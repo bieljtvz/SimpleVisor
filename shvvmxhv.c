@@ -21,6 +21,87 @@ Environment:
 --*/
 
 #include "shv.h"
+#include "shv_comm.h"
+
+//
+// Contador de VM-exits. Incrementado a cada exit para confirmar que o
+// handler esta sendo chamado. Leia com o WinDbg: dd shv!ShvExitCount
+//
+volatile UINT64 ShvExitCount = 0;
+volatile UINT64 ShvLastExitReason = 0;
+
+//
+// Contadores de observacao do MSR LSTAR (modo passivo, sem hook de SYSCALL).
+// O MSR bitmap forca um VM-exit a cada RDMSR/WRMSR no LSTAR.
+//
+// Leia no WinDbg:
+//   dq shv!ShvLstarReadCount    <- quantas vezes RDMSR LSTAR foi executado
+//   dq shv!ShvLstarWriteCount   <- quantas vezes WRMSR LSTAR foi executado
+//   dq shv!ShvLastLstarValue    <- ultimo valor lido/escrito no LSTAR
+//
+volatile UINT64 ShvLstarReadCount  = 0;
+volatile UINT64 ShvLstarWriteCount = 0;
+volatile UINT64 ShvLastLstarValue  = 0;
+
+//
+// EPT execute hook: endereco fisico monitorado e contador de execucoes.
+// ShvEptHookPhysical e definido aqui e lido por shvvmx.c para saber
+// onde instalar o hook durante ShvVmxLaunchOnVp.
+//
+volatile UINT64 ShvEptHookPhysical = 0;
+volatile UINT64 ShvEptHookHitCount = 0;
+
+//
+// Ring buffer de eventos: o hypervisor escreve aqui a cada interceptacao
+// (RDMSR/WRMSR LSTAR, EPT violation). O usermode le via CPUID sub-leaf.
+//
+// Estrutura de uma entrada -- deve caber em 4 registradores CPUID (EAX/EBX/ECX/EDX):
+//   EAX = SeqNum   (numero sequencial monotonicamente crescente)
+//   EBX = Value.Lo (32 bits baixos do valor associado ao evento)
+//   ECX = Value.Hi (32 bits altos)
+//   EDX = (Type << 8) | CpuNumber
+//
+typedef struct _SHV_HV_EVENT
+{
+    UINT32 SeqNum;      // identificador sequencial; usermode usa para detectar novidades
+    UINT8  Type;        // SHV_EVENT_* de shv_comm.h
+    UINT8  CpuNumber;   // qual processador logico gerou o evento
+    UINT16 Reserved;
+    UINT64 Value;       // LSTAR value para eventos MSR; GPA para EPT
+} SHV_HV_EVENT, *PSHV_HV_EVENT;
+
+static SHV_HV_EVENT ShvEventBuffer[SHV_EVENT_RING_SIZE];
+volatile UINT64     ShvEventCount = 0; // total de eventos escritos (nunca decrementa)
+
+//
+// Adiciona um evento ao ring buffer de forma segura para multi-CPU.
+// Usa InterlockedIncrement64 (instrucao LOCK XADD) que e segura em
+// VMX root mode -- nao faz chamadas de sistema, apenas uma instrucao atomica.
+//
+static VOID
+ShvHvPushEvent (
+    _In_ UINT8  Type,
+    _In_ UINT64 Value
+    )
+{
+    LONG64   idx;
+    UINT32   slot;
+    PSHV_HV_EVENT ev;
+
+    // Reserva o proximo slot de forma atomica
+    idx  = _InterlockedIncrement64((LONG64*)&ShvEventCount) - 1;
+    slot = (UINT32)(idx % SHV_EVENT_RING_SIZE);
+    ev   = &ShvEventBuffer[slot];
+
+    // Preenche a entrada ANTES de gravar o SeqNum, assim o usermode que
+    // checar o SeqNum ve um valor consistente
+    ev->Type      = Type;
+    ev->CpuNumber = (UINT8)ShvOsGetCurrentProcessorNumber();
+    ev->Reserved  = 0;
+    ev->Value     = Value;
+    _mm_sfence();           // garante que Value/Type chegam a memoria antes de SeqNum
+    ev->SeqNum    = (UINT32)idx;
+}
 
 DECLSPEC_NORETURN
 VOID
@@ -94,6 +175,10 @@ ShvVmxHandleInvd (
     __wbinvd();
 }
 
+//
+// A leaf SHV_CPUID_LEAF e o protocolo completo de sub-leaves estao definidos
+// em shv_comm.h (incluido acima) para ser compartilhado com o usermode.
+
 VOID
 ShvVmxHandleCpuid (
     _In_ PSHV_VP_STATE VpState
@@ -102,10 +187,10 @@ ShvVmxHandleCpuid (
     INT32 cpu_info[4];
 
     //
-    // Check for the magic CPUID sequence, and check that it is coming from
-    // Ring 0. Technically we could also check the RIP and see if this falls
-    // in the expected function, but we may want to allow a separate "unload"
-    // driver or code at some point.
+    // Verificacao da sequencia magica de desligamento do hypervisor.
+    // Quando RAX=0x41414141 e RCX=0x42424242 vindo de Ring 0 (kernel),
+    // o hypervisor sinaliza que deve ser descarregado (ExitVm = TRUE).
+    // Isso faz o ShvVmxEntryHandler executar o caminho de desligamento.
     //
     if ((VpState->VpRegs->Rax == 0x41414141) &&
         (VpState->VpRegs->Rcx == 0x42424242) &&
@@ -116,37 +201,228 @@ ShvVmxHandleCpuid (
     }
 
     //
-    // Otherwise, issue the CPUID to the logical processor based on the indexes
-    // on the VP's GPRs.
+    // Verifica se alguem esta consultando nossa leaf customizada.
+    // Qualquer software (inclusive usermode) pode fazer isso com:
+    //   int cpuInfo[4];
+    //   __cpuid(cpuInfo, 0x53485600);
+    // e verificar se cpuInfo[0] == 0x53485600 para saber se o SHV esta ativo.
+    //
+    if (VpState->VpRegs->Rax == SHV_CPUID_LEAF)
+    {
+        //
+        // Leaf de comunicacao do SimpleVisor. O sub-leaf (ECX) determina
+        // qual informacao e retornada. Veja shv_comm.h para a lista completa.
+        // Nenhum desses casos passa o CPUID para o hardware -- as respostas
+        // sao fabricadas inteiramente pelo hypervisor.
+        //
+        LARGE_INTEGER   counter;
+        UINT32          subleaf = (UINT32)VpState->VpRegs->Rcx;
+        PSHV_HV_EVENT   ev;
+
+        // Zera os registradores de saida como default seguro
+        VpState->VpRegs->Rax = 0;
+        VpState->VpRegs->Rbx = 0;
+        VpState->VpRegs->Rcx = 0;
+        VpState->VpRegs->Rdx = 0;
+
+        if (subleaf == SHV_QUERY_PRESENCE)
+        {
+            // EAX = assinatura (a propria leaf), EBX = cpu, ECX = versao
+            VpState->VpRegs->Rax = SHV_CPUID_LEAF;
+            VpState->VpRegs->Rbx = (UINT64)ShvOsGetCurrentProcessorNumber();
+            VpState->VpRegs->Rcx = 1;
+        }
+        else if (subleaf == SHV_QUERY_LSTAR_READS)
+        {
+            counter.QuadPart     = ShvLstarReadCount;
+            VpState->VpRegs->Rax = counter.LowPart;
+            VpState->VpRegs->Rbx = counter.HighPart;
+        }
+        else if (subleaf == SHV_QUERY_LSTAR_WRITES)
+        {
+            counter.QuadPart     = ShvLstarWriteCount;
+            VpState->VpRegs->Rax = counter.LowPart;
+            VpState->VpRegs->Rbx = counter.HighPart;
+        }
+        else if (subleaf == SHV_QUERY_EXIT_COUNT)
+        {
+            counter.QuadPart     = ShvExitCount;
+            VpState->VpRegs->Rax = counter.LowPart;
+            VpState->VpRegs->Rbx = counter.HighPart;
+        }
+        else if (subleaf == SHV_QUERY_LAST_LSTAR)
+        {
+            counter.QuadPart     = ShvLastLstarValue;
+            VpState->VpRegs->Rax = counter.LowPart;
+            VpState->VpRegs->Rbx = counter.HighPart;
+        }
+        else if (subleaf == SHV_QUERY_HOOK_HITS)
+        {
+            counter.QuadPart     = ShvEptHookHitCount;
+            VpState->VpRegs->Rax = counter.LowPart;
+            VpState->VpRegs->Rbx = counter.HighPart;
+        }
+        else if (subleaf == SHV_QUERY_EVENT_INFO)
+        {
+            // EAX = total de eventos escritos (32 bits baixos),
+            // EBX = tamanho do ring buffer
+            counter.QuadPart     = ShvEventCount;
+            VpState->VpRegs->Rax = counter.LowPart;
+            VpState->VpRegs->Rbx = SHV_EVENT_RING_SIZE;
+        }
+        else if (subleaf >= SHV_QUERY_EVENT_BASE &&
+                 subleaf <  SHV_QUERY_EVENT_BASE + SHV_EVENT_RING_SIZE)
+        {
+            // Entrada individual do ring buffer.
+            // EAX=SeqNum, EBX=Value.Lo, ECX=Value.Hi, EDX=(Type<<8)|CpuNum
+            ev = &ShvEventBuffer[subleaf - SHV_QUERY_EVENT_BASE];
+            counter.QuadPart     = ev->Value;
+            VpState->VpRegs->Rax = ev->SeqNum;
+            VpState->VpRegs->Rbx = counter.LowPart;
+            VpState->VpRegs->Rcx = counter.HighPart;
+            VpState->VpRegs->Rdx = ((UINT32)ev->Type << 8) | ev->CpuNumber;
+        }
+
+        return;
+    }
+
+    //
+    // Para qualquer outra leaf, executa o CPUID real no hardware e repassa
+    // o resultado de volta para o guest. O guest nao sabe que passou pelo
+    // hypervisor -- tudo e transparente.
+    //
+    // __cpuidex usa tanto EAX (leaf) quanto ECX (subleaf), necessario para
+    // leaves como a 4h e Bh que tem multiplos niveis de informacao.
     //
     __cpuidex(cpu_info, (INT32)VpState->VpRegs->Rax, (INT32)VpState->VpRegs->Rcx);
 
     //
-    // Check if this was CPUID 1h, which is the features request.
+    // Leaf 1h: informacoes basicas do processador e features.
+    // Aproveitamos para setar o bit 31 de ECX, que por convencao indica
+    // que um hypervisor esta presente. Isso e o que VMware, Hyper-V e
+    // outros hypervisors fazem para se anunciar ao SO guest.
     //
     if (VpState->VpRegs->Rax == 1)
     {
-        //
-        // Set the Hypervisor Present-bit in RCX, which Intel and AMD have both
-        // reserved for this indication.
-        //
         cpu_info[2] |= HYPERV_HYPERVISOR_PRESENT_BIT;
     }
     else if (VpState->VpRegs->Rax == HYPERV_CPUID_INTERFACE)
     {
         //
-        // Return our interface identifier
+        // Leaf de identificacao do hypervisor (0x40000001).
+        // Retorna nossa assinatura "Shv " em EAX.
         //
         cpu_info[0] = ' vhS';
     }
 
     //
-    // Copy the values from the logical processor registers into the VP GPRs.
+    // Copia os resultados do CPUID de volta para os registradores do guest.
+    // O guest vai ler esses valores como se o CPUID tivesse executado
+    // diretamente no hardware -- ele nao tem como saber que passou pelo SHV.
     //
     VpState->VpRegs->Rax = cpu_info[0];
     VpState->VpRegs->Rbx = cpu_info[1];
     VpState->VpRegs->Rcx = cpu_info[2];
     VpState->VpRegs->Rdx = cpu_info[3];
+}
+
+
+//
+// === HOOK REAL DE SYSCALL (LSTAR trampoline) ================================
+//
+// REQUER: KPTI (KVA Shadow) desativado na maquina de teste.
+//
+// O KPTI e uma mitigacao Meltdown que remove paginas de kernel do mapa de
+// usermode (shadow CR3). Quando o hardware executa SYSCALL, o trampoline roda
+// com o shadow CR3 ainda ativo -- se tentar escrever em globais do kernel
+// (NonPagedPool) que nao estao no shadow CR3, gera #PF sem pilha kernel valida
+// → double fault → BSOD 0x7F.
+//
+// Para desativar o KPTI na maquina de teste, execute como administrador:
+//
+//   reg add "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" ^
+//     /v FeatureSettingsOverride     /t REG_DWORD /d 3 /f
+//   reg add "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" ^
+//     /v FeatureSettingsOverrideMask /t REG_DWORD /d 3 /f
+//
+// Reinicie apos o comando. O proximo passo de implementacao correto sem
+// precisar desativar o KPTI e usar um EPT hook no KiSystemCall64, que
+// intercepta a execucao no nivel do hypervisor antes da troca de CR3.
+//
+// O codigo abaixo esta comentado ate que o KPTI seja desativado no ambiente
+// de teste.
+//
+#if 0
+
+UINT64 ShvOriginalLstar = 0;
+UINT64 ShvSyscallCount = 0;
+UINT64 ShvLastSyscallNumber = 0;
+
+VOID
+ShvVmxInstallSyscallHook (
+    VOID
+    )
+{
+    UINT64 currentLstar = __readmsr(MSR_LSTAR);
+    if (ShvOriginalLstar == 0)
+    {
+        ShvOriginalLstar = currentLstar;
+    }
+    __writemsr(MSR_LSTAR, (UINT64)ShvSyscallTrampoline);
+}
+
+#endif /* KPTI deve estar desativado para usar o hook acima */
+
+VOID
+ShvVmxHandleMsrRead (
+    _In_ PSHV_VP_STATE VpState
+    )
+{
+    UINT32 msr;
+    LARGE_INTEGER value;
+
+    msr = (UINT32)VpState->VpRegs->Rcx;
+    value.QuadPart = __readmsr(msr);
+
+    //
+    // Modo passivo: conta, registra e empurra evento ao ring buffer.
+    // Nao altera o valor retornado -- o guest le o LSTAR real.
+    //
+    if (msr == MSR_LSTAR)
+    {
+        ShvLstarReadCount++;
+        ShvLastLstarValue = value.QuadPart;
+        ShvHvPushEvent(SHV_EVENT_LSTAR_READ, value.QuadPart);
+    }
+
+    VpState->VpRegs->Rax = value.LowPart;
+    VpState->VpRegs->Rdx = value.HighPart;
+}
+
+VOID
+ShvVmxHandleMsrWrite (
+    _In_ PSHV_VP_STATE VpState
+    )
+{
+    UINT32 msr;
+    LARGE_INTEGER value;
+
+    msr = (UINT32)VpState->VpRegs->Rcx;
+    value.LowPart = (UINT32)VpState->VpRegs->Rax;
+    value.HighPart = (UINT32)VpState->VpRegs->Rdx;
+
+    //
+    // Modo passivo: conta, registra e empurra evento ao ring buffer.
+    // Deixa a escrita passar para o hardware sem redirecionar.
+    //
+    if (msr == MSR_LSTAR)
+    {
+        ShvLstarWriteCount++;
+        ShvLastLstarValue = value.QuadPart;
+        ShvHvPushEvent(SHV_EVENT_LSTAR_WRITE, value.QuadPart);
+    }
+
+    __writemsr(msr, value.QuadPart);
 }
 
 VOID
@@ -179,18 +455,97 @@ ShvVmxHandleVmx (
     __vmx_vmwrite(GUEST_RFLAGS, VpState->GuestEFlags);
 }
 
+//
+// Handler para EXIT_REASON_EPT_VIOLATION (razao 48).
+//
+// Quando o guest tenta executar uma pagina marcada sem permissao Execute no EPT,
+// o hardware gera um VM-exit. Aqui:
+//   1. Contamos a execucao no hook.
+//   2. Publicamos o evento no ring buffer.
+//   3. Temporariamente restauramos a permissao Execute para a instrucao passar.
+//   4. Ligamos o MTF (Monitor Trap Flag) para re-armar o hook apos 1 instrucao.
+//
+// SkipRipAdvance = TRUE porque o guest ainda nao executou a instrucao que
+// causou a violation -- ela deve ser re-tentada com as permissoes restauradas.
+//
 VOID
-ShvVmxHandleExit (
-    _In_ PSHV_VP_STATE VpState
+ShvVmxHandleEptViolation (
+    _In_ PSHV_VP_STATE VpState,
+    _In_ PSHV_VP_DATA  VpData
     )
 {
-    //
-    // This is the generic VM-Exit handler. Decode the reason for the exit and
-    // call the appropriate handler. As per Intel specifications, given that we
-    // have requested no optional exits whatsoever, we should only see CPUID,
-    // INVD, XSETBV and other VMX instructions. GETSEC cannot happen as we do
-    // not run in SMX context.
-    //
+    UINT64 exitQual;
+    UINT64 guestPa;
+    UINT64 controls;
+
+    exitQual = ShvVmxRead(EXIT_QUALIFICATION);
+    guestPa  = ShvVmxRead(GUEST_PHYSICAL_ADDRESS);
+
+    // Bit 2 da Exit Qualification = fetch de instrucao (execute violation)
+    if ((exitQual & 0x4) != 0)
+    {
+        // E o nosso hook?
+        if (guestPa == ShvEptHookPhysical)
+        {
+            ShvEptHookHitCount++;
+            ShvHvPushEvent(SHV_EVENT_EPT_EXEC, guestPa);
+        }
+
+        // Restaura execucao temporariamente para o guest poder avançar
+        ShvVmxEptSetPermissions(VpData, guestPa, 1, 1, 1);
+        ShvVmxInveptLocal(VpData);
+
+        // Arma MTF para re-restringir apos exatamente 1 instrucao do guest
+        VpData->MtfRestorePhysical = guestPa;
+        controls = ShvVmxRead(CPU_BASED_VM_EXEC_CONTROL);
+        __vmx_vmwrite(CPU_BASED_VM_EXEC_CONTROL, controls | CPU_BASED_MONITOR_TRAP_FLAG);
+    }
+
+    // Nao avanca o RIP -- o guest deve re-executar a instrucao com Execute=1
+    VpState->SkipRipAdvance = TRUE;
+}
+
+//
+// Handler para EXIT_REASON_MONITOR_TRAP_FLAG (razao 37).
+//
+// O MTF dispara um VM-exit apos exatamente 1 instrucao do guest.
+// Aqui re-removemos a permissao Execute para re-armar o hook.
+//
+VOID
+ShvVmxHandleMtf (
+    _In_ PSHV_VP_STATE VpState,
+    _In_ PSHV_VP_DATA  VpData
+    )
+{
+    UINT64 controls;
+
+    if (VpData->MtfRestorePhysical != 0)
+    {
+        ShvVmxEptSetPermissions(VpData, VpData->MtfRestorePhysical, 1, 1, 0);
+        ShvVmxInveptLocal(VpData);
+        VpData->MtfRestorePhysical = 0;
+    }
+
+    // Desliga o MTF
+    controls = ShvVmxRead(CPU_BASED_VM_EXEC_CONTROL);
+    __vmx_vmwrite(CPU_BASED_VM_EXEC_CONTROL, controls & ~CPU_BASED_MONITOR_TRAP_FLAG);
+
+    // MTF nao tem VM_EXIT_INSTRUCTION_LEN valido; nao avancamos o RIP
+    VpState->SkipRipAdvance = TRUE;
+}
+
+VOID
+ShvVmxHandleExit (
+    _In_ PSHV_VP_STATE VpState,
+    _In_ PSHV_VP_DATA  VpData
+    )
+{
+    ShvExitCount++;
+    ShvLastExitReason = VpState->ExitReason;
+
+    // Por default avancamos o RIP; EPT violation e MTF desligam esse flag.
+    VpState->SkipRipAdvance = FALSE;
+
     switch (VpState->ExitReason)
     {
     case EXIT_REASON_CPUID:
@@ -202,7 +557,24 @@ ShvVmxHandleExit (
     case EXIT_REASON_XSETBV:
         ShvVmxHandleXsetbv(VpState);
         break;
+    case EXIT_REASON_MSR_READ:
+        ShvVmxHandleMsrRead(VpState);
+        break;
+    case EXIT_REASON_MSR_WRITE:
+        ShvVmxHandleMsrWrite(VpState);
+        break;
+    case EXIT_REASON_EPT_VIOLATION:
+        ShvVmxHandleEptViolation(VpState, VpData);
+        break;
+    case EXIT_REASON_MONITOR_TRAP_FLAG:
+        ShvVmxHandleMtf(VpState, VpData);
+        break;
     case EXIT_REASON_VMCALL:
+        if (VpState->VpRegs->Rax == 0x42424242)
+        {
+            VpState->VpRegs->Rcx = 0x43434343;
+        }
+        break;
     case EXIT_REASON_VMCLEAR:
     case EXIT_REASON_VMLAUNCH:
     case EXIT_REASON_VMPTRLD:
@@ -218,13 +590,13 @@ ShvVmxHandleExit (
         break;
     }
 
-    //
-    // Move the instruction pointer to the next instruction after the one that
-    // caused the exit. Since we are not doing any special handling or changing
-    // of execution, this can be done for any exit reason.
-    //
-    VpState->GuestRip += ShvVmxRead(VM_EXIT_INSTRUCTION_LEN);
-    __vmx_vmwrite(GUEST_RIP, VpState->GuestRip);
+    // Avanca o RIP somente para exits que representam instrucoes completas.
+    // EPT violation e MTF nao devem adiantar o RIP.
+    if (VpState->SkipRipAdvance == FALSE)
+    {
+        VpState->GuestRip += ShvVmxRead(VM_EXIT_INSTRUCTION_LEN);
+        __vmx_vmwrite(GUEST_RIP, VpState->GuestRip);
+    }
 }
 
 DECLSPEC_NORETURN
@@ -260,11 +632,12 @@ ShvVmxEntryHandler (
     guestContext.ExitReason = ShvVmxRead(VM_EXIT_REASON) & 0xFFFF;
     guestContext.VpRegs = Context;
     guestContext.ExitVm = FALSE;
+    guestContext.SkipRipAdvance = FALSE;
 
     //
     // Call the generic handler
     //
-    ShvVmxHandleExit(&guestContext);
+    ShvVmxHandleExit(&guestContext, vpData);
 
     //
     // Did we hit the magic exit sequence, or should we resume back to the VM

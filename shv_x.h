@@ -81,6 +81,12 @@ typedef struct _SHV_VP_DATA
             UINT64 MsrBitmapPhysicalAddress;
             UINT64 EptPml4PhysicalAddress;
             UINT32 EptControls;
+
+            // Campos usados pelo EPT execute hook
+            UINT64 MtfRestorePhysical;  // GPA a re-restringir no proximo MTF exit
+            UINT32 EptPtUsed;           // quantas entradas em EptPtPdpteIndex estao em uso
+            UINT32 EptPtPdpteIndex[8];  // qual PDPTE e dono de cada PT
+            UINT32 EptPtPdeIndex[8];    // qual PDE e dono de cada PT
         };
     };
 
@@ -91,9 +97,13 @@ typedef struct _SHV_VP_DATA
 
     DECLSPEC_ALIGN(PAGE_SIZE) VMX_VMCS VmxOn;
     DECLSPEC_ALIGN(PAGE_SIZE) VMX_VMCS Vmcs;
+
+    // Pool de page tables de 4KB geradas por ShvVmxEptSplitLargePage.
+    // Cada entrada cobre uma regiao de 2MB dividida em 512 PTEs de 4KB.
+    DECLSPEC_ALIGN(PAGE_SIZE) VMX_PTE EptPt[8][PTE_ENTRY_COUNT];
 } SHV_VP_DATA, *PSHV_VP_DATA;
 
-C_ASSERT(sizeof(SHV_VP_DATA) == (KERNEL_STACK_SIZE + (512 + 5) * PAGE_SIZE));
+C_ASSERT(sizeof(SHV_VP_DATA) == (KERNEL_STACK_SIZE + (512 + 5 + 8) * PAGE_SIZE));
 
 VOID
 _sldt (

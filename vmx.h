@@ -28,6 +28,7 @@ Environment:
 #define DPL_SYSTEM              0
 #define MSR_GS_BASE             0xC0000101
 #define MSR_DEBUG_CTL           0x1D9
+#define MSR_LSTAR               0xC0000082
 #define RPL_MASK                3
 #define MTRR_TYPE_UC            0
 #define MTRR_TYPE_USWC          1
@@ -641,11 +642,40 @@ typedef struct _VMX_LARGE_PDE
     };
 } VMX_LARGE_PDE, *PVMX_LARGE_PDE;
 
+// VMX_PTE: folha de 4KB no EPT (gerada por ShvVmxEptSplitLargePage).
+// O layout e identico ao VMX_PDPTE mas sem o bit Large (n/a em PTEs).
+typedef struct _VMX_PTE
+{
+    union
+    {
+        struct
+        {
+            UINT64 Read : 1;
+            UINT64 Write : 1;
+            UINT64 Execute : 1;
+            UINT64 Type : 3;
+            UINT64 IgnorePat : 1;
+            UINT64 Reserved : 1;
+            UINT64 Accessed : 1;
+            UINT64 Dirty : 1;
+            UINT64 UserModeExecute : 1;
+            UINT64 SoftwareUse : 1;
+            UINT64 PageFrameNumber : 36;
+            UINT64 ReservedHigh : 4;
+            UINT64 SoftwareUseHigh : 11;
+            UINT64 SupressVme : 1;
+        };
+        UINT64 AsUlonglong;
+    };
+} VMX_PTE, *PVMX_PTE;
+
 static_assert(sizeof(VMX_EPTP) == sizeof(UINT64), "EPTP Size Mismatch");
 static_assert(sizeof(VMX_EPML4E) == sizeof(UINT64), "EPML4E Size Mismatch");
 static_assert(sizeof(VMX_PDPTE) == sizeof(UINT64), "EPDPTE Size Mismatch");
+static_assert(sizeof(VMX_PTE) == sizeof(UINT64), "VMX_PTE Size Mismatch");
 
 #define PML4E_ENTRY_COUNT   512
 #define PDPTE_ENTRY_COUNT   512
 #define PDE_ENTRY_COUNT     512
+#define PTE_ENTRY_COUNT     512
 

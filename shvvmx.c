@@ -113,6 +113,69 @@ ShvVmxMtrrAdjustEffectiveMemoryType (
     return CandidateMemoryType;
 }
 
+//
+// O MSR Bitmap e uma pagina de 4KB dividida em 4 regioes de 1024 bytes cada:
+//
+//   Offset 0-1023    : bitmap de LEITURA  para MSRs 0x00000000-0x00001FFF
+//   Offset 1024-2047 : bitmap de LEITURA  para MSRs 0xC0000000-0xC0001FFF
+//   Offset 2048-3071 : bitmap de ESCRITA para MSRs 0x00000000-0x00001FFF
+//   Offset 3072-4095 : bitmap de ESCRITA para MSRs 0xC0000000-0xC0001FFF
+//
+// Cada bit corresponde a um MSR. Se o bit estiver setado (1), o RDMSR/WRMSR
+// daquele MSR causa um VM-exit. Se estiver zerado (0), a instrucao executa
+// normalmente sem interceptacao.
+//
+// LSTAR (0xC0000082) esta na faixa "alta", entao usamos as regioes 2 e 4.
+// O offset dentro da faixa alta e: MSR - 0xC0000000 = 0x82.
+// Bit a setar = offset 0x82 -> byte 0x82/8 = 16, bit 0x82%8 = 2.
+//
+#define MSR_BITMAP_READ_LOW     0
+#define MSR_BITMAP_READ_HIGH    1024
+#define MSR_BITMAP_WRITE_LOW    2048
+#define MSR_BITMAP_WRITE_HIGH   3072
+
+VOID
+ShvVmxSetMsrBit (
+    _In_ PUINT8 Bitmap,
+    _In_ UINT32 RegionOffset,
+    _In_ UINT32 Msr
+    )
+{
+    UINT32 bitIndex;
+    UINT32 byteIndex;
+
+    //
+    // MSRs na faixa alta (0xC0000000+) tem seu offset calculado a partir
+    // da base dessa faixa. MSRs na faixa baixa usam o valor diretamente.
+    //
+    if (Msr >= 0xC0000000)
+    {
+        bitIndex = Msr - 0xC0000000;
+    }
+    else
+    {
+        bitIndex = Msr;
+    }
+
+    byteIndex = bitIndex / 8;
+    Bitmap[RegionOffset + byteIndex] |= (1 << (bitIndex % 8));
+}
+
+VOID
+ShvVmxMsrBitmapInitialize (
+    _In_ PSHV_VP_DATA VpData
+    )
+{
+    //
+    // Intercepta leitura e escrita do LSTAR, o MSR que contem o endereco do
+    // handler de SYSCALL. Qualquer RDMSR/WRMSR nesse MSR agora causa VM-exit,
+    // nos dando visibilidade sobre configuracoes desse registrador --
+    // inclusive tentativas de rootkits de sequestrar a tabela de syscalls.
+    //
+    ShvVmxSetMsrBit(VpData->MsrBitmap, MSR_BITMAP_READ_HIGH, MSR_LSTAR);
+    ShvVmxSetMsrBit(VpData->MsrBitmap, MSR_BITMAP_WRITE_HIGH, MSR_LSTAR);
+}
+
 VOID
 ShvVmxEptInitialize (
     _In_ PSHV_VP_DATA VpData
@@ -170,6 +233,139 @@ ShvVmxEptInitialize (
             VpData->Epde[i][j].Type = ShvVmxMtrrAdjustEffectiveMemoryType(VpData,
                                                                           VpData->Epde[i][j].PageFrameNumber * _2MB,
                                                                           MTRR_TYPE_WB);
+        }
+    }
+}
+
+// Descritor necessario para a instrucao INVEPT
+typedef struct _SHV_INVEPT_DESCRIPTOR
+{
+    UINT64 Eptp;
+    UINT64 Reserved;
+} SHV_INVEPT_DESCRIPTOR;
+
+//
+// Invalida o EPT TLB do processador local usando o EPTP do VpData atual.
+// Deve ser chamada apos qualquer modificacao nas entradas EPT.
+//
+VOID
+ShvVmxInveptLocal (
+    _In_ PSHV_VP_DATA VpData
+    )
+{
+    SHV_INVEPT_DESCRIPTOR desc;
+    VMX_EPTP vmxEptp;
+
+    vmxEptp.AsUlonglong = 0;
+    vmxEptp.PageWalkLength = 3;
+    vmxEptp.Type = MTRR_TYPE_WB;
+    vmxEptp.PageFrameNumber = VpData->EptPml4PhysicalAddress / PAGE_SIZE;
+
+    desc.Eptp     = vmxEptp.AsUlonglong;
+    desc.Reserved = 0;
+
+    ShvVmxInvept(1, &desc); // tipo 1 = single context
+}
+
+//
+// Divide uma pagina grande de 2MB do EPT em 512 PTEs de 4KB.
+// Necessario antes de modificar permissoes de uma unica pagina de 4KB.
+// Retorna TRUE em sucesso, FALSE se o pool de PTs estiver cheio.
+//
+UINT8
+ShvVmxEptSplitLargePage (
+    _In_ PSHV_VP_DATA VpData,
+    _In_ UINT64 GuestPhysical
+    )
+{
+    UINT32 pdpteIndex;
+    UINT32 pdeIndex;
+    UINT32 i;
+    PVMX_LARGE_PDE largePde;
+    PVMX_PDPTE newPde;
+    PVMX_PTE pt;
+    UINT64 base4kPfn;
+
+    pdpteIndex = (UINT32)((GuestPhysical >> 30) & 0x1FF);
+    pdeIndex   = (UINT32)((GuestPhysical >> 21) & 0x1FF);
+    largePde   = &VpData->Epde[pdpteIndex][pdeIndex];
+
+    // Ja foi dividida (Large=0 indica ponteiro para PT)
+    if (largePde->Large == 0)
+    {
+        return 1;
+    }
+
+    // Verifica se ha slot disponivel no pool
+    if (VpData->EptPtUsed >= 8)
+    {
+        return 0;
+    }
+
+    pt = VpData->EptPt[VpData->EptPtUsed];
+
+    // O PFN da pagina grande e relativo a blocos de 2MB:
+    // base4kPfn = largePde->PageFrameNumber * 512  (2MB / 4KB)
+    base4kPfn = (UINT64)largePde->PageFrameNumber * PTE_ENTRY_COUNT;
+
+    for (i = 0; i < PTE_ENTRY_COUNT; i++)
+    {
+        pt[i].AsUlonglong     = 0;
+        pt[i].Read            = largePde->Read;
+        pt[i].Write           = largePde->Write;
+        pt[i].Execute         = largePde->Execute;
+        pt[i].Type            = largePde->Type;
+        pt[i].PageFrameNumber = base4kPfn + i;
+    }
+
+    // Registra o mapeamento pdpte/pde -> slot de PT
+    VpData->EptPtPdpteIndex[VpData->EptPtUsed] = pdpteIndex;
+    VpData->EptPtPdeIndex[VpData->EptPtUsed]   = pdeIndex;
+
+    // Substitui o PDE grande por um PDE nao-grande apontando para a PT
+    newPde = (PVMX_PDPTE)largePde;
+    newPde->AsUlonglong     = 0;
+    newPde->Read            = 1;
+    newPde->Write           = 1;
+    newPde->Execute         = 1;
+    newPde->PageFrameNumber = ShvOsGetPhysicalAddress(pt) / PAGE_SIZE;
+
+    VpData->EptPtUsed++;
+    return 1;
+}
+
+//
+// Altera as permissoes de uma pagina de 4KB no EPT.
+// A pagina ja deve ter sido dividida com ShvVmxEptSplitLargePage.
+// Chame ShvVmxInveptLocal depois para flushar o TLB do EPT.
+//
+VOID
+ShvVmxEptSetPermissions (
+    _In_ PSHV_VP_DATA VpData,
+    _In_ UINT64 GuestPhysical,
+    _In_ UINT8 Read,
+    _In_ UINT8 Write,
+    _In_ UINT8 Execute
+    )
+{
+    UINT32 pdpteIndex;
+    UINT32 pdeIndex;
+    UINT32 pteIndex;
+    UINT32 i;
+
+    pdpteIndex = (UINT32)((GuestPhysical >> 30) & 0x1FF);
+    pdeIndex   = (UINT32)((GuestPhysical >> 21) & 0x1FF);
+    pteIndex   = (UINT32)((GuestPhysical >> 12) & 0x1FF);
+
+    for (i = 0; i < VpData->EptPtUsed; i++)
+    {
+        if (VpData->EptPtPdpteIndex[i] == pdpteIndex &&
+            VpData->EptPtPdeIndex[i]   == pdeIndex)
+        {
+            VpData->EptPt[i][pteIndex].Read    = Read;
+            VpData->EptPt[i][pteIndex].Write   = Write;
+            VpData->EptPt[i][pteIndex].Execute = Execute;
+            return;
         }
     }
 }
@@ -591,6 +787,11 @@ ShvVmxLaunchOnVp (
     ShvVmxEptInitialize(VpData);
 
     //
+    // Marca o MSR do LSTAR para causar VM-exit em leitura/escrita
+    //
+    ShvVmxMsrBitmapInitialize(VpData);
+
+    //
     // Attempt to enter VMX root mode on this processor.
     //
     if (ShvVmxEnterRootModeOnVp(VpData) == FALSE)
@@ -605,6 +806,31 @@ ShvVmxLaunchOnVp (
     // Initialize the VMCS, both guest and host state.
     //
     ShvVmxSetupVmcsForVp(VpData);
+
+    //
+    // Hook real de SYSCALL via LSTAR trampoline esta desativado aqui.
+    // Veja o bloco #if 0 em shvvmxhv.c -- requer KPTI desativado.
+    // ShvVmxInstallSyscallHook();
+    //
+
+    //
+    // EPT execute hook no KiSystemCall64 (endereco atual do LSTAR).
+    // Intercepta toda execucao nessa funcao via EPT violation -- KPTI-safe
+    // pois opera no nivel do hypervisor, antes de qualquer troca de CR3.
+    //
+    {
+        UINT64 lstarVa = __readmsr(MSR_LSTAR);
+        UINT64 lstarPa = ShvOsGetPhysicalAddress((VOID*)lstarVa);
+        if (lstarPa != 0)
+        {
+            if (ShvVmxEptSplitLargePage(VpData, lstarPa))
+            {
+                ShvVmxEptSetPermissions(VpData, lstarPa, 1, 1, 0);
+                ShvVmxInveptLocal(VpData);
+                ShvEptHookPhysical = lstarPa;
+            }
+        }
+    }
 
     //
     // Launch the VMCS, based on the guest data that was loaded into the

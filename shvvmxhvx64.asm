@@ -40,4 +40,57 @@
                                 ; home space, which is true of release builds.
     ShvVmxEntry ENDP
 
+    ShvVmxCall PROC
+    mov     rax, rcx            ; first argument is the magic value
+    xor     rcx, rcx            ; clear RCX before VMCALL
+    vmcall                      ; causes VM-exit to our handler
+    mov     rax, rcx            ; return whatever handler put in RCX
+    ret
+    ShvVmxCall ENDP
+
+    ;
+    ; ShvVmxInvept(Type: UINT64 rcx, Descriptor: VOID* rdx)
+    ;
+    ; Invalida as traducoes cacheadas do EPT TLB.
+    ;   rcx = tipo: 1 = single context (invalida o EPTP atual)
+    ;               2 = all contexts  (invalida todos os EPTPs)
+    ;   rdx = ponteiro para o descritor de 16 bytes { EPTP (8), Reserved (8) }
+    ;
+    ShvVmxInvept PROC
+    invept  rcx, oword ptr [rdx]
+    ret
+    ShvVmxInvept ENDP
+
+    ;
+    ; === HOOK REAL DE SYSCALL (ShvSyscallTrampoline) =========================
+    ;
+    ; REQUER: KPTI (KVA Shadow) desativado na maquina de teste.
+    ;
+    ; Quando o SYSCALL dispara, o hardware salta aqui com:
+    ;   - CR3  = shadow CR3 do processo (nao mapeia paginas de kernel comuns)
+    ;   - RSP  = pilha de usermode (nao tocada ainda)
+    ;   - GS   = GS de usermode (aponta para TEB, nao KPCR)
+    ;   - RAX  = numero da syscall
+    ;
+    ; Com KPTI ativo, qualquer escrita em memoria de kernel (ShvSyscallCount,
+    ; ShvLastSyscallNumber, ShvOriginalLstar) causa #PF, pois essas paginas
+    ; nao estao no shadow CR3. O #PF tenta rodar com RSP de usermode + GS
+    ; errado, gera outro fault → double fault → BSOD 0x7F.
+    ;
+    ; Para habilitar: desative o KPTI (veja shvvmxhv.c), descomente o bloco
+    ; #if 0 em shvvmxhv.c, reative a chamada ShvVmxInstallSyscallHook em
+    ; shvvmx.c, e descomente o codigo abaixo.
+    ;
+    ; extern ShvSyscallCount:qword
+    ; extern ShvLastSyscallNumber:qword
+    ; extern ShvOriginalLstar:qword
+    ;
+    ; ShvSyscallTrampoline PROC
+    ;     mov  qword ptr [ShvLastSyscallNumber], rax
+    ;     lock inc qword ptr [ShvSyscallCount]
+    ;     jmp  qword ptr [ShvOriginalLstar]
+    ; ShvSyscallTrampoline ENDP
+    ;
+    ; =========================================================================
+
     end

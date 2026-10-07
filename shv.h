@@ -40,6 +40,7 @@ typedef struct _SHV_VP_STATE
     uintptr_t GuestEFlags;
     UINT16 ExitReason;
     UINT8 ExitVm;
+    UINT8 SkipRipAdvance; // TRUE = nao adiantar RIP (EPT violation, MTF)
 } SHV_VP_STATE, *PSHV_VP_STATE;
 
 typedef struct _SHV_CALLBACK_CONTEXT
@@ -57,6 +58,18 @@ VOID
 ShvVmxEntry (
     VOID
     );
+
+UINT64
+ShvVmxCall (
+    _In_ UINT64 Magic
+    );
+
+//
+// ShvSyscallTrampoline e ShvVmxInstallSyscallHook estao desativados.
+// Requerem KPTI desativado -- veja o bloco #if 0 em shvvmxhv.c.
+//
+// VOID ShvSyscallTrampoline (VOID);
+// VOID ShvVmxInstallSyscallHook (VOID);
 
 INT32
 ShvVmxLaunchOnVp (
@@ -99,6 +112,37 @@ ShvVmxProbe (
 
 VOID
 ShvVmxEptInitialize (
+    _In_ PSHV_VP_DATA VpData
+    );
+
+VOID
+ShvVmxMsrBitmapInitialize (
+    _In_ PSHV_VP_DATA VpData
+    );
+
+UINT8
+ShvVmxEptSplitLargePage (
+    _In_ PSHV_VP_DATA VpData,
+    _In_ UINT64 GuestPhysical
+    );
+
+VOID
+ShvVmxEptSetPermissions (
+    _In_ PSHV_VP_DATA VpData,
+    _In_ UINT64 GuestPhysical,
+    _In_ UINT8 Read,
+    _In_ UINT8 Write,
+    _In_ UINT8 Execute
+    );
+
+VOID
+ShvVmxInvept (
+    _In_ UINT64 Type,
+    _In_ VOID* Descriptor
+    );
+
+VOID
+ShvVmxInveptLocal (
     _In_ PSHV_VP_DATA VpData
     );
 
@@ -181,4 +225,9 @@ ShvOsRunCallbackOnProcessors (
     );
 
 extern PSHV_VP_DATA* ShvGlobalData;
+
+// Endereco fisico do hook EPT (KiSystemCall64). Zero = hook nao instalado.
+// Definido em shvvmxhv.c, usado em shvvmx.c para saber onde instalar.
+extern volatile UINT64 ShvEptHookPhysical;
+extern volatile UINT64 ShvEptHookHitCount;
 
