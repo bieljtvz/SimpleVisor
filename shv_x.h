@@ -82,8 +82,9 @@ typedef struct _SHV_VP_DATA
             UINT64 EptPml4PhysicalAddress;
             UINT32 EptControls;
 
-            // Campos usados pelo EPT execute hook
+            // Campos usados pelo EPT hook
             UINT64 MtfRestorePhysical;  // GPA a re-restringir no proximo MTF exit
+            UINT64 EptHookVersion;      // versao da tabela de hooks aplicada a este CPU
             UINT32 EptPtUsed;           // quantas entradas em EptPtPdpteIndex estao em uso
             UINT32 EptPtPdpteIndex[8];  // qual PDPTE e dono de cada PT
             UINT32 EptPtPdeIndex[8];    // qual PDE e dono de cada PT

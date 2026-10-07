@@ -231,3 +231,8 @@ extern PSHV_VP_DATA* ShvGlobalData;
 extern volatile UINT64 ShvEptHookPhysical;
 extern volatile UINT64 ShvEptHookHitCount;
 
+// Tabela de hooks EPT instalados via IOCTL (shvvmxhv.c)
+// Retornam SHVD_STATUS_* de shv_dbg.h
+UINT32 ShvHookInstall(_In_ UINT64 PhysAddr, _In_ UINT8 HookType);
+UINT32 ShvHookRemove(_In_ UINT64 PhysAddr);
+

@@ -16,6 +16,12 @@
     <WindowsTargetPlatformVersion>$(LatestTargetPlatformVersion)</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='UEFI|x64'">
+    <PlatformToolset>v145</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='NT|x64'">
+    <Driver_SpectreMitigation>false</Driver_SpectreMitigation>
+  </PropertyGroup>
   <Import Project="$(Configuration)\$(Configuration).default.props" />
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)'=='UEFI'">
@@ -29,22 +35,29 @@
   <PropertyGroup>
     <IncludePath>$(IncludePath);$(VC_IncludePath)</IncludePath>
   </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='NT|x64'">
+    <DriverSign>
+      <AdditionalOptions>/fd SHA256 %(AdditionalOptions)</AdditionalOptions>
+    </DriverSign>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="shv.c" />
     <ClCompile Include="shvutil.c" />
     <ClCompile Include="shvvmx.c" />
     <ClCompile Include="shvvmxhv.c" />
     <ClCompile Include="shvvp.c" />
-    <ClCompile Include="$(Configuration)\shvos.c"/>
+    <ClCompile Include="$(Configuration)\shvos.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="shv.h" />
+    <ClInclude Include="shv_comm.h" />
+    <ClInclude Include="shv_dbg.h" />
     <ClInclude Include="ntint.h" />
     <ClInclude Include="shv_x.h" />
     <ClInclude Include="vmx.h" />
   </ItemGroup>
   <ItemGroup>
     <MASM Include="shvvmxhvx64.asm" />
-    <MASM Include="$(Configuration)\shvosx64.asm"/>
+    <MASM Include="$(Configuration)\shvosx64.asm" />
   </ItemGroup>
 </Project>

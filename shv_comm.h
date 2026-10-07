@@ -45,7 +45,8 @@ Abstract:
 //
 #define SHV_EVENT_LSTAR_READ        1   // RDMSR no LSTAR (ex: PatchGuard verificando)
 #define SHV_EVENT_LSTAR_WRITE       2   // WRMSR no LSTAR (ex: Windows configurando syscall)
-#define SHV_EVENT_EPT_EXEC          3   // EPT execute violation (hook futuro)
+#define SHV_EVENT_EPT_EXEC          3   // EPT execute violation
+#define SHV_EVENT_EPT_WRITE         4   // EPT write violation
 
 //
 // Tamanho do ring buffer de eventos. Deve ser potencia de 2.

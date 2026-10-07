@@ -22,6 +22,7 @@ Environment:
 
 #include "shv.h"
 #include "shv_comm.h"
+#include "shv_dbg.h"
 
 //
 // Contador de VM-exits. Incrementado a cada exit para confirmar que o
@@ -44,12 +45,29 @@ volatile UINT64 ShvLstarWriteCount = 0;
 volatile UINT64 ShvLastLstarValue  = 0;
 
 //
-// EPT execute hook: endereco fisico monitorado e contador de execucoes.
-// ShvEptHookPhysical e definido aqui e lido por shvvmx.c para saber
-// onde instalar o hook durante ShvVmxLaunchOnVp.
+// EPT execute hook legado: KiSystemCall64 instalado em ShvVmxLaunchOnVp.
+// Mantido para compatibilidade com CPUID sub-leaf SHV_QUERY_HOOK_HITS.
 //
 volatile UINT64 ShvEptHookPhysical = 0;
 volatile UINT64 ShvEptHookHitCount = 0;
+
+//
+// Tabela de hooks EPT instalados pelo usermode via IOCTL.
+// A versao (ShvHookVersion) e incrementada a cada install/remove.
+// Cada CPU aplica a tabela lazily no proximo VM-exit quando detecta
+// que sua copia local (VpData->EptHookVersion) esta desatualizada.
+//
+#define SHV_HOOK_MAX_ENTRIES    16
+
+typedef struct _SHV_HOOK_ENTRY
+{
+    UINT64 PhysAddr;    // GPA alinhada a 4KB; 0 = slot livre
+    UINT8  Type;        // SHV_HOOK_EXEC | SHV_HOOK_WRITE
+    UINT64 HitCount;
+} SHV_HOOK_ENTRY;
+
+static SHV_HOOK_ENTRY ShvHookTable[SHV_HOOK_MAX_ENTRIES];
+volatile UINT64       ShvHookVersion = 0;
 
 //
 // Ring buffer de eventos: o hypervisor escreve aqui a cada interceptacao
@@ -101,6 +119,147 @@ ShvHvPushEvent (
     ev->Value     = Value;
     _mm_sfence();           // garante que Value/Type chegam a memoria antes de SeqNum
     ev->SeqNum    = (UINT32)idx;
+}
+
+//
+// Instala um hook EPT na tabela global. Chamado pelo IOCTL handler (PASSIVE_LEVEL).
+// Retorna SHVD_STATUS_OK ou SHVD_STATUS_ERR_FULL.
+//
+UINT32
+ShvHookInstall (
+    _In_ UINT64 PhysAddr,
+    _In_ UINT8  HookType
+    )
+{
+    UINT32 i;
+    UINT64 page = PhysAddr & ~0xFFFULL;
+
+    // Atualiza entrada existente para esta pagina
+    for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
+    {
+        if (ShvHookTable[i].PhysAddr == page)
+        {
+            ShvHookTable[i].Type |= HookType;
+            _InterlockedIncrement64((LONG64*)&ShvHookVersion);
+            return SHVD_STATUS_OK;
+        }
+    }
+
+    // Slot livre
+    for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
+    {
+        if (ShvHookTable[i].PhysAddr == 0)
+        {
+            ShvHookTable[i].PhysAddr  = page;
+            ShvHookTable[i].Type      = HookType;
+            ShvHookTable[i].HitCount  = 0;
+            _InterlockedIncrement64((LONG64*)&ShvHookVersion);
+            return SHVD_STATUS_OK;
+        }
+    }
+
+    return SHVD_STATUS_ERR_FULL;
+}
+
+//
+// Remove um hook EPT da tabela global.
+// Retorna SHVD_STATUS_OK ou SHVD_STATUS_ERR_NOTFOUND.
+//
+UINT32
+ShvHookRemove (
+    _In_ UINT64 PhysAddr
+    )
+{
+    UINT32 i;
+    UINT64 page = PhysAddr & ~0xFFFULL;
+
+    for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
+    {
+        if (ShvHookTable[i].PhysAddr == page)
+        {
+            ShvHookTable[i].PhysAddr = 0;
+            ShvHookTable[i].Type     = 0;
+            ShvHookTable[i].HitCount = 0;
+            _InterlockedIncrement64((LONG64*)&ShvHookVersion);
+            return SHVD_STATUS_OK;
+        }
+    }
+
+    return SHVD_STATUS_ERR_NOTFOUND;
+}
+
+//
+// Aplica todos os hooks da tabela global ao EPT deste CPU.
+// Chamado quando VpData->EptHookVersion < ShvHookVersion.
+// Roda em VMX root mode (nenhuma chamada de SO aqui).
+//
+static VOID
+ShvVmxEptApplyHooks (
+    _In_ PSHV_VP_DATA VpData
+    )
+{
+    UINT32 i;
+
+    for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
+    {
+        UINT64 pa;
+        UINT8  type;
+        UINT8  r, w, x;
+
+        if (ShvHookTable[i].PhysAddr == 0)
+        {
+            continue;
+        }
+
+        pa   = ShvHookTable[i].PhysAddr;
+        type = ShvHookTable[i].Type;
+
+        // Garante que a pagina grande foi dividida em 4KB PTEs
+        ShvVmxEptSplitLargePage(VpData, pa);
+
+        r = 1;
+        w = (type & SHV_HOOK_WRITE) ? 0 : 1;
+        x = (type & SHV_HOOK_EXEC)  ? 0 : 1;
+
+        ShvVmxEptSetPermissions(VpData, pa, r, w, x);
+    }
+
+    ShvVmxInveptLocal(VpData);
+}
+
+//
+// Re-arma o hook na pagina indicada consultando tanto o hook legado
+// (ShvEptHookPhysical) quanto a tabela de hooks.
+// Chamado pelo handler de MTF apos o guest executar 1 instrucao.
+//
+static VOID
+ShvVmxEptRearmHook (
+    _In_ PSHV_VP_DATA VpData,
+    _In_ UINT64       GuestPa
+    )
+{
+    UINT32 i;
+    UINT64 page = GuestPa & ~0xFFFULL;
+    UINT8  r = 1, w = 1, x = 1;
+
+    // Hook legado de KiSystemCall64
+    if (page == ShvEptHookPhysical)
+    {
+        x = 0;
+    }
+
+    // Tabela de hooks do usermode
+    for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
+    {
+        if (ShvHookTable[i].PhysAddr == page)
+        {
+            if (ShvHookTable[i].Type & SHV_HOOK_EXEC)  x = 0;
+            if (ShvHookTable[i].Type & SHV_HOOK_WRITE) w = 0;
+        }
+    }
+
+    ShvVmxEptSetPermissions(VpData, page, r, w, x);
+    ShvVmxInveptLocal(VpData);
 }
 
 DECLSPEC_NORETURN
@@ -458,15 +617,16 @@ ShvVmxHandleVmx (
 //
 // Handler para EXIT_REASON_EPT_VIOLATION (razao 48).
 //
-// Quando o guest tenta executar uma pagina marcada sem permissao Execute no EPT,
-// o hardware gera um VM-exit. Aqui:
-//   1. Contamos a execucao no hook.
-//   2. Publicamos o evento no ring buffer.
-//   3. Temporariamente restauramos a permissao Execute para a instrucao passar.
-//   4. Ligamos o MTF (Monitor Trap Flag) para re-armar o hook apos 1 instrucao.
+// Suporta violacoes de Execute (bit 2) e Write (bit 1) na Exit Qualification.
 //
-// SkipRipAdvance = TRUE porque o guest ainda nao executou a instrucao que
-// causou a violation -- ela deve ser re-tentada com as permissoes restauradas.
+// Fluxo para qualquer tipo de violacao:
+//   1. Identifica o tipo (exec/write) e o hook ativo (legado ou tabela).
+//   2. Registra o hit e publica o evento no ring buffer.
+//   3. Restaura permissoes completas temporariamente para o guest executar 1 instrucao.
+//   4. Liga o MTF para re-armar o hook apos essa instrucao.
+//
+// SkipRipAdvance = TRUE: a instrucao que causou a violation nao foi executada
+// ainda -- o guest deve re-tenta-la com as permissoes temporariamente restauradas.
 //
 VOID
 ShvVmxHandleEptViolation (
@@ -476,32 +636,59 @@ ShvVmxHandleEptViolation (
 {
     UINT64 exitQual;
     UINT64 guestPa;
+    UINT64 page;
     UINT64 controls;
+    UINT32 i;
 
     exitQual = ShvVmxRead(EXIT_QUALIFICATION);
     guestPa  = ShvVmxRead(GUEST_PHYSICAL_ADDRESS);
+    page     = guestPa & ~0xFFFULL;
 
-    // Bit 2 da Exit Qualification = fetch de instrucao (execute violation)
+    // Bit 2 = instruction fetch (execute violation)
     if ((exitQual & 0x4) != 0)
     {
-        // E o nosso hook?
-        if (guestPa == ShvEptHookPhysical)
+        // Hook legado de KiSystemCall64
+        if (page == ShvEptHookPhysical)
         {
             ShvEptHookHitCount++;
             ShvHvPushEvent(SHV_EVENT_EPT_EXEC, guestPa);
         }
 
-        // Restaura execucao temporariamente para o guest poder avançar
-        ShvVmxEptSetPermissions(VpData, guestPa, 1, 1, 1);
-        ShvVmxInveptLocal(VpData);
-
-        // Arma MTF para re-restringir apos exatamente 1 instrucao do guest
-        VpData->MtfRestorePhysical = guestPa;
-        controls = ShvVmxRead(CPU_BASED_VM_EXEC_CONTROL);
-        __vmx_vmwrite(CPU_BASED_VM_EXEC_CONTROL, controls | CPU_BASED_MONITOR_TRAP_FLAG);
+        // Tabela de hooks do usermode
+        for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
+        {
+            if ((ShvHookTable[i].PhysAddr == page) &&
+                (ShvHookTable[i].Type & SHV_HOOK_EXEC))
+            {
+                ShvHookTable[i].HitCount++;
+                ShvHvPushEvent(SHV_EVENT_EPT_EXEC, guestPa);
+            }
+        }
+    }
+    // Bit 1 = data write violation
+    else if ((exitQual & 0x2) != 0)
+    {
+        for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
+        {
+            if ((ShvHookTable[i].PhysAddr == page) &&
+                (ShvHookTable[i].Type & SHV_HOOK_WRITE))
+            {
+                ShvHookTable[i].HitCount++;
+                ShvHvPushEvent(SHV_EVENT_EPT_WRITE, guestPa);
+            }
+        }
     }
 
-    // Nao avanca o RIP -- o guest deve re-executar a instrucao com Execute=1
+    // Restaura todas as permissoes para o guest executar 1 instrucao
+    ShvVmxEptSetPermissions(VpData, page, 1, 1, 1);
+    ShvVmxInveptLocal(VpData);
+
+    // Arma MTF para re-restringir apos essa instrucao
+    VpData->MtfRestorePhysical = page;
+    controls = ShvVmxRead(CPU_BASED_VM_EXEC_CONTROL);
+    __vmx_vmwrite(CPU_BASED_VM_EXEC_CONTROL, controls | CPU_BASED_MONITOR_TRAP_FLAG);
+
+    // Nao avanca o RIP -- o guest deve re-executar a instrucao com permissoes ok
     VpState->SkipRipAdvance = TRUE;
 }
 
@@ -509,7 +696,8 @@ ShvVmxHandleEptViolation (
 // Handler para EXIT_REASON_MONITOR_TRAP_FLAG (razao 37).
 //
 // O MTF dispara um VM-exit apos exatamente 1 instrucao do guest.
-// Aqui re-removemos a permissao Execute para re-armar o hook.
+// Usa ShvVmxEptRearmHook para restaurar as restricoes corretas
+// consultando tanto o hook legado quanto a tabela de hooks.
 //
 VOID
 ShvVmxHandleMtf (
@@ -521,8 +709,7 @@ ShvVmxHandleMtf (
 
     if (VpData->MtfRestorePhysical != 0)
     {
-        ShvVmxEptSetPermissions(VpData, VpData->MtfRestorePhysical, 1, 1, 0);
-        ShvVmxInveptLocal(VpData);
+        ShvVmxEptRearmHook(VpData, VpData->MtfRestorePhysical);
         VpData->MtfRestorePhysical = 0;
     }
 
@@ -542,6 +729,13 @@ ShvVmxHandleExit (
 {
     ShvExitCount++;
     ShvLastExitReason = VpState->ExitReason;
+
+    // Aplica hooks pendentes a este CPU quando a tabela foi atualizada
+    if (VpData->EptHookVersion != ShvHookVersion)
+    {
+        ShvVmxEptApplyHooks(VpData);
+        VpData->EptHookVersion = ShvHookVersion;
+    }
 
     // Por default avancamos o RIP; EPT violation e MTF desligam esse flag.
     VpState->SkipRipAdvance = FALSE;

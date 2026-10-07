@@ -23,8 +23,14 @@ Environment:
 #include <ntifs.h>
 #include <stdarg.h>
 #include "..\shv_x.h"
+#include "..\shv_dbg.h"
 #pragma warning(disable:4221)
 #pragma warning(disable:4204)
+
+// Declaracoes das funcoes de hook (definidas em shvvmxhv.c)
+// Nao incluimos shv.h aqui para evitar conflito com ntifs.h.
+UINT32 ShvHookInstall(_In_ UINT64 PhysAddr, _In_ UINT8 HookType);
+UINT32 ShvHookRemove(_In_ UINT64 PhysAddr);
 
 NTKERNELAPI
 _IRQL_requires_max_(APC_LEVEL)
@@ -77,7 +83,352 @@ typedef struct _SHV_DPC_CONTEXT
 #define KGDT64_R3_DATA      0x28
 #define KGDT64_R3_CMTEB     0x50
 
-PVOID g_PowerCallbackRegistration;
+PVOID           g_PowerCallbackRegistration;
+PDEVICE_OBJECT  g_ShvDeviceObject;
+
+// ============================================================
+// IOCTL Dispatcher
+// ============================================================
+
+//
+// ZwQuerySystemInformation -- nao importado automaticamente pelo ntifs.h
+//
+typedef enum _SYSTEM_INFORMATION_CLASS_SHV
+{
+    SystemProcessInformation  = 5,
+    SystemModuleInformation   = 11
+} SYSTEM_INFORMATION_CLASS_SHV;
+
+NTSTATUS
+ZwQuerySystemInformation (
+    _In_      ULONG  SystemInformationClass,
+    _Out_opt_ PVOID  SystemInformation,
+    _In_      ULONG  SystemInformationLength,
+    _Out_opt_ PULONG ReturnLength
+    );
+
+typedef struct _SYSTEM_PROCESS_INFORMATION_SHV
+{
+    ULONG          NextEntryOffset;
+    ULONG          NumberOfThreads;
+    LARGE_INTEGER  Reserved[3];
+    LARGE_INTEGER  CreateTime;
+    LARGE_INTEGER  UserTime;
+    LARGE_INTEGER  KernelTime;
+    UNICODE_STRING ImageName;
+    KPRIORITY      BasePriority;
+    HANDLE         UniqueProcessId;
+    HANDLE         InheritedFromUniqueProcessId;
+    ULONG          HandleCount;
+    ULONG          SessionId;
+    ULONG_PTR      PageDirectoryBase;     // CR3 do processo
+    // ... campos restantes nao precisamos
+} SYSTEM_PROCESS_INFORMATION_SHV, *PSYSTEM_PROCESS_INFORMATION_SHV;
+
+typedef struct _RTL_PROCESS_MODULE_INFORMATION
+{
+    HANDLE Section;
+    PVOID  MappedBase;
+    PVOID  ImageBase;
+    ULONG  ImageSize;
+    ULONG  Flags;
+    USHORT LoadOrderIndex;
+    USHORT InitOrderIndex;
+    USHORT LoadCount;
+    USHORT OffsetToFileName;
+    UCHAR  FullPathName[256];
+} RTL_PROCESS_MODULE_INFORMATION, *PRTL_PROCESS_MODULE_INFORMATION;
+
+typedef struct _RTL_PROCESS_MODULES
+{
+    ULONG                       NumberOfModules;
+    RTL_PROCESS_MODULE_INFORMATION Modules[1];
+} RTL_PROCESS_MODULES, *PRTL_PROCESS_MODULES;
+
+static NTSTATUS
+ShvDispatchIoctl (
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ PIRP Irp
+    )
+{
+    PIO_STACK_LOCATION  ioStack;
+    SHV_REQUEST         req;
+    SHV_RESPONSE        resp;
+    ULONG               inputLen;
+    ULONG               outputLen;
+    NTSTATUS            status = STATUS_SUCCESS;
+    PVOID               buffer;
+
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    RtlZeroMemory(&resp, sizeof(resp));
+    resp.Status = SHVD_STATUS_ERR_INVALID;
+
+    ioStack   = IoGetCurrentIrpStackLocation(Irp);
+    buffer    = Irp->AssociatedIrp.SystemBuffer;
+    inputLen  = ioStack->Parameters.DeviceIoControl.InputBufferLength;
+    outputLen = ioStack->Parameters.DeviceIoControl.OutputBufferLength;
+
+    if (ioStack->Parameters.DeviceIoControl.IoControlCode != SHV_IOCTL_SUBMIT)
+    {
+        status = STATUS_INVALID_DEVICE_REQUEST;
+        goto Exit;
+    }
+
+    if (inputLen < sizeof(SHV_REQUEST) || outputLen < sizeof(SHV_RESPONSE) || buffer == NULL)
+    {
+        resp.Status = SHVD_STATUS_ERR_INVALID;
+        goto CopyOut;
+    }
+
+    RtlCopyMemory(&req, buffer, sizeof(SHV_REQUEST));
+
+    switch (req.Command)
+    {
+    case SHV_CMD_HOOK_EPT:
+    {
+        UINT64 page = req.Hook.PhysAddr & ~0xFFFULL;
+        if (page == 0)
+        {
+            resp.Status = SHVD_STATUS_ERR_INVALID;
+            break;
+        }
+        resp.Status = ShvHookInstall(page, req.Hook.HookType);
+        break;
+    }
+
+    case SHV_CMD_UNHOOK_EPT:
+    {
+        UINT64 page = req.Unhook.PhysAddr & ~0xFFFULL;
+        resp.Status = ShvHookRemove(page);
+        break;
+    }
+
+    case SHV_CMD_TRANSLATE_VA:
+    {
+        PHYSICAL_ADDRESS pa;
+
+        if (req.Translate.Pid == 0)
+        {
+            // Kernel VA: MmGetPhysicalAddress direto
+            __try
+            {
+                pa = MmGetPhysicalAddress((PVOID)(ULONG_PTR)req.Translate.VirtAddr);
+                resp.PhysAddr = pa.QuadPart;
+                resp.Status   = SHVD_STATUS_OK;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                resp.Status = SHVD_STATUS_ERR_ACCESS;
+            }
+        }
+        else
+        {
+            // Process VA: attach -> translate -> detach
+            PEPROCESS process;
+            KAPC_STATE apcState;
+            NTSTATUS   lookupStatus;
+
+            lookupStatus = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)req.Translate.Pid,
+                                                      &process);
+            if (!NT_SUCCESS(lookupStatus))
+            {
+                resp.Status = SHVD_STATUS_ERR_ACCESS;
+                break;
+            }
+
+            KeStackAttachProcess(process, &apcState);
+            __try
+            {
+                pa = MmGetPhysicalAddress((PVOID)(ULONG_PTR)req.Translate.VirtAddr);
+                resp.PhysAddr = pa.QuadPart;
+                resp.Status   = SHVD_STATUS_OK;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                resp.Status = SHVD_STATUS_ERR_ACCESS;
+            }
+            KeUnstackDetachProcess(&apcState);
+            ObDereferenceObject(process);
+        }
+        break;
+    }
+
+    case SHV_CMD_READ_PHYS:
+    {
+        PHYSICAL_ADDRESS physAddr;
+        PVOID            mapped;
+        ULONG            size;
+
+        size = req.ReadPhys.Size;
+        if (size == 0 || size > SHV_MAX_READ_SIZE)
+        {
+            resp.Status = SHVD_STATUS_ERR_INVALID;
+            break;
+        }
+
+        physAddr.QuadPart = req.ReadPhys.PhysAddr;
+        mapped = MmMapIoSpace(physAddr, size, MmNonCached);
+        if (mapped == NULL)
+        {
+            resp.Status = SHVD_STATUS_ERR_ACCESS;
+            break;
+        }
+
+        RtlCopyMemory(resp.Data, mapped, size);
+        MmUnmapIoSpace(mapped, size);
+        resp.Count  = size;
+        resp.Status = SHVD_STATUS_OK;
+        break;
+    }
+
+    case SHV_CMD_LIST_PROCS:
+    {
+        ULONG  bufSize = 0x10000;
+        PVOID  sysInfo = ExAllocatePoolWithTag(PagedPool, bufSize, 'vhSP');
+        if (sysInfo == NULL)
+        {
+            resp.Status = SHVD_STATUS_ERR_NOMEM;
+            break;
+        }
+
+        {
+            NTSTATUS qStatus = ZwQuerySystemInformation(SystemProcessInformation,
+                                                        sysInfo, bufSize, NULL);
+            if (!NT_SUCCESS(qStatus))
+            {
+                ExFreePoolWithTag(sysInfo, 'vhSP');
+                resp.Status = SHVD_STATUS_ERR_ACCESS;
+                break;
+            }
+        }
+
+        {
+            PSYSTEM_PROCESS_INFORMATION_SHV entry =
+                (PSYSTEM_PROCESS_INFORMATION_SHV)sysInfo;
+            UINT32 count = 0;
+            UINT32 maxEntries = SHV_MAX_READ_SIZE / sizeof(SHV_PROC_ENTRY);
+
+            while (count < maxEntries)
+            {
+                PSHV_PROC_ENTRY pe = &resp.Procs[count];
+                RtlZeroMemory(pe, sizeof(*pe));
+
+                pe->Pid     = (unsigned long long)(ULONG_PTR)entry->UniqueProcessId;
+                pe->DirBase = (unsigned long long)entry->PageDirectoryBase;
+
+                if (entry->ImageName.Buffer != NULL && entry->ImageName.Length > 0)
+                {
+                    ULONG nameChars = entry->ImageName.Length / sizeof(WCHAR);
+                    ULONG i;
+                    if (nameChars >= SHV_PROC_NAME_LEN)
+                    {
+                        nameChars = SHV_PROC_NAME_LEN - 1;
+                    }
+                    for (i = 0; i < nameChars; i++)
+                    {
+                        pe->Name[i] = (char)entry->ImageName.Buffer[i];
+                    }
+                }
+
+                count++;
+
+                if (entry->NextEntryOffset == 0)
+                {
+                    break;
+                }
+                entry = (PSYSTEM_PROCESS_INFORMATION_SHV)
+                        ((ULONG_PTR)entry + entry->NextEntryOffset);
+            }
+
+            resp.Count  = count;
+            resp.Status = SHVD_STATUS_OK;
+        }
+
+        ExFreePoolWithTag(sysInfo, 'vhSP');
+        break;
+    }
+
+    case SHV_CMD_LIST_MODULES:
+    {
+        ULONG  bufSize = 0x20000;
+        PVOID  sysInfo = ExAllocatePoolWithTag(PagedPool, bufSize, 'vhSM');
+        if (sysInfo == NULL)
+        {
+            resp.Status = SHVD_STATUS_ERR_NOMEM;
+            break;
+        }
+
+        {
+            NTSTATUS qStatus = ZwQuerySystemInformation(SystemModuleInformation,
+                                                        sysInfo, bufSize, NULL);
+            if (!NT_SUCCESS(qStatus))
+            {
+                ExFreePoolWithTag(sysInfo, 'vhSM');
+                resp.Status = SHVD_STATUS_ERR_ACCESS;
+                break;
+            }
+        }
+
+        {
+            PRTL_PROCESS_MODULES mods = (PRTL_PROCESS_MODULES)sysInfo;
+            UINT32 count = 0;
+            UINT32 maxEntries = SHV_MAX_READ_SIZE / sizeof(SHV_MODULE_ENTRY);
+            UINT32 i;
+
+            for (i = 0; i < mods->NumberOfModules && count < maxEntries; i++)
+            {
+                PRTL_PROCESS_MODULE_INFORMATION mi = &mods->Modules[i];
+                PSHV_MODULE_ENTRY               me = &resp.Modules[count];
+
+                RtlZeroMemory(me, sizeof(*me));
+                me->Base = (unsigned long long)(ULONG_PTR)mi->ImageBase;
+                me->Size = (unsigned long long)mi->ImageSize;
+
+                {
+                    ULONG nameLen = 0;
+                    const char* src = (const char*)(mi->FullPathName + mi->OffsetToFileName);
+                    while (nameLen < SHV_MOD_NAME_LEN - 1 && src[nameLen] != '\0') nameLen++;
+                    RtlCopyMemory(me->Name, src, nameLen);
+                }
+                count++;
+            }
+
+            resp.Count  = count;
+            resp.Status = SHVD_STATUS_OK;
+        }
+
+        ExFreePoolWithTag(sysInfo, 'vhSM');
+        break;
+    }
+
+    default:
+        resp.Status = SHVD_STATUS_ERR_INVALID;
+        break;
+    }
+
+CopyOut:
+    RtlCopyMemory(buffer, &resp, sizeof(SHV_RESPONSE));
+    Irp->IoStatus.Information = sizeof(SHV_RESPONSE);
+
+Exit:
+    Irp->IoStatus.Status = status;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return status;
+}
+
+static NTSTATUS
+ShvDispatchPassthrough (
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ PIRP Irp
+    )
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    Irp->IoStatus.Status      = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
 
 NTSTATUS
 FORCEINLINE
@@ -350,7 +701,17 @@ DriverUnload (
     _In_ PDRIVER_OBJECT DriverObject
     )
 {
+    UNICODE_STRING symLink = RTL_CONSTANT_STRING(SHV_DEVICE_LINK);
+
     UNREFERENCED_PARAMETER(DriverObject);
+
+    // Remove symbolic link e device object
+    IoDeleteSymbolicLink(&symLink);
+    if (g_ShvDeviceObject != NULL)
+    {
+        IoDeleteDevice(g_ShvDeviceObject);
+        g_ShvDeviceObject = NULL;
+    }
 
     //
     // Unregister the power callback. We would not have loaded without it
@@ -373,6 +734,8 @@ DriverEntry (
     PCALLBACK_OBJECT callbackObject;
     UNICODE_STRING callbackName =
         RTL_CONSTANT_STRING(L"\\Callback\\PowerState");
+    UNICODE_STRING devName  = RTL_CONSTANT_STRING(SHV_DEVICE_NAME);
+    UNICODE_STRING symLink  = RTL_CONSTANT_STRING(SHV_DEVICE_LINK);
     OBJECT_ATTRIBUTES objectAttributes =
         RTL_CONSTANT_OBJECT_ATTRIBUTES(&callbackName,
                                        OBJ_CASE_INSENSITIVE |
@@ -382,7 +745,33 @@ DriverEntry (
     //
     // Make the driver (and SHV itself) unloadable
     //
-    DriverObject->DriverUnload = DriverUnload;
+    DriverObject->DriverUnload                         = DriverUnload;
+    DriverObject->MajorFunction[IRP_MJ_CREATE]         = ShvDispatchPassthrough;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE]          = ShvDispatchPassthrough;
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = ShvDispatchIoctl;
+
+    //
+    // Create device object para o IOCTL interface
+    //
+    status = IoCreateDevice(DriverObject,
+                            0,
+                            &devName,
+                            FILE_DEVICE_UNKNOWN,
+                            FILE_DEVICE_SECURE_OPEN,
+                            FALSE,
+                            &g_ShvDeviceObject);
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
+    status = IoCreateSymbolicLink(&symLink, &devName);
+    if (!NT_SUCCESS(status))
+    {
+        IoDeleteDevice(g_ShvDeviceObject);
+        g_ShvDeviceObject = NULL;
+        return status;
+    }
 
     //
     // Create the power state callback
@@ -412,6 +801,9 @@ DriverEntry (
     //
     if (g_PowerCallbackRegistration == NULL)
     {
+        IoDeleteSymbolicLink(&symLink);
+        IoDeleteDevice(g_ShvDeviceObject);
+        g_ShvDeviceObject = NULL;
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -427,6 +819,9 @@ DriverEntry (
     if (!NT_SUCCESS(status))
     {
         ExUnregisterCallback(g_PowerCallbackRegistration);
+        IoDeleteSymbolicLink(&symLink);
+        IoDeleteDevice(g_ShvDeviceObject);
+        g_ShvDeviceObject = NULL;
     }
 
     return status;
