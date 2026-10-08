@@ -81,11 +81,13 @@ volatile UINT64       ShvHookVersion = 0;
 //
 typedef struct _SHV_HV_EVENT
 {
-    UINT32 SeqNum;      // identificador sequencial; usermode usa para detectar novidades
+    UINT32 SeqNum;      // identificador sequencial
     UINT8  Type;        // SHV_EVENT_* de shv_comm.h
     UINT8  CpuNumber;   // qual processador logico gerou o evento
     UINT16 Reserved;
-    UINT64 Value;       // LSTAR value para eventos MSR; GPA para EPT
+    UINT64 Value;       // GuestRIP para violacoes EPT; valor do MSR para LSTAR
+    UINT64 ReturnAddr;  // [GUEST_RSP] para exec hooks; GuestRIP para write hooks
+    UINT64 Aux;         // GPA para write hooks; GUEST_RIP para LSTAR events
 } SHV_HV_EVENT, *PSHV_HV_EVENT;
 
 static SHV_HV_EVENT ShvEventBuffer[SHV_EVENT_RING_SIZE];
@@ -99,27 +101,29 @@ volatile UINT64     ShvEventCount = 0; // total de eventos escritos (nunca decre
 static VOID
 ShvHvPushEvent (
     _In_ UINT8  Type,
-    _In_ UINT64 Value
+    _In_ UINT64 Value,
+    _In_ UINT64 ReturnAddr,
+    _In_ UINT64 Aux
     )
 {
     LONG64   idx;
     UINT32   slot;
     PSHV_HV_EVENT ev;
 
-    // Reserva o proximo slot de forma atomica
     idx  = _InterlockedIncrement64((LONG64*)&ShvEventCount) - 1;
     slot = (UINT32)(idx % SHV_EVENT_RING_SIZE);
     ev   = &ShvEventBuffer[slot];
 
-    // Preenche a entrada ANTES de gravar o SeqNum, assim o usermode que
-    // checar o SeqNum ve um valor consistente
-    ev->Type      = Type;
-    ev->CpuNumber = (UINT8)ShvOsGetCurrentProcessorNumber();
-    ev->Reserved  = 0;
-    ev->Value     = Value;
-    _mm_sfence();           // garante que Value/Type chegam a memoria antes de SeqNum
-    ev->SeqNum    = (UINT32)idx;
+    ev->Type       = Type;
+    ev->CpuNumber  = (UINT8)ShvOsGetCurrentProcessorNumber();
+    ev->Reserved   = 0;
+    ev->Value      = Value;
+    ev->ReturnAddr = ReturnAddr;
+    ev->Aux        = Aux;
+    _mm_sfence();
+    ev->SeqNum     = (UINT32)idx;
 }
+
 
 //
 // Instala um hook EPT na tabela global. Chamado pelo IOCTL handler (PASSIVE_LEVEL).
@@ -432,14 +436,28 @@ ShvVmxHandleCpuid (
         else if (subleaf >= SHV_QUERY_EVENT_BASE &&
                  subleaf <  SHV_QUERY_EVENT_BASE + SHV_EVENT_RING_SIZE)
         {
-            // Entrada individual do ring buffer.
-            // EAX=SeqNum, EBX=Value.Lo, ECX=Value.Hi, EDX=(Type<<8)|CpuNum
+            // Parte base do evento: EAX=SeqNum, EBX=Value.Lo, ECX=Value.Hi, EDX=(Type<<8)|CpuNum
+            // Value = GuestRIP para EPT; valor do MSR para LSTAR
             ev = &ShvEventBuffer[subleaf - SHV_QUERY_EVENT_BASE];
             counter.QuadPart     = ev->Value;
             VpState->VpRegs->Rax = ev->SeqNum;
             VpState->VpRegs->Rbx = counter.LowPart;
             VpState->VpRegs->Rcx = counter.HighPart;
             VpState->VpRegs->Rdx = ((UINT32)ev->Type << 8) | ev->CpuNumber;
+        }
+        else if (subleaf >= SHV_QUERY_EVENT_EXT_BASE &&
+                 subleaf <  SHV_QUERY_EVENT_EXT_BASE + SHV_EVENT_RING_SIZE)
+        {
+            // Parte extendida do mesmo slot: retorna ReturnAddr e Aux.
+            // EAX=ReturnAddr.Lo, EBX=ReturnAddr.Hi, ECX=Aux.Lo, EDX=Aux.Hi
+            LARGE_INTEGER aux;
+            ev = &ShvEventBuffer[subleaf - SHV_QUERY_EVENT_EXT_BASE];
+            counter.QuadPart     = ev->ReturnAddr;
+            aux.QuadPart         = ev->Aux;
+            VpState->VpRegs->Rax = counter.LowPart;
+            VpState->VpRegs->Rbx = counter.HighPart;
+            VpState->VpRegs->Rcx = aux.LowPart;
+            VpState->VpRegs->Rdx = aux.HighPart;
         }
 
         return;
@@ -549,9 +567,11 @@ ShvVmxHandleMsrRead (
     //
     if (msr == MSR_LSTAR)
     {
+        UINT64 rip = ShvVmxRead(GUEST_RIP);
         ShvLstarReadCount++;
         ShvLastLstarValue = value.QuadPart;
-        ShvHvPushEvent(SHV_EVENT_LSTAR_READ, value.QuadPart);
+        // Value = valor do MSR, ReturnAddr = RIP de quem fez RDMSR, Aux = 0
+        ShvHvPushEvent(SHV_EVENT_LSTAR_READ, value.QuadPart, rip, 0);
     }
 
     VpState->VpRegs->Rax = value.LowPart;
@@ -576,9 +596,10 @@ ShvVmxHandleMsrWrite (
     //
     if (msr == MSR_LSTAR)
     {
+        UINT64 rip = ShvVmxRead(GUEST_RIP);
         ShvLstarWriteCount++;
         ShvLastLstarValue = value.QuadPart;
-        ShvHvPushEvent(SHV_EVENT_LSTAR_WRITE, value.QuadPart);
+        ShvHvPushEvent(SHV_EVENT_LSTAR_WRITE, value.QuadPart, rip, 0);
     }
 
     __writemsr(msr, value.QuadPart);
@@ -615,6 +636,26 @@ ShvVmxHandleVmx (
 }
 
 //
+// Le [RSP] do guest de forma segura em VMX root.
+// So tenta dereferenciar enderecos canonicos de kernel (>= 0xFFFF800000000000),
+// alinhados a 8 bytes. Pilha de kernel e sempre non-paged -- acesso seguro.
+// RSP em modo usuario (< 0x8000000000000000) retorna 0.
+//
+static UINT64
+ShvReadGuestReturnAddress (
+    VOID
+    )
+{
+    UINT64 rsp = ShvVmxRead(GUEST_RSP);
+
+    if (rsp >= 0xFFFF800000000000ULL && (rsp & 0x7) == 0)
+    {
+        return *(volatile UINT64*)rsp;
+    }
+    return 0;
+}
+
+//
 // Handler para EXIT_REASON_EPT_VIOLATION (razao 48).
 //
 // Suporta violacoes de Execute (bit 2) e Write (bit 1) na Exit Qualification.
@@ -647,34 +688,49 @@ ShvVmxHandleEptViolation (
     // Bit 2 = instruction fetch (execute violation)
     if ((exitQual & 0x4) != 0)
     {
-        // Hook legado de KiSystemCall64
+        //
+        // Value      = GuestRIP (VA da instrucao que sera executada = inicio da funcao).
+        // ReturnAddr = [GUEST_RSP] = quem chamou essa funcao (return address do caller).
+        //              Se RSP for user-mode (e.g. na fronteira de SYSCALL), retorna 0.
+        // Aux        = GPA da pagina executada.
+        //
+        UINT64 guestRip = ShvVmxRead(GUEST_RIP);
+        UINT64 retAddr  = ShvReadGuestReturnAddress();
+
         if (page == ShvEptHookPhysical)
         {
             ShvEptHookHitCount++;
-            ShvHvPushEvent(SHV_EVENT_EPT_EXEC, guestPa);
+            ShvHvPushEvent(SHV_EVENT_EPT_EXEC, guestRip, retAddr, guestPa);
         }
 
-        // Tabela de hooks do usermode
         for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
         {
             if ((ShvHookTable[i].PhysAddr == page) &&
                 (ShvHookTable[i].Type & SHV_HOOK_EXEC))
             {
                 ShvHookTable[i].HitCount++;
-                ShvHvPushEvent(SHV_EVENT_EPT_EXEC, guestPa);
+                ShvHvPushEvent(SHV_EVENT_EPT_EXEC, guestRip, retAddr, guestPa);
             }
         }
     }
     // Bit 1 = data write violation
     else if ((exitQual & 0x2) != 0)
     {
+        //
+        // Value      = GuestRIP (instrucao que esta escrevendo = o "caller").
+        // ReturnAddr = [GUEST_RSP] = quem chamou a funcao que esta escrevendo.
+        // Aux        = GPA da pagina que esta sendo escrita.
+        //
+        UINT64 guestRip = ShvVmxRead(GUEST_RIP);
+        UINT64 retAddr  = ShvReadGuestReturnAddress();
+
         for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
         {
             if ((ShvHookTable[i].PhysAddr == page) &&
                 (ShvHookTable[i].Type & SHV_HOOK_WRITE))
             {
                 ShvHookTable[i].HitCount++;
-                ShvHvPushEvent(SHV_EVENT_EPT_WRITE, guestPa);
+                ShvHvPushEvent(SHV_EVENT_EPT_WRITE, guestRip, retAddr, guestPa);
             }
         }
     }

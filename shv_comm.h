@@ -38,6 +38,11 @@ Abstract:
 #define SHV_QUERY_EVENT_BASE        11  // ECX=11+slot -> entrada do ring buffer:
                                         //   EAX=SeqNum, EBX=Value.Low,
                                         //   ECX=Value.High, EDX=(Type<<8)|CpuNum
+                                        // Value = GuestRIP para EPT; MSR value para LSTAR
+#define SHV_QUERY_EVENT_EXT_BASE    27  // ECX=27+slot -> parte extendida do mesmo slot:
+                                        //   EAX=ReturnAddr.Low, EBX=ReturnAddr.High
+                                        //   ECX=Aux.Low (GPA para write, 0 para exec)
+                                        //   EDX=Aux.High
 
 //
 // Tipos de evento armazenados no ring buffer.

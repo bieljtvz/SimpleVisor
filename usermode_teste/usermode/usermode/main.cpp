@@ -39,6 +39,7 @@ Abstract:
 #define SHV_QUERY_HOOK_HITS     5
 #define SHV_QUERY_EVENT_INFO    10
 #define SHV_QUERY_EVENT_BASE    11
+#define SHV_QUERY_EVENT_EXT_BASE 27
 #define SHV_EVENT_LSTAR_READ    1
 #define SHV_EVENT_LSTAR_WRITE   2
 #define SHV_EVENT_EPT_EXEC      3
@@ -139,18 +140,28 @@ struct EventEntry {
     uint32_t seqNum;
     uint8_t  type;
     uint8_t  cpu;
-    uint64_t value;
+    uint64_t value;       // GuestRIP para EPT; valor MSR para LSTAR
+    uint64_t returnAddr;  // [RSP] no momento da violacao (caller return addr)
+    uint64_t aux;         // GPA para EPT; GuestRIP para LSTAR
 };
 
 static EventEntry ReadSlot(int slot)
 {
     int r[4];
-    __cpuidex(r, SHV_CPUID_LEAF, SHV_QUERY_EVENT_BASE + slot);
     EventEntry e = {};
+
+    // Parte base: SeqNum, Value (GuestRIP/MSR), Type, CPU
+    __cpuidex(r, SHV_CPUID_LEAF, SHV_QUERY_EVENT_BASE + slot);
     e.seqNum = (uint32_t)r[0];
     e.value  = ((uint64_t)(uint32_t)r[2] << 32) | (uint32_t)r[1];
     e.type   = (uint8_t)((r[3] >> 8) & 0xFF);
     e.cpu    = (uint8_t)(r[3] & 0xFF);
+
+    // Parte extendida: ReturnAddr, Aux
+    __cpuidex(r, SHV_CPUID_LEAF, SHV_QUERY_EVENT_EXT_BASE + slot);
+    e.returnAddr = ((uint64_t)(uint32_t)r[1] << 32) | (uint32_t)r[0];
+    e.aux        = ((uint64_t)(uint32_t)r[3] << 32) | (uint32_t)r[2];
+
     return e;
 }
 
@@ -266,13 +277,15 @@ static const char* EventName(uint8_t type)
 // ======================================================
 // ============================================================
 
-#define DISPLAY_ROWS 20
+#define DISPLAY_ROWS 10
 
 struct DisplayEvent {
     uint32_t seqNum;
     uint8_t  type;
     uint8_t  cpu;
-    uint64_t value;
+    uint64_t value;       // GuestRIP (EPT) ou valor MSR (LSTAR)
+    uint64_t returnAddr;  // [RSP] = caller return address
+    uint64_t aux;         // GPA (EPT) ou GuestRIP (LSTAR)
 };
 
 static DisplayEvent g_log[DISPLAY_ROWS];
@@ -312,10 +325,12 @@ static void RunEventsMode()
             if (e.type != 0 && e.seqNum == seqTarget)
             {
                 DisplayEvent de;
-                de.seqNum = e.seqNum;
-                de.type   = e.type;
-                de.cpu    = e.cpu;
-                de.value  = e.value;
+                de.seqNum     = e.seqNum;
+                de.type       = e.type;
+                de.cpu        = e.cpu;
+                de.value      = e.value;
+                de.returnAddr = e.returnAddr;
+                de.aux        = e.aux;
                 PushLog(de);
             }
         }
@@ -339,7 +354,8 @@ static void RunEventsMode()
                present ? "ATIVO" : "INATIVO", totalEvents);
 
         SetColor(C_HEADER);
-        printf("  #Seq    CPU  Tipo          Valor                       \n");
+        printf("  #Seq    CPU  Tipo        RIP/Valor                   \n");
+        printf("         RetAddr / Caller  Aux (GPA)                   \n");
         printf("--------------------------------------------------------\n");
 
         for (int i = 0; i < DISPLAY_ROWS; i++)
@@ -349,12 +365,27 @@ static void RunEventsMode()
             {
                 DisplayEvent& e = g_log[idx];
                 SetColor(EventColor(e.type));
-                printf("  [%05u]  CPU%u  %-12s  0x%016llX    \n",
+
+                // Linha 1: sequencia, CPU, tipo, RIP/Value
+                printf("  [%05u]  CPU%u  %-10s  0x%016llX    \n",
                        e.seqNum, e.cpu, EventName(e.type), e.value);
+
+                // Linha 2: returnAddr e aux (indentado para parecer hierarquico)
+                SetColor(C_NORMAL);
+                if (e.returnAddr != 0 || e.aux != 0)
+                {
+                    printf("         ret=0x%016llX  aux=0x%016llX\n",
+                           e.returnAddr, e.aux);
+                }
+                else
+                {
+                    printf("%-56s\n", "");
+                }
             }
             else
             {
                 SetColor(C_NORMAL);
+                printf("%-56s\n", "");
                 printf("%-56s\n", "");
             }
         }
