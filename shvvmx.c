@@ -450,6 +450,12 @@ ShvVmxEnterRootModeOnVp (
         // Enable EPT if these features are supported
         //
         VpData->EptControls = SECONDARY_EXEC_ENABLE_EPT | SECONDARY_EXEC_ENABLE_VPID;
+
+        //
+        // Record execute-only EPT support for CPUID sub-leaf SHV_QUERY_EPT_CAPS.
+        //
+        ShvEptExecuteOnlySupported =
+            ((VpData->MsrData[12].QuadPart & VMX_EPT_EXECUTE_ONLY_BIT) != 0) ? 1 : 0;
     }
 
     //

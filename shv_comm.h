@@ -34,15 +34,13 @@ Abstract:
 #define SHV_QUERY_EXIT_COUNT        3   // total de VM-exits desde o load
 #define SHV_QUERY_LAST_LSTAR        4   // ultimo valor lido/escrito no LSTAR
 #define SHV_QUERY_HOOK_HITS         5   // total de EPT execute hooks disparados (KiSystemCall64)
+#define SHV_QUERY_EPT_CAPS          6   // EAX bit0=execute-only EPT suportado
 #define SHV_QUERY_EVENT_INFO        10  // EAX=total de eventos escritos, EBX=ring size
 #define SHV_QUERY_EVENT_BASE        11  // ECX=11+slot -> entrada do ring buffer:
                                         //   EAX=SeqNum, EBX=Value.Low,
                                         //   ECX=Value.High, EDX=(Type<<8)|CpuNum
                                         // Value = GuestRIP para EPT; MSR value para LSTAR
-#define SHV_QUERY_EVENT_EXT_BASE    27  // ECX=27+slot -> parte extendida do mesmo slot:
-                                        //   EAX=ReturnAddr.Low, EBX=ReturnAddr.High
-                                        //   ECX=Aux.Low (GPA para write, 0 para exec)
-                                        //   EDX=Aux.High
+#define SHV_QUERY_EVENT_EXT_BASE    (SHV_QUERY_EVENT_BASE + SHV_EVENT_RING_SIZE)
 
 //
 // Tipos de evento armazenados no ring buffer.
@@ -57,4 +55,4 @@ Abstract:
 // Tamanho do ring buffer de eventos. Deve ser potencia de 2.
 // Quando cheio, entradas mais antigas sao sobrescritas.
 //
-#define SHV_EVENT_RING_SIZE         16
+#define SHV_EVENT_RING_SIZE         256

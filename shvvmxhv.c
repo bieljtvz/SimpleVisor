@@ -65,10 +65,15 @@ typedef struct _SHV_HOOK_ENTRY
     UINT64 ShadowPhysAddr; // PA da shadow page; 0 = hook EPT normal
     UINT8  Type;           // SHV_HOOK_EXEC | SHV_HOOK_WRITE (para hooks normais)
     UINT64 HitCount;
+    UINT64 VirtAddr;       // VA original do hook (para exibicao na GUI)
+    UINT64 Pid;            // PID do processo alvo (0 = kernel)
+    UINT64 RangeSize;      // numero de paginas hookadas neste bloco
 } SHV_HOOK_ENTRY;
 
 static SHV_HOOK_ENTRY ShvHookTable[SHV_HOOK_MAX_ENTRIES];
 volatile UINT64       ShvHookVersion = 0;
+
+UINT8 ShvEptExecuteOnlySupported = 0;
 
 //
 // Estado compartilhado entre shvvmxhv.c (EPT) e nt/hpv_hooks.c (NT-side).
@@ -142,7 +147,10 @@ ShvHvPushEvent (
 UINT32
 ShvHookInstall (
     _In_ UINT64 PhysAddr,
-    _In_ UINT8  HookType
+    _In_ UINT8  HookType,
+    _In_ UINT64 VirtAddr,
+    _In_ UINT64 Pid,
+    _In_ UINT64 RangeSize
     )
 {
     UINT32 i;
@@ -167,6 +175,9 @@ ShvHookInstall (
             ShvHookTable[i].PhysAddr  = page;
             ShvHookTable[i].Type      = HookType;
             ShvHookTable[i].HitCount  = 0;
+            ShvHookTable[i].VirtAddr  = VirtAddr;
+            ShvHookTable[i].Pid       = Pid;
+            ShvHookTable[i].RangeSize = RangeSize ? RangeSize : 1;
             _InterlockedIncrement64((LONG64*)&ShvHookVersion);
             return SHVD_STATUS_OK;
         }
@@ -214,9 +225,16 @@ ShvHookRemoveAll (
     UINT32 i;
     for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
     {
-        ShvHookTable[i].PhysAddr = 0;
-        ShvHookTable[i].Type     = 0;
-        ShvHookTable[i].HitCount = 0;
+        // Preserva shadow hooks (ShadowPhysAddr != 0) -- esses sao gerenciados
+        // por ShvHookRemoveShadow, nao pelo UNHOOK_ALL de EPT hooks normais.
+        if (ShvHookTable[i].ShadowPhysAddr != 0)
+            continue;
+        ShvHookTable[i].PhysAddr  = 0;
+        ShvHookTable[i].Type      = 0;
+        ShvHookTable[i].HitCount  = 0;
+        ShvHookTable[i].VirtAddr  = 0;
+        ShvHookTable[i].Pid       = 0;
+        ShvHookTable[i].RangeSize = 0;
     }
     _InterlockedIncrement64((LONG64*)&ShvHookVersion);
 }
@@ -330,16 +348,16 @@ ShvListEptHooks (
 
     for (i = 0; i < SHV_HOOK_MAX_ENTRIES && count < MaxCount; i++)
     {
-        if (ShvHookTable[i].PhysAddr != 0)
+        if (ShvHookTable[i].PhysAddr != 0 && ShvHookTable[i].ShadowPhysAddr == 0)
         {
             PSHV_EPT_HOOK_INFO e = (PSHV_EPT_HOOK_INFO)((UINT8*)OutBuffer + count * EntrySize);
             __stosb((UINT8*)e, 0, EntrySize);
             e->PhysAddr  = ShvHookTable[i].PhysAddr;
-            e->VirtAddr  = 0;
-            e->Pid       = 0;
+            e->VirtAddr  = ShvHookTable[i].VirtAddr;
+            e->Pid       = ShvHookTable[i].Pid;
             e->HitCount  = ShvHookTable[i].HitCount;
             e->RangeStart= ShvHookTable[i].PhysAddr;
-            e->RangeSize = 1;
+            e->RangeSize = ShvHookTable[i].RangeSize ? ShvHookTable[i].RangeSize : 1;
             e->Type      = ShvHookTable[i].Type;
             count++;
         }
@@ -625,6 +643,11 @@ ShvVmxHandleCpuid (
             VpState->VpRegs->Rcx = counter.HighPart;
             VpState->VpRegs->Rdx = ((UINT32)ev->Type << 8) | ev->CpuNumber;
         }
+        else if (subleaf == SHV_QUERY_EPT_CAPS)
+        {
+            // EAX bit0 = execute-only EPT suportado pelo hardware
+            VpState->VpRegs->Rax = ShvEptExecuteOnlySupported & 1u;
+        }
         else if (subleaf >= SHV_QUERY_EVENT_EXT_BASE &&
                  subleaf <  SHV_QUERY_EVENT_EXT_BASE + SHV_EVENT_RING_SIZE)
         {
@@ -652,25 +675,6 @@ ShvVmxHandleCpuid (
     // leaves como a 4h e Bh que tem multiplos niveis de informacao.
     //
     __cpuidex(cpu_info, (INT32)VpState->VpRegs->Rax, (INT32)VpState->VpRegs->Rcx);
-
-    //
-    // Leaf 1h: informacoes basicas do processador e features.
-    // Aproveitamos para setar o bit 31 de ECX, que por convencao indica
-    // que um hypervisor esta presente. Isso e o que VMware, Hyper-V e
-    // outros hypervisors fazem para se anunciar ao SO guest.
-    //
-    if (VpState->VpRegs->Rax == 1)
-    {
-        cpu_info[2] |= HYPERV_HYPERVISOR_PRESENT_BIT;
-    }
-    else if (VpState->VpRegs->Rax == HYPERV_CPUID_INTERFACE)
-    {
-        //
-        // Leaf de identificacao do hypervisor (0x40000001).
-        // Retorna nossa assinatura "Shv " em EAX.
-        //
-        cpu_info[0] = ' vhS';
-    }
 
     //
     // Copia os resultados do CPUID de volta para os registradores do guest.

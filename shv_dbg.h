@@ -268,6 +268,9 @@ typedef struct _SHV_SHADOW_PAGE_RECORD
     unsigned long long ShadowPa;
     void*              ShadowVa;
     unsigned int       RefCount;
+    unsigned int       Offset;
+    unsigned int       PatchLen;
+    unsigned char      PatchBytes[SHV_SHADOW_PATCH_MAX];
 } SHV_SHADOW_PAGE_RECORD, *PSHV_SHADOW_PAGE_RECORD;
 
 typedef struct _SHV_SYSCALL_HOOK_ENTRY

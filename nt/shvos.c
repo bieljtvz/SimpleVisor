@@ -275,7 +275,8 @@ ShvDispatchIoctl (
                 __except (EXCEPTION_EXECUTE_HANDLER) { pa.QuadPart = 0; }
                 if ((pa.QuadPart & ~0xFFFULL) != 0)
                 {
-                    ShvHookInstall(pa.QuadPart & ~0xFFFULL, req.Hook.HookType);
+                    ShvHookInstall(pa.QuadPart & ~0xFFFULL, req.Hook.HookType,
+                                   va, 0, req.Hook.RangeSize ? req.Hook.RangeSize : 1);
                     hooked++;
                 }
             }
@@ -338,7 +339,10 @@ ShvDispatchIoctl (
                 if (gpa != 0)
                 {
                     if (i == 0) firstPa = gpa;
-                    ShvHookInstall(gpa, req.Hook.HookType);
+                    ShvHookInstall(gpa, req.Hook.HookType,
+                                   vaBase + (UINT64)i * PAGE_SIZE,
+                                   req.Hook.Pid,
+                                   req.Hook.RangeSize ? req.Hook.RangeSize : 1);
                     hooked++;
                 }
             }
@@ -897,6 +901,9 @@ ShvDispatchIoctl (
         g_ShadowPages[freeSlot].ShadowPa = physAddr.QuadPart;
         g_ShadowPages[freeSlot].ShadowVa = shadowVa;
         g_ShadowPages[freeSlot].RefCount  = 1;
+        g_ShadowPages[freeSlot].Offset    = offset;
+        g_ShadowPages[freeSlot].PatchLen  = patchLen;
+        RtlCopyMemory(g_ShadowPages[freeSlot].PatchBytes, req.Shadow.PatchBytes, patchLen);
 
         resp->Status = ShvHookInstallShadow(gpa, physAddr.QuadPart);
         ShvLog("[SHV-IOCTL] HOOK_SHADOW GPA=%016llX shadowPA=%016llX offset=%u len=%u -> status=%u\n",
@@ -985,10 +992,13 @@ ShvDispatchIoctl (
             {
                 PSHV_SHADOW_HOOK_INFO shi = &resp->ShadowHookInfos[count];
                 RtlZeroMemory(shi, sizeof(*shi));
-                shi->GpaPage = g_ShadowPages[i].Gpa;
-                shi->Offset  = 0;
-                shi->PatchLen = 0;
-                shi->FuncVa  = 0;
+                shi->GpaPage  = g_ShadowPages[i].Gpa;
+                shi->Offset   = g_ShadowPages[i].Offset;
+                shi->PatchLen = g_ShadowPages[i].PatchLen;
+                shi->FuncVa   = 0;
+                if (g_ShadowPages[i].PatchLen <= SHV_SHADOW_PATCH_MAX)
+                    RtlCopyMemory(shi->PatchBytes, g_ShadowPages[i].PatchBytes,
+                                  g_ShadowPages[i].PatchLen);
                 count++;
             }
         }
