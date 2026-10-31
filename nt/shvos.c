@@ -24,13 +24,12 @@ Environment:
 #include <stdarg.h>
 #include "..\shv_x.h"
 #include "..\shv_dbg.h"
+#include "..\shvhooks.h"
 #pragma warning(disable:4221)
 #pragma warning(disable:4204)
+#pragma warning(disable:4996)  // ExAllocatePoolWithTag deprecated em WDK recente
 
-// Declaracoes das funcoes de hook (definidas em shvvmxhv.c)
-// Nao incluimos shv.h aqui para evitar conflito com ntifs.h.
-UINT32 ShvHookInstall(_In_ UINT64 PhysAddr, _In_ UINT8 HookType);
-UINT32 ShvHookRemove(_In_ UINT64 PhysAddr);
+#include "shvos_internal.h"
 
 NTKERNELAPI
 _IRQL_requires_max_(APC_LEVEL)
@@ -121,9 +120,13 @@ typedef struct _SYSTEM_PROCESS_INFORMATION_SHV
     HANDLE         InheritedFromUniqueProcessId;
     ULONG          HandleCount;
     ULONG          SessionId;
-    ULONG_PTR      PageDirectoryBase;     // CR3 do processo
-    // ... campos restantes nao precisamos
+    // NOTA: em Vista+ o campo +104 e UniqueProcessKey, NAO PageDirectoryBase.
+    // PageDirectoryBase foi removido de ZwQuerySystemInformation; usar EPROCESS+0x28.
 } SYSTEM_PROCESS_INFORMATION_SHV, *PSYSTEM_PROCESS_INFORMATION_SHV;
+
+// Offset de KPROCESS.DirectoryTableBase dentro de EPROCESS no x64 Win10.
+// EPROCESS comeca com KPROCESS; Pcb.DirectoryTableBase esta em +0x28.
+#define EPROCESS_DIR_TABLE_BASE_OFFSET 0x28
 
 typedef struct _RTL_PROCESS_MODULE_INFORMATION
 {
@@ -145,24 +148,74 @@ typedef struct _RTL_PROCESS_MODULES
     RTL_PROCESS_MODULE_INFORMATION Modules[1];
 } RTL_PROCESS_MODULES, *PRTL_PROCESS_MODULES;
 
-static NTSTATUS
+// ============================================================
+// Tabela de MDLs: guarda os MDLs que travam paginas user-mode durante hooks EPT.
+// Indexado pela PA do primeiro byte da regiao (page-aligned).
+// ============================================================
+#define SHV_MDL_TABLE_MAX 64
+typedef struct _SHV_MDL_ENTRY { UINT64 FirstPa; PMDL Mdl; } SHV_MDL_ENTRY;
+static SHV_MDL_ENTRY g_MdlTable[SHV_MDL_TABLE_MAX];
+
+VOID ShvHookSetMdl(_In_ UINT64 Pa, _In_ PMDL Mdl)
+{
+    UINT32 i;
+    for (i = 0; i < SHV_MDL_TABLE_MAX; i++)
+    {
+        if (g_MdlTable[i].Mdl == NULL)
+        {
+            g_MdlTable[i].FirstPa = Pa;
+            g_MdlTable[i].Mdl     = Mdl;
+            return;
+        }
+    }
+}
+
+PMDL ShvHookTakeMdl(_In_ UINT64 Pa)
+{
+    UINT32 i;
+    for (i = 0; i < SHV_MDL_TABLE_MAX; i++)
+    {
+        if (g_MdlTable[i].Mdl != NULL && g_MdlTable[i].FirstPa == Pa)
+        {
+            PMDL mdl = g_MdlTable[i].Mdl;
+            g_MdlTable[i].Mdl     = NULL;
+            g_MdlTable[i].FirstPa = 0;
+            return mdl;
+        }
+    }
+    return NULL;
+}
+
+VOID ShvHookReleaseMdls(VOID)
+{
+    UINT32 i;
+    for (i = 0; i < SHV_MDL_TABLE_MAX; i++)
+    {
+        if (g_MdlTable[i].Mdl != NULL)
+        {
+            MmUnlockPages(g_MdlTable[i].Mdl);
+            IoFreeMdl(g_MdlTable[i].Mdl);
+            g_MdlTable[i].Mdl     = NULL;
+            g_MdlTable[i].FirstPa = 0;
+        }
+    }
+}
+
+NTSTATUS
 ShvDispatchIoctl (
     _In_ PDEVICE_OBJECT DeviceObject,
     _In_ PIRP Irp
     )
 {
     PIO_STACK_LOCATION  ioStack;
-    SHV_REQUEST         req;
-    SHV_RESPONSE        resp;
+    SHV_REQUEST         req;        // ~68 bytes, fine on stack
+    PSHV_RESPONSE       resp;       // points into SystemBuffer (pool alloc by I/O manager)
     ULONG               inputLen;
     ULONG               outputLen;
     NTSTATUS            status = STATUS_SUCCESS;
     PVOID               buffer;
 
     UNREFERENCED_PARAMETER(DeviceObject);
-
-    RtlZeroMemory(&resp, sizeof(resp));
-    resp.Status = SHVD_STATUS_ERR_INVALID;
 
     ioStack   = IoGetCurrentIrpStackLocation(Irp);
     buffer    = Irp->AssociatedIrp.SystemBuffer;
@@ -177,30 +230,209 @@ ShvDispatchIoctl (
 
     if (inputLen < sizeof(SHV_REQUEST) || outputLen < sizeof(SHV_RESPONSE) || buffer == NULL)
     {
-        resp.Status = SHVD_STATUS_ERR_INVALID;
-        goto CopyOut;
+        status = STATUS_INVALID_PARAMETER;
+        goto Exit;
     }
 
+    // Copy request before zeroing the SystemBuffer (input and output share it)
     RtlCopyMemory(&req, buffer, sizeof(SHV_REQUEST));
+
+    // Use SystemBuffer directly as response -- it is already a pool allocation
+    // of at least outputLen >= sizeof(SHV_RESPONSE) bytes.
+    resp = (PSHV_RESPONSE)buffer;
+    RtlZeroMemory(resp, sizeof(SHV_RESPONSE));
+    resp->Status = SHVD_STATUS_ERR_INVALID;
 
     switch (req.Command)
     {
     case SHV_CMD_HOOK_EPT:
     {
-        UINT64 page = req.Hook.PhysAddr & ~0xFFFULL;
-        if (page == 0)
+        UINT64 vaBase, vaEnd;
+        ULONG  regionBytes;
+        UINT32 hooked = 0;
+
+        if (req.Hook.VirtAddr == 0)
         {
-            resp.Status = SHVD_STATUS_ERR_INVALID;
+            resp->Status = SHVD_STATUS_ERR_INVALID;
             break;
         }
-        resp.Status = ShvHookInstall(page, req.Hook.HookType);
+
+        // Page-align o intervalo
+        vaBase      = req.Hook.VirtAddr & ~(UINT64)0xFFF;
+        vaEnd       = (req.Hook.VirtAddr + (req.Hook.RangeSize ? req.Hook.RangeSize : PAGE_SIZE) + 0xFFF)
+                      & ~(UINT64)0xFFF;
+        regionBytes = (ULONG)(vaEnd - vaBase);
+        if (regionBytes == 0) regionBytes = PAGE_SIZE;
+
+        if (req.Hook.Pid == 0)
+        {
+            // Kernel: paginas nao-paginadas; itera direto por VA
+            UINT64 va;
+            for (va = vaBase; va < vaEnd; va += PAGE_SIZE)
+            {
+                PHYSICAL_ADDRESS pa;
+                __try { pa = MmGetPhysicalAddress((PVOID)(ULONG_PTR)va); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { pa.QuadPart = 0; }
+                if ((pa.QuadPart & ~0xFFFULL) != 0)
+                {
+                    ShvHookInstall(pa.QuadPart & ~0xFFFULL, req.Hook.HookType);
+                    hooked++;
+                }
+            }
+            resp->Status = hooked ? SHVD_STATUS_OK : SHVD_STATUS_ERR_ACCESS;
+            ShvLog("[SHV-IOCTL] HOOK_EPT kernel VA=%016llX-%016llX pages=%u\n",
+                   vaBase, vaEnd, hooked);
+        }
+        else
+        {
+            // User-mode: trava todas as paginas com MDL para PA nao mudar
+            PEPROCESS process;
+            PMDL      mdl;
+            PPFN_NUMBER pfnArray;
+            ULONG       pageCount, i;
+            KAPC_STATE  apcState;
+            UINT64      firstPa = 0;
+
+            if (!NT_SUCCESS(PsLookupProcessByProcessId(
+                    (HANDLE)(ULONG_PTR)req.Hook.Pid, &process)))
+            {
+                resp->Status = SHVD_STATUS_ERR_ACCESS;
+                break;
+            }
+
+            mdl = IoAllocateMdl((PVOID)(ULONG_PTR)vaBase, regionBytes,
+                                 FALSE, FALSE, NULL);
+            if (mdl == NULL)
+            {
+                ObDereferenceObject(process);
+                resp->Status = SHVD_STATUS_ERR_NOMEM;
+                break;
+            }
+
+            // Trava as paginas fisicas (impede paging-out enquanto hook estiver ativo)
+            KeStackAttachProcess(process, &apcState);
+            __try
+            {
+                MmProbeAndLockPages(mdl, UserMode, IoReadAccess);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                IoFreeMdl(mdl);
+                mdl = NULL;
+            }
+            KeUnstackDetachProcess(&apcState);
+            ObDereferenceObject(process);
+
+            if (mdl == NULL)
+            {
+                resp->Status = SHVD_STATUS_ERR_ACCESS;
+                break;
+            }
+
+            // Itera PFNs e instala hook em cada pagina
+            pfnArray  = MmGetMdlPfnArray(mdl);
+            pageCount = ADDRESS_AND_SIZE_TO_SPAN_PAGES(vaBase, regionBytes);
+            for (i = 0; i < pageCount; i++)
+            {
+                UINT64 gpa = (UINT64)pfnArray[i] << PAGE_SHIFT;
+                if (gpa != 0)
+                {
+                    if (i == 0) firstPa = gpa;
+                    ShvHookInstall(gpa, req.Hook.HookType);
+                    hooked++;
+                }
+            }
+
+            // Guarda MDL indexado pela PA da primeira pagina para desbloquear no unhook
+            if (firstPa != 0)
+                ShvHookSetMdl(firstPa, mdl);
+            else
+            {
+                MmUnlockPages(mdl);
+                IoFreeMdl(mdl);
+            }
+
+            resp->Status = hooked ? SHVD_STATUS_OK : SHVD_STATUS_ERR_ACCESS;
+            ShvLog("[SHV-IOCTL] HOOK_EPT PID=%llu VA=%016llX-%016llX pages=%u locked\n",
+                   req.Hook.Pid, vaBase, vaEnd, hooked);
+        }
         break;
     }
 
     case SHV_CMD_UNHOOK_EPT:
     {
-        UINT64 page = req.Unhook.PhysAddr & ~0xFFFULL;
-        resp.Status = ShvHookRemove(page);
+        PHYSICAL_ADDRESS pa;
+        UINT64           vaBase;
+
+        if (req.Unhook.VirtAddr == 0)
+        {
+            resp->Status = SHVD_STATUS_ERR_INVALID;
+            break;
+        }
+
+        vaBase = req.Unhook.VirtAddr & ~(UINT64)0xFFF;
+
+        if (req.Unhook.Pid == 0)
+        {
+            // Kernel: traduz VA e remove hook da pagina
+            __try
+            {
+                pa = MmGetPhysicalAddress((PVOID)(ULONG_PTR)vaBase);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                resp->Status = SHVD_STATUS_ERR_ACCESS;
+                break;
+            }
+            resp->Status = ShvHookRemove(pa.QuadPart & ~0xFFFULL);
+        }
+        else
+        {
+            // User-mode: recupera MDL pelo PA da primeira pagina e remove todos os hooks
+            PEPROCESS process;
+            KAPC_STATE apcState;
+            PMDL       mdl;
+
+            if (!NT_SUCCESS(PsLookupProcessByProcessId(
+                    (HANDLE)(ULONG_PTR)req.Unhook.Pid, &process)))
+            {
+                resp->Status = SHVD_STATUS_ERR_ACCESS;
+                break;
+            }
+            KeStackAttachProcess(process, &apcState);
+            __try { pa = MmGetPhysicalAddress((PVOID)(ULONG_PTR)vaBase); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { pa.QuadPart = 0; }
+            KeUnstackDetachProcess(&apcState);
+            ObDereferenceObject(process);
+
+            if ((pa.QuadPart & ~0xFFFULL) == 0)
+            {
+                resp->Status = SHVD_STATUS_ERR_ACCESS;
+                break;
+            }
+
+            // Remove hook de todas as paginas do MDL
+            mdl = ShvHookTakeMdl(pa.QuadPart & ~0xFFFULL);
+            if (mdl != NULL)
+            {
+                PPFN_NUMBER pfnArray = MmGetMdlPfnArray(mdl);
+                ULONG pageCount = (MmGetMdlByteCount(mdl) + PAGE_SIZE - 1) / PAGE_SIZE;
+                ULONG i;
+                for (i = 0; i < pageCount; i++)
+                {
+                    UINT64 gpa = (UINT64)pfnArray[i] << PAGE_SHIFT;
+                    if (gpa != 0) ShvHookRemove(gpa);
+                }
+                MmUnlockPages(mdl);
+                IoFreeMdl(mdl);
+            }
+            else
+            {
+                // Sem MDL (ex: hook por kernel path) — remove apenas a pagina base
+                ShvHookRemove(pa.QuadPart & ~0xFFFULL);
+            }
+            resp->Status = SHVD_STATUS_OK;
+        }
         break;
     }
 
@@ -210,43 +442,36 @@ ShvDispatchIoctl (
 
         if (req.Translate.Pid == 0)
         {
-            // Kernel VA: MmGetPhysicalAddress direto
             __try
             {
                 pa = MmGetPhysicalAddress((PVOID)(ULONG_PTR)req.Translate.VirtAddr);
-                resp.PhysAddr = pa.QuadPart;
-                resp.Status   = SHVD_STATUS_OK;
+                resp->PhysAddr = pa.QuadPart;
+                resp->Status   = SHVD_STATUS_OK;
             }
             __except (EXCEPTION_EXECUTE_HANDLER)
             {
-                resp.Status = SHVD_STATUS_ERR_ACCESS;
+                resp->Status = SHVD_STATUS_ERR_ACCESS;
             }
         }
         else
         {
-            // Process VA: attach -> translate -> detach
             PEPROCESS process;
             KAPC_STATE apcState;
-            NTSTATUS   lookupStatus;
-
-            lookupStatus = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)req.Translate.Pid,
-                                                      &process);
-            if (!NT_SUCCESS(lookupStatus))
+            if (!NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)req.Translate.Pid, &process)))
             {
-                resp.Status = SHVD_STATUS_ERR_ACCESS;
+                resp->Status = SHVD_STATUS_ERR_ACCESS;
                 break;
             }
-
             KeStackAttachProcess(process, &apcState);
             __try
             {
                 pa = MmGetPhysicalAddress((PVOID)(ULONG_PTR)req.Translate.VirtAddr);
-                resp.PhysAddr = pa.QuadPart;
-                resp.Status   = SHVD_STATUS_OK;
+                resp->PhysAddr = pa.QuadPart;
+                resp->Status   = SHVD_STATUS_OK;
             }
             __except (EXCEPTION_EXECUTE_HANDLER)
             {
-                resp.Status = SHVD_STATUS_ERR_ACCESS;
+                resp->Status = SHVD_STATUS_ERR_ACCESS;
             }
             KeUnstackDetachProcess(&apcState);
             ObDereferenceObject(process);
@@ -263,7 +488,7 @@ ShvDispatchIoctl (
         size = req.ReadPhys.Size;
         if (size == 0 || size > SHV_MAX_READ_SIZE)
         {
-            resp.Status = SHVD_STATUS_ERR_INVALID;
+            resp->Status = SHVD_STATUS_ERR_INVALID;
             break;
         }
 
@@ -271,36 +496,48 @@ ShvDispatchIoctl (
         mapped = MmMapIoSpace(physAddr, size, MmNonCached);
         if (mapped == NULL)
         {
-            resp.Status = SHVD_STATUS_ERR_ACCESS;
+            resp->Status = SHVD_STATUS_ERR_ACCESS;
             break;
         }
 
-        RtlCopyMemory(resp.Data, mapped, size);
+        RtlCopyMemory(resp->Data, mapped, size);
         MmUnmapIoSpace(mapped, size);
-        resp.Count  = size;
-        resp.Status = SHVD_STATUS_OK;
+        resp->Count  = size;
+        resp->Status = SHVD_STATUS_OK;
         break;
     }
 
     case SHV_CMD_LIST_PROCS:
     {
-        ULONG  bufSize = 0x10000;
-        PVOID  sysInfo = ExAllocatePoolWithTag(PagedPool, bufSize, 'vhSP');
-        if (sysInfo == NULL)
-        {
-            resp.Status = SHVD_STATUS_ERR_NOMEM;
-            break;
-        }
+        ULONG    bufSize = 0x80000;   // 512KB inicial; sistemas com muitos processos/threads precisam de mais
+        PVOID    sysInfo = NULL;
+        NTSTATUS qStatus = STATUS_UNSUCCESSFUL;
+        UINT32   tries;
 
+        for (tries = 0; tries < 4; tries++)
         {
-            NTSTATUS qStatus = ZwQuerySystemInformation(SystemProcessInformation,
-                                                        sysInfo, bufSize, NULL);
-            if (!NT_SUCCESS(qStatus))
+            if (sysInfo) ExFreePoolWithTag(sysInfo, 'vhSP');
+            sysInfo = ExAllocatePoolWithTag(PagedPool, bufSize, 'vhSP');
+            if (sysInfo == NULL)
             {
-                ExFreePoolWithTag(sysInfo, 'vhSP');
-                resp.Status = SHVD_STATUS_ERR_ACCESS;
+                resp->Status = SHVD_STATUS_ERR_NOMEM;
                 break;
             }
+            qStatus = ZwQuerySystemInformation(SystemProcessInformation,
+                                               sysInfo, bufSize, NULL);
+            if (qStatus != STATUS_INFO_LENGTH_MISMATCH)
+                break;
+            bufSize *= 2;
+        }
+
+        if (sysInfo == NULL)
+            break;
+
+        if (!NT_SUCCESS(qStatus))
+        {
+            ExFreePoolWithTag(sysInfo, 'vhSP');
+            resp->Status = SHVD_STATUS_ERR_ACCESS;
+            break;
         }
 
         {
@@ -311,38 +548,42 @@ ShvDispatchIoctl (
 
             while (count < maxEntries)
             {
-                PSHV_PROC_ENTRY pe = &resp.Procs[count];
+                PSHV_PROC_ENTRY pe = &resp->Procs[count];
                 RtlZeroMemory(pe, sizeof(*pe));
 
                 pe->Pid     = (unsigned long long)(ULONG_PTR)entry->UniqueProcessId;
-                pe->DirBase = (unsigned long long)entry->PageDirectoryBase;
+
+                // Ler DirBase real do EPROCESS+0x28 (KPROCESS.DirectoryTableBase).
+                // ZwQuerySystemInformation nao expoe mais o CR3 em Vista+.
+                {
+                    PEPROCESS proc = NULL;
+                    if (NT_SUCCESS(PsLookupProcessByProcessId(entry->UniqueProcessId, &proc)))
+                    {
+                        pe->DirBase = *(UINT64*)((UINT8*)proc + EPROCESS_DIR_TABLE_BASE_OFFSET);
+                        ObDereferenceObject(proc);
+                    }
+                }
 
                 if (entry->ImageName.Buffer != NULL && entry->ImageName.Length > 0)
                 {
                     ULONG nameChars = entry->ImageName.Length / sizeof(WCHAR);
                     ULONG i;
                     if (nameChars >= SHV_PROC_NAME_LEN)
-                    {
                         nameChars = SHV_PROC_NAME_LEN - 1;
-                    }
                     for (i = 0; i < nameChars; i++)
-                    {
                         pe->Name[i] = (char)entry->ImageName.Buffer[i];
-                    }
                 }
 
                 count++;
 
                 if (entry->NextEntryOffset == 0)
-                {
                     break;
-                }
                 entry = (PSYSTEM_PROCESS_INFORMATION_SHV)
                         ((ULONG_PTR)entry + entry->NextEntryOffset);
             }
 
-            resp.Count  = count;
-            resp.Status = SHVD_STATUS_OK;
+            resp->Count  = count;
+            resp->Status = SHVD_STATUS_OK;
         }
 
         ExFreePoolWithTag(sysInfo, 'vhSP');
@@ -355,7 +596,7 @@ ShvDispatchIoctl (
         PVOID  sysInfo = ExAllocatePoolWithTag(PagedPool, bufSize, 'vhSM');
         if (sysInfo == NULL)
         {
-            resp.Status = SHVD_STATUS_ERR_NOMEM;
+            resp->Status = SHVD_STATUS_ERR_NOMEM;
             break;
         }
 
@@ -365,7 +606,7 @@ ShvDispatchIoctl (
             if (!NT_SUCCESS(qStatus))
             {
                 ExFreePoolWithTag(sysInfo, 'vhSM');
-                resp.Status = SHVD_STATUS_ERR_ACCESS;
+                resp->Status = SHVD_STATUS_ERR_ACCESS;
                 break;
             }
         }
@@ -379,7 +620,7 @@ ShvDispatchIoctl (
             for (i = 0; i < mods->NumberOfModules && count < maxEntries; i++)
             {
                 PRTL_PROCESS_MODULE_INFORMATION mi = &mods->Modules[i];
-                PSHV_MODULE_ENTRY               me = &resp.Modules[count];
+                PSHV_MODULE_ENTRY               me = &resp->Modules[count];
 
                 RtlZeroMemory(me, sizeof(*me));
                 me->Base = (unsigned long long)(ULONG_PTR)mi->ImageBase;
@@ -394,21 +635,374 @@ ShvDispatchIoctl (
                 count++;
             }
 
-            resp.Count  = count;
-            resp.Status = SHVD_STATUS_OK;
+            resp->Count  = count;
+            resp->Status = SHVD_STATUS_OK;
         }
 
         ExFreePoolWithTag(sysInfo, 'vhSM');
         break;
     }
 
-    default:
-        resp.Status = SHVD_STATUS_ERR_INVALID;
+    // ----------------------------------------------------------------
+    // EPT hook management
+    // ----------------------------------------------------------------
+    case SHV_CMD_UNHOOK_ALL:
+        ShvLog("[SHV-IOCTL] UNHOOK_ALL\n");
+        ShvHookReleaseMdls();   // desbloqueia paginas user-mode antes de remover hooks
+        ShvHookRemoveAll();
+        resp->Status = SHVD_STATUS_OK;
+        break;
+
+    case SHV_CMD_LIST_EPT_HOOKS:
+    {
+        UINT32 maxEntries = SHV_MAX_READ_SIZE / sizeof(SHV_EPT_HOOK_INFO);
+        resp->Count  = ShvListEptHooks(resp->EptHookInfos, maxEntries, sizeof(SHV_EPT_HOOK_INFO));
+        resp->Status = SHVD_STATUS_OK;
         break;
     }
 
-CopyOut:
-    RtlCopyMemory(buffer, &resp, sizeof(SHV_RESPONSE));
+    case SHV_CMD_CLEAR_EVENTS:
+        ShvClearEvents();
+        resp->Status = SHVD_STATUS_OK;
+        break;
+
+    // ----------------------------------------------------------------
+    // Filtros de processo (NtOpenProcess via ObRegisterCallbacks)
+    // ----------------------------------------------------------------
+    case SHV_CMD_NTOP_PROTECT:
+        if (req.ProcFilter.Pid == 0)
+            resp->Status = SHVD_STATUS_ERR_INVALID;
+        else
+        {
+            resp->Status = NT_SUCCESS(ShvHooksAddProtected(req.ProcFilter.Pid))
+                           ? SHVD_STATUS_OK : SHVD_STATUS_ERR_FULL;
+            ShvLog("[SHV-IOCTL] PROTECT PID=%llu -> status=%u\n",
+                   req.ProcFilter.Pid, resp->Status);
+        }
+        break;
+
+    case SHV_CMD_NTOP_UNPROTECT:
+        if (req.ProcFilter.Pid == 0)
+            resp->Status = SHVD_STATUS_ERR_INVALID;
+        else
+        {
+            resp->Status = NT_SUCCESS(ShvHooksRemoveProtected(req.ProcFilter.Pid))
+                           ? SHVD_STATUS_OK : SHVD_STATUS_ERR_NOTFOUND;
+            ShvLog("[SHV-IOCTL] UNPROTECT PID=%llu -> status=%u\n",
+                   req.ProcFilter.Pid, resp->Status);
+        }
+        break;
+
+    case SHV_CMD_NTOP_MONITOR:
+        if (req.ProcFilter.Pid == 0)
+            resp->Status = SHVD_STATUS_ERR_INVALID;
+        else
+        {
+            resp->Status = NT_SUCCESS(ShvHooksAddMonitored(req.ProcFilter.Pid))
+                           ? SHVD_STATUS_OK : SHVD_STATUS_ERR_FULL;
+            ShvLog("[SHV-IOCTL] MONITOR PID=%llu -> status=%u\n",
+                   req.ProcFilter.Pid, resp->Status);
+        }
+        break;
+
+    case SHV_CMD_NTOP_UNMONITOR:
+        if (req.ProcFilter.Pid == 0)
+            resp->Status = SHVD_STATUS_ERR_INVALID;
+        else
+        {
+            resp->Status = NT_SUCCESS(ShvHooksRemoveMonitored(req.ProcFilter.Pid))
+                           ? SHVD_STATUS_OK : SHVD_STATUS_ERR_NOTFOUND;
+            ShvLog("[SHV-IOCTL] UNMONITOR PID=%llu -> status=%u\n",
+                   req.ProcFilter.Pid, resp->Status);
+        }
+        break;
+
+    case SHV_CMD_NTOP_PROTECT_NAME:
+    {
+        req.NameFilter.Name[SHV_PROC_NAME_LEN - 1] = '\0';
+        resp->Status = NT_SUCCESS(ShvHooksAddProtectedName(req.NameFilter.Name))
+                       ? SHVD_STATUS_OK : SHVD_STATUS_ERR_FULL;
+        ShvLog("[SHV-IOCTL] PROTECT_NAME \"%s\" -> status=%u\n",
+               req.NameFilter.Name, resp->Status);
+        break;
+    }
+
+    case SHV_CMD_NTOP_UNPROTECT_NAME:
+    {
+        req.NameFilter.Name[SHV_PROC_NAME_LEN - 1] = '\0';
+        resp->Status = NT_SUCCESS(ShvHooksRemoveProtectedName(req.NameFilter.Name))
+                       ? SHVD_STATUS_OK : SHVD_STATUS_ERR_NOTFOUND;
+        ShvLog("[SHV-IOCTL] UNPROTECT_NAME \"%s\" -> status=%u\n",
+               req.NameFilter.Name, resp->Status);
+        break;
+    }
+
+    case SHV_CMD_NTOP_MONITOR_NAME:
+    {
+        req.NameFilter.Name[SHV_PROC_NAME_LEN - 1] = '\0';
+        resp->Status = NT_SUCCESS(ShvHooksAddMonitoredName(req.NameFilter.Name))
+                       ? SHVD_STATUS_OK : SHVD_STATUS_ERR_FULL;
+        ShvLog("[SHV-IOCTL] MONITOR_NAME \"%s\" -> status=%u\n",
+               req.NameFilter.Name, resp->Status);
+        break;
+    }
+
+    case SHV_CMD_NTOP_UNMONITOR_NAME:
+    {
+        req.NameFilter.Name[SHV_PROC_NAME_LEN - 1] = '\0';
+        resp->Status = NT_SUCCESS(ShvHooksRemoveMonitoredName(req.NameFilter.Name))
+                       ? SHVD_STATUS_OK : SHVD_STATUS_ERR_NOTFOUND;
+        ShvLog("[SHV-IOCTL] UNMONITOR_NAME \"%s\" -> status=%u\n",
+               req.NameFilter.Name, resp->Status);
+        break;
+    }
+
+    case SHV_CMD_NTOP_LIST:
+    {
+        UINT32 maxEntries = SHV_MAX_READ_SIZE / sizeof(SHV_PROC_FILTER_ENTRY);
+        ShvHooksListFilters(resp->Filters, &resp->Count, maxEntries);
+        resp->Status = SHVD_STATUS_OK;
+        break;
+    }
+
+    // ----------------------------------------------------------------
+    // Leitura de memoria virtual
+    // ----------------------------------------------------------------
+    case SHV_CMD_READ_VIRT:
+    {
+        ULONG size = req.ReadVirt.Size;
+        if (size == 0 || size > SHV_MAX_READ_SIZE)
+        {
+            resp->Status = SHVD_STATUS_ERR_INVALID;
+            break;
+        }
+
+        if (req.ReadVirt.Pid == 0)
+        {
+            __try
+            {
+                RtlCopyMemory(resp->Data, (PVOID)(ULONG_PTR)req.ReadVirt.VirtAddr, size);
+                resp->Count  = size;
+                resp->Status = SHVD_STATUS_OK;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                resp->Status = SHVD_STATUS_ERR_ACCESS;
+            }
+        }
+        else
+        {
+            PEPROCESS  process;
+            KAPC_STATE apcState;
+            if (!NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)req.ReadVirt.Pid, &process)))
+            {
+                resp->Status = SHVD_STATUS_ERR_ACCESS;
+                break;
+            }
+            KeStackAttachProcess(process, &apcState);
+            __try
+            {
+                RtlCopyMemory(resp->Data, (PVOID)(ULONG_PTR)req.ReadVirt.VirtAddr, size);
+                resp->Count  = size;
+                resp->Status = SHVD_STATUS_OK;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                resp->Status = SHVD_STATUS_ERR_ACCESS;
+            }
+            KeUnstackDetachProcess(&apcState);
+            ObDereferenceObject(process);
+        }
+        break;
+    }
+
+    // ----------------------------------------------------------------
+    // Shadow hooks: split-page EPT
+    // ----------------------------------------------------------------
+    case SHV_CMD_HOOK_SHADOW:
+    {
+        UINT64           gpa      = req.Shadow.Gpa & ~0xFFFULL;
+        UINT32           offset   = req.Shadow.PatchOffset;
+        UINT32           patchLen = req.Shadow.PatchLen;
+        UINT32           i, freeSlot;
+        PVOID            shadowVa = NULL;
+        PHYSICAL_ADDRESS physAddr, lowest, highest, boundary;
+
+        if (gpa == 0 || patchLen == 0 || patchLen > SHV_SHADOW_PATCH_MAX ||
+            (UINT64)offset + patchLen > PAGE_SIZE)
+        {
+            resp->Status = SHVD_STATUS_ERR_INVALID;
+            break;
+        }
+
+        freeSlot = (UINT32)-1;
+        resp->Status = SHVD_STATUS_ERR_NOTFOUND;
+
+        for (i = 0; i < SHV_SHADOW_MAX; i++)
+        {
+            if (g_ShadowPages[i].Gpa == gpa)
+            {
+                // Shadow page already exists -- just apply new patch
+                RtlCopyMemory((UINT8*)g_ShadowPages[i].ShadowVa + offset,
+                              req.Shadow.PatchBytes, patchLen);
+                g_ShadowPages[i].RefCount++;
+                resp->Status = SHVD_STATUS_OK;
+                break;
+            }
+            if (g_ShadowPages[i].Gpa == 0 && freeSlot == (UINT32)-1)
+                freeSlot = i;
+        }
+
+        if (resp->Status == SHVD_STATUS_OK)
+            break;
+
+        if (freeSlot == (UINT32)-1)
+        {
+            resp->Status = SHVD_STATUS_ERR_FULL;
+            break;
+        }
+
+        lowest.QuadPart   = 0;
+        highest.QuadPart  = -1LL;
+        boundary.QuadPart = 0;
+
+        shadowVa = MmAllocateContiguousNodeMemory(PAGE_SIZE, lowest, highest, boundary,
+                                                  PAGE_EXECUTE_READWRITE,
+                                                  KeGetCurrentNodeNumber());
+        if (shadowVa == NULL)
+        {
+            resp->Status = SHVD_STATUS_ERR_NOMEM;
+            break;
+        }
+
+        // Copy original physical page content
+        physAddr.QuadPart = gpa;
+        {
+            PVOID origVa = MmMapIoSpace(physAddr, PAGE_SIZE, MmNonCached);
+            if (origVa == NULL)
+            {
+                MmFreeContiguousMemory(shadowVa);
+                resp->Status = SHVD_STATUS_ERR_ACCESS;
+                break;
+            }
+            RtlCopyMemory(shadowVa, origVa, PAGE_SIZE);
+            MmUnmapIoSpace(origVa, PAGE_SIZE);
+        }
+
+        // Apply patch to shadow copy
+        RtlCopyMemory((UINT8*)shadowVa + offset, req.Shadow.PatchBytes, patchLen);
+
+        physAddr = MmGetPhysicalAddress(shadowVa);
+        g_ShadowPages[freeSlot].Gpa      = gpa;
+        g_ShadowPages[freeSlot].ShadowPa = physAddr.QuadPart;
+        g_ShadowPages[freeSlot].ShadowVa = shadowVa;
+        g_ShadowPages[freeSlot].RefCount  = 1;
+
+        resp->Status = ShvHookInstallShadow(gpa, physAddr.QuadPart);
+        ShvLog("[SHV-IOCTL] HOOK_SHADOW GPA=%016llX shadowPA=%016llX offset=%u len=%u -> status=%u\n",
+               gpa, physAddr.QuadPart, offset, patchLen, resp->Status);
+        if (resp->Status != SHVD_STATUS_OK)
+        {
+            MmFreeContiguousMemory(shadowVa);
+            RtlZeroMemory(&g_ShadowPages[freeSlot], sizeof(SHV_SHADOW_PAGE_RECORD));
+        }
+        break;
+    }
+
+    case SHV_CMD_UNHOOK_SHADOW:
+    {
+        UINT64  gpa = req.Shadow.Gpa & ~0xFFFULL;
+        UINT32  i;
+        BOOLEAN found = FALSE;
+
+        for (i = 0; i < SHV_SHADOW_MAX; i++)
+        {
+            if (g_ShadowPages[i].Gpa == gpa)
+            {
+                found = TRUE;
+                if (g_ShadowPages[i].RefCount > 0)
+                    g_ShadowPages[i].RefCount--;
+                if (g_ShadowPages[i].RefCount == 0)
+                {
+                    ShvHookRemoveShadow(gpa);
+                    MmFreeContiguousMemory(g_ShadowPages[i].ShadowVa);
+                    RtlZeroMemory(&g_ShadowPages[i], sizeof(SHV_SHADOW_PAGE_RECORD));
+                }
+                resp->Status = SHVD_STATUS_OK;
+                break;
+            }
+        }
+
+        if (!found)
+            resp->Status = SHVD_STATUS_ERR_NOTFOUND;
+        ShvLog("[SHV-IOCTL] UNHOOK_SHADOW GPA=%016llX found=%d -> status=%u\n",
+               (req.Shadow.Gpa & ~0xFFFULL), (int)found, resp->Status);
+        break;
+    }
+
+    case SHV_CMD_BEEP_SHADOW_SETUP:
+        // Beep hijack is already set up via dispatch table replacement in DriverEntry.
+        // EPT shadow upgrade is a future enhancement.
+        resp->Status = SHVD_STATUS_OK;
+        break;
+
+    case SHV_CMD_LIST_SYSCALL_HOOKS:
+    {
+        UINT32 count = 0;
+        UINT32 maxEntries = SHV_MAX_READ_SIZE / sizeof(SHV_HOOK_INFO);
+        UINT32 i;
+
+        for (i = 0; i < SHV_SYSCALL_HOOK_MAX && count < maxEntries; i++)
+        {
+            if (g_SyscallHooks[i].InUse)
+            {
+                PSHV_HOOK_INFO hi = &resp->HookInfos[count];
+                RtlZeroMemory(hi, sizeof(*hi));
+                hi->SyscallIndex  = g_SyscallHooks[i].SyscallIndex;
+                hi->DisplacedSize = g_SyscallHooks[i].DisplacedSize;
+                hi->HookFuncVa    = (UINT64)(ULONG_PTR)g_SyscallHooks[i].HookFunc;
+                hi->TrampolineVa  = (UINT64)(ULONG_PTR)g_SyscallHooks[i].Trampoline;
+                hi->FuncGpa       = g_SyscallHooks[i].FuncGpa;
+                hi->FuncVa        = (UINT64)(ULONG_PTR)g_SyscallHooks[i].FuncVa;
+                count++;
+            }
+        }
+
+        resp->Count  = count;
+        resp->Status = SHVD_STATUS_OK;
+        break;
+    }
+
+    case SHV_CMD_LIST_SHADOW_PATCHES:
+    {
+        UINT32 count = 0;
+        UINT32 maxEntries = SHV_MAX_READ_SIZE / sizeof(SHV_SHADOW_HOOK_INFO);
+        UINT32 i;
+
+        for (i = 0; i < SHV_SHADOW_MAX && count < maxEntries; i++)
+        {
+            if (g_ShadowPages[i].Gpa != 0)
+            {
+                PSHV_SHADOW_HOOK_INFO shi = &resp->ShadowHookInfos[count];
+                RtlZeroMemory(shi, sizeof(*shi));
+                shi->GpaPage = g_ShadowPages[i].Gpa;
+                shi->Offset  = 0;
+                shi->PatchLen = 0;
+                shi->FuncVa  = 0;
+                count++;
+            }
+        }
+
+        resp->Count  = count;
+        resp->Status = SHVD_STATUS_OK;
+        break;
+    }
+
+    default:
+        resp->Status = SHVD_STATUS_ERR_INVALID;
+        break;
+    }
+
     Irp->IoStatus.Information = sizeof(SHV_RESPONSE);
 
 Exit:
@@ -705,6 +1299,8 @@ DriverUnload (
 
     UNREFERENCED_PARAMETER(DriverObject);
 
+    ShvLog("[SHV] DriverUnload iniciado...\n");
+
     // Remove symbolic link e device object
     IoDeleteSymbolicLink(&symLink);
     if (g_ShvDeviceObject != NULL)
@@ -714,6 +1310,30 @@ DriverUnload (
     }
 
     //
+    // Uninit process filters (ObRegisterCallbacks)
+    //
+    ShvLog("[SHV] Removendo filtros de processo...\n");
+    ShvHooksUninit();
+
+    //
+    // Remove EPT shadow policy hooks BEFORE freeing trampoline pool
+    //
+    ShvLog("[SHV] Removendo hooks de politica EPT...\n");
+    ShvPolicyHooksUninit();
+
+    //
+    // Restore Beep dispatch table
+    //
+    ShvLog("[SHV] Restaurando Beep dispatch...\n");
+    ShvBeepHijackTeardown();
+
+    //
+    // Free trampoline pool (after hypervisor unload so no more EPT violations)
+    //
+    ShvLog("[SHV] Liberando trampoline pool...\n");
+    HpvTrampolinePoolFree();
+
+    //
     // Unregister the power callback. We would not have loaded without it
     //
     ExUnregisterCallback(g_PowerCallbackRegistration);
@@ -721,7 +1341,9 @@ DriverUnload (
     //
     // Unload the hypervisor
     //
+    ShvLog("[SHV] Descarregando hipervisor VMX (ShvUnload)...\n");
     ShvUnload();
+    ShvLog("[SHV] DriverUnload concluido.\n");
 }
 
 NTSTATUS
@@ -807,9 +1429,49 @@ DriverEntry (
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+    ShvLog("[SHV] DriverEntry iniciado\n");
+
+    //
+    // Init trampoline pool BEFORE ShvLoad (shadow hooks need it at any time)
+    //
+    ShvLog("[SHV] Iniciando pool de trampolins...\n");
+    status = HpvTrampolinePoolInit();
+    if (!NT_SUCCESS(status))
+    {
+        ShvLog("[SHV] HpvTrampolinePoolInit FALHOU: 0x%08X\n", status);
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[SHV] HpvTrampolinePoolInit falhou: 0x%08X\n", status);
+        ExUnregisterCallback(g_PowerCallbackRegistration);
+        IoDeleteSymbolicLink(&symLink);
+        IoDeleteDevice(g_ShvDeviceObject);
+        g_ShvDeviceObject = NULL;
+        return status;
+    }
+    ShvLog("[SHV] Trampoline pool OK: %p\n", g_TrampolinePool);
+
+    //
+    // Setup Beep hijack BEFORE ShvLoad -- ShvBeepHijackSetup apenas substitui
+    // a entrada da tabela de dispatch, nao requer o hipervisor ainda rodando.
+    //
+    ShvLog("[SHV] Iniciando Beep hijack...\n");
+    status = ShvBeepHijackSetup();
+    if (!NT_SUCCESS(status))
+    {
+        ShvLog("[SHV] ShvBeepHijackSetup FALHOU: 0x%08X\n", status);
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[SHV] ShvBeepHijackSetup falhou: 0x%08X\n", status);
+        ExUnregisterCallback(g_PowerCallbackRegistration);
+        IoDeleteSymbolicLink(&symLink);
+        IoDeleteDevice(g_ShvDeviceObject);
+        g_ShvDeviceObject = NULL;
+        return status;
+    }
+    ShvLog("[SHV] Beep hijack OK\n");
+
     //
     // Load the hypervisor
     //
+    ShvLog("[SHV] Carregando hipervisor VMX (ShvLoad)...\n");
     status = ShvOsErrorToError(ShvLoad());
 
     //
@@ -818,12 +1480,41 @@ DriverEntry (
     //
     if (!NT_SUCCESS(status))
     {
+        ShvLog("[SHV] ShvLoad FALHOU: 0x%08X\n", status);
+        ShvBeepHijackTeardown();
         ExUnregisterCallback(g_PowerCallbackRegistration);
         IoDeleteSymbolicLink(&symLink);
         IoDeleteDevice(g_ShvDeviceObject);
         g_ShvDeviceObject = NULL;
+        return status;
+    }
+    ShvLog("[SHV] Hipervisor VMX carregado OK\n");
+
+    //
+    // Init process filter subsystem (ObRegisterCallbacks) AFTER ShvLoad
+    //
+    ShvLog("[SHV] Iniciando filtros de processo (ShvHooksInit)...\n");
+    ShvHooksInit();
+    ShvLog("[SHV] ShvHooksInit OK\n");
+
+    //
+    // Install EPT shadow hooks: NtOpenProcess + MmCopyVirtualMemory
+    //
+    ShvLog("[SHV] Instalando hooks de politica EPT (NtOpenProcess+MmCopyVirtualMemory)...\n");
+    status = ShvPolicyHooksInit();
+    if (!NT_SUCCESS(status))
+    {
+        ShvLog("[SHV] ShvPolicyHooksInit FALHOU: 0x%08X (nao fatal, continuando)\n", status);
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[SHV] ShvPolicyHooksInit falhou: 0x%08X (nao fatal)\n", status);
+        // Nao e fatal; o driver funciona sem os hooks de politica
+    }
+    else
+    {
+        ShvLog("[SHV] Hooks de politica EPT instalados OK\n");
     }
 
-    return status;
+    ShvLog("[SHV] DriverEntry concluido com sucesso. Driver pronto.\n");
+    return STATUS_SUCCESS;
 }
 

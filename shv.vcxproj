@@ -39,6 +39,9 @@
     <DriverSign>
       <AdditionalOptions>/fd SHA256 %(AdditionalOptions)</AdditionalOptions>
     </DriverSign>
+    <ClCompile>
+      <AdditionalOptions>/FS %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="shv.c" />
@@ -47,9 +50,19 @@
     <ClCompile Include="shvvmxhv.c" />
     <ClCompile Include="shvvp.c" />
     <ClCompile Include="$(Configuration)\shvos.c" />
+    <ClCompile Include="$(Configuration)\shvos_log.c" Condition="'$(Configuration)'=='NT'" />
+    <ClCompile Include="$(Configuration)\shvos_beep.c" Condition="'$(Configuration)'=='NT'" />
+    <ClCompile Include="$(Configuration)\shvhooks.c" Condition="'$(Configuration)'=='NT'" />
+    <ClCompile Include="$(Configuration)\hde64.c" Condition="'$(Configuration)'=='NT'" />
+    <ClCompile Include="$(Configuration)\shvssdt.c" Condition="'$(Configuration)'=='NT'" />
+    <ClCompile Include="$(Configuration)\hpv_hooks.c" Condition="'$(Configuration)'=='NT'" />
+    <ClCompile Include="$(Configuration)\hpv_policy_hooks.c" Condition="'$(Configuration)'=='NT'" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="shv.h" />
+    <ClInclude Include="shvhooks.h" />
+    <ClInclude Include="$(Configuration)\shvos_internal.h" Condition="'$(Configuration)'=='NT'" />
+    <ClInclude Include="$(Configuration)\shvssdt.h" Condition="'$(Configuration)'=='NT'" />
     <ClInclude Include="shv_comm.h" />
     <ClInclude Include="shv_dbg.h" />
     <ClInclude Include="ntint.h" />

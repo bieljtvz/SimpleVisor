@@ -136,6 +136,16 @@ ShvVmxEptSetPermissions (
     );
 
 VOID
+ShvVmxEptSetPhysAndPerms (
+    _In_ PSHV_VP_DATA VpData,
+    _In_ UINT64 GuestPhysical,
+    _In_ UINT64 NewPhysAddr,
+    _In_ UINT8 Read,
+    _In_ UINT8 Write,
+    _In_ UINT8 Execute
+    );
+
+VOID
 ShvVmxInvept (
     _In_ UINT64 Type,
     _In_ VOID* Descriptor

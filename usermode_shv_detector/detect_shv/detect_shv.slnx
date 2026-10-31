@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="detect_shv/detect_shv.vcxproj" Id="221ecf57-678b-42c5-ad19-2715f83200ac" />
+</Solution>

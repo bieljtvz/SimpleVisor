@@ -370,6 +370,44 @@ ShvVmxEptSetPermissions (
     }
 }
 
+//
+// Altera o PFN (Physical Frame Number) e as permissoes de uma PTE de 4KB.
+// Usado por shadow hooks para redirecionar execute para a pagina shadow.
+// A pagina deve ter sido dividida previamente com ShvVmxEptSplitLargePage.
+//
+VOID
+ShvVmxEptSetPhysAndPerms (
+    _In_ PSHV_VP_DATA VpData,
+    _In_ UINT64 GuestPhysical,
+    _In_ UINT64 NewPhysAddr,
+    _In_ UINT8 Read,
+    _In_ UINT8 Write,
+    _In_ UINT8 Execute
+    )
+{
+    UINT32 pdpteIndex;
+    UINT32 pdeIndex;
+    UINT32 pteIndex;
+    UINT32 i;
+
+    pdpteIndex = (UINT32)((GuestPhysical >> 30) & 0x1FF);
+    pdeIndex   = (UINT32)((GuestPhysical >> 21) & 0x1FF);
+    pteIndex   = (UINT32)((GuestPhysical >> 12) & 0x1FF);
+
+    for (i = 0; i < VpData->EptPtUsed; i++)
+    {
+        if (VpData->EptPtPdpteIndex[i] == pdpteIndex &&
+            VpData->EptPtPdeIndex[i]   == pdeIndex)
+        {
+            VpData->EptPt[i][pteIndex].PageFrameNumber = NewPhysAddr >> 12;
+            VpData->EptPt[i][pteIndex].Read    = Read;
+            VpData->EptPt[i][pteIndex].Write   = Write;
+            VpData->EptPt[i][pteIndex].Execute = Execute;
+            return;
+        }
+    }
+}
+
 UINT8
 ShvVmxEnterRootModeOnVp (
     _In_ PSHV_VP_DATA VpData

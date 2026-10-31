@@ -61,13 +61,23 @@ volatile UINT64 ShvEptHookHitCount = 0;
 
 typedef struct _SHV_HOOK_ENTRY
 {
-    UINT64 PhysAddr;    // GPA alinhada a 4KB; 0 = slot livre
-    UINT8  Type;        // SHV_HOOK_EXEC | SHV_HOOK_WRITE
+    UINT64 PhysAddr;       // GPA alinhada a 4KB; 0 = slot livre
+    UINT64 ShadowPhysAddr; // PA da shadow page; 0 = hook EPT normal
+    UINT8  Type;           // SHV_HOOK_EXEC | SHV_HOOK_WRITE (para hooks normais)
     UINT64 HitCount;
 } SHV_HOOK_ENTRY;
 
 static SHV_HOOK_ENTRY ShvHookTable[SHV_HOOK_MAX_ENTRIES];
 volatile UINT64       ShvHookVersion = 0;
+
+//
+// Estado compartilhado entre shvvmxhv.c (EPT) e nt/hpv_hooks.c (NT-side).
+// Exportados via shvos_internal.h.
+//
+SHV_SHADOW_PAGE_RECORD  g_ShadowPages[SHV_SHADOW_MAX];
+void*                   g_TrampolinePool  = NULL;
+UINT32                  g_TrampolineUsed  = 0;
+SHV_SYSCALL_HOOK_ENTRY  g_SyscallHooks[SHV_SYSCALL_HOOK_MAX];
 
 //
 // Ring buffer de eventos: o hypervisor escreve aqui a cada interceptacao
@@ -193,6 +203,152 @@ ShvHookRemove (
 }
 
 //
+// Remove todos os hooks EPT da tabela global.
+// Chamado via IOCTL SHV_CMD_UNHOOK_ALL.
+//
+VOID
+ShvHookRemoveAll (
+    VOID
+    )
+{
+    UINT32 i;
+    for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
+    {
+        ShvHookTable[i].PhysAddr = 0;
+        ShvHookTable[i].Type     = 0;
+        ShvHookTable[i].HitCount = 0;
+    }
+    _InterlockedIncrement64((LONG64*)&ShvHookVersion);
+}
+
+//
+// Instala um shadow hook: redireciona a GPA para a shadow page (execute-only).
+// Chamado pelo NT-side (PASSIVE_LEVEL) depois de preparar a shadow page.
+//
+UINT32
+ShvHookInstallShadow (
+    _In_ UINT64 OriginalPhys,
+    _In_ UINT64 ShadowPhys
+    )
+{
+    UINT32 i;
+    UINT64 page = OriginalPhys & ~0xFFFULL;
+
+    for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
+    {
+        if (ShvHookTable[i].PhysAddr == page)
+        {
+            ShvHookTable[i].ShadowPhysAddr = ShadowPhys;
+            _InterlockedIncrement64((LONG64*)&ShvHookVersion);
+            return SHVD_STATUS_OK;
+        }
+    }
+
+    for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
+    {
+        if (ShvHookTable[i].PhysAddr == 0)
+        {
+            ShvHookTable[i].PhysAddr       = page;
+            ShvHookTable[i].ShadowPhysAddr = ShadowPhys;
+            ShvHookTable[i].Type           = 0;
+            ShvHookTable[i].HitCount       = 0;
+            _InterlockedIncrement64((LONG64*)&ShvHookVersion);
+            return SHVD_STATUS_OK;
+        }
+    }
+
+    return SHVD_STATUS_ERR_FULL;
+}
+
+//
+// Remove um shadow hook da tabela global.
+// Retorna SHVD_STATUS_OK ou SHVD_STATUS_ERR_NOTFOUND.
+//
+UINT32
+ShvHookRemoveShadow (
+    _In_ UINT64 OriginalPhys
+    )
+{
+    UINT32 i;
+    UINT64 page = OriginalPhys & ~0xFFFULL;
+
+    for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
+    {
+        if (ShvHookTable[i].PhysAddr == page &&
+            ShvHookTable[i].ShadowPhysAddr != 0)
+        {
+            ShvHookTable[i].PhysAddr       = 0;
+            ShvHookTable[i].ShadowPhysAddr = 0;
+            ShvHookTable[i].Type           = 0;
+            ShvHookTable[i].HitCount       = 0;
+            _InterlockedIncrement64((LONG64*)&ShvHookVersion);
+            return SHVD_STATUS_OK;
+        }
+    }
+
+    return SHVD_STATUS_ERR_NOTFOUND;
+}
+
+//
+// Limpa a tabela de restauracao de MTF em todos os VPs.
+// Atualmente stub: o MtfRestorePhysical e zerado naturalmente pelo handler de MTF.
+//
+VOID
+ShvVmxClearRestoreTables (
+    VOID
+    )
+{
+    // Noop: por-CPU MtfRestorePhysical e zerado pelo handler de MTF
+}
+
+//
+// Limpa o ring buffer de eventos.
+// Chamado via IOCTL SHV_CMD_CLEAR_EVENTS.
+//
+VOID
+ShvClearEvents (
+    VOID
+    )
+{
+    _InterlockedExchange64((LONG64*)&ShvEventCount, 0);
+}
+
+//
+// Preenche OutBuffer com ate MaxCount entradas SHV_EPT_HOOK_INFO da tabela.
+// Retorna o numero de entradas escritas.
+// Chamado via IOCTL SHV_CMD_LIST_EPT_HOOKS.
+//
+UINT32
+ShvListEptHooks (
+    _Out_ VOID*  OutBuffer,
+    _In_  UINT32 MaxCount,
+    _In_  UINT32 EntrySize
+    )
+{
+    UINT32 count = 0;
+    UINT32 i;
+
+    for (i = 0; i < SHV_HOOK_MAX_ENTRIES && count < MaxCount; i++)
+    {
+        if (ShvHookTable[i].PhysAddr != 0)
+        {
+            PSHV_EPT_HOOK_INFO e = (PSHV_EPT_HOOK_INFO)((UINT8*)OutBuffer + count * EntrySize);
+            __stosb((UINT8*)e, 0, EntrySize);
+            e->PhysAddr  = ShvHookTable[i].PhysAddr;
+            e->VirtAddr  = 0;
+            e->Pid       = 0;
+            e->HitCount  = ShvHookTable[i].HitCount;
+            e->RangeStart= ShvHookTable[i].PhysAddr;
+            e->RangeSize = 1;
+            e->Type      = ShvHookTable[i].Type;
+            count++;
+        }
+    }
+
+    return count;
+}
+
+//
 // Aplica todos os hooks da tabela global ao EPT deste CPU.
 // Chamado quando VpData->EptHookVersion < ShvHookVersion.
 // Roda em VMX root mode (nenhuma chamada de SO aqui).
@@ -221,11 +377,21 @@ ShvVmxEptApplyHooks (
         // Garante que a pagina grande foi dividida em 4KB PTEs
         ShvVmxEptSplitLargePage(VpData, pa);
 
-        r = 1;
-        w = (type & SHV_HOOK_WRITE) ? 0 : 1;
-        x = (type & SHV_HOOK_EXEC)  ? 0 : 1;
-
-        ShvVmxEptSetPermissions(VpData, pa, r, w, x);
+        if (ShvHookTable[i].ShadowPhysAddr != 0)
+        {
+            // Shadow hook: EPT PTE aponta para shadow page, execute-only.
+            // Leituras/escritas na GPA original causam violacao e servimos
+            // a pagina original por 1 instrucao via MTF.
+            ShvVmxEptSetPhysAndPerms(VpData, pa, ShvHookTable[i].ShadowPhysAddr,
+                                     0, 0, 1);
+        }
+        else
+        {
+            r = 1;
+            w = (type & SHV_HOOK_WRITE) ? 0 : 1;
+            x = (type & SHV_HOOK_EXEC)  ? 0 : 1;
+            ShvVmxEptSetPermissions(VpData, pa, r, w, x);
+        }
     }
 
     ShvVmxInveptLocal(VpData);
@@ -246,16 +412,30 @@ ShvVmxEptRearmHook (
     UINT64 page = GuestPa & ~0xFFFULL;
     UINT8  r = 1, w = 1, x = 1;
 
+    // Shadow hooks: restaura PTE para shadow PA, execute-only
+    for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
+    {
+        if (ShvHookTable[i].PhysAddr == page &&
+            ShvHookTable[i].ShadowPhysAddr != 0)
+        {
+            ShvVmxEptSetPhysAndPerms(VpData, page, ShvHookTable[i].ShadowPhysAddr,
+                                     0, 0, 1);
+            ShvVmxInveptLocal(VpData);
+            return;
+        }
+    }
+
     // Hook legado de KiSystemCall64
     if (page == ShvEptHookPhysical)
     {
         x = 0;
     }
 
-    // Tabela de hooks do usermode
+    // Tabela de hooks do usermode (EPT normal)
     for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
     {
-        if (ShvHookTable[i].PhysAddr == page)
+        if (ShvHookTable[i].PhysAddr == page &&
+            ShvHookTable[i].ShadowPhysAddr == 0)
         {
             if (ShvHookTable[i].Type & SHV_HOOK_EXEC)  x = 0;
             if (ShvHookTable[i].Type & SHV_HOOK_WRITE) w = 0;
@@ -735,8 +915,35 @@ ShvVmxHandleEptViolation (
         }
     }
 
-    // Restaura todas as permissoes para o guest executar 1 instrucao
-    ShvVmxEptSetPermissions(VpData, page, 1, 1, 1);
+    // Restaura acesso temporario para o guest executar/ler/escrever 1 instrucao.
+    // Shadow hook: o PTE aponta para shadow PA; precisa trocar para original PA.
+    // Hook normal: o PTE ja aponta para a PA correta; apenas restaura permissoes.
+    {
+        UINT8 isShadow = 0;
+        for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
+        {
+            if (ShvHookTable[i].PhysAddr == page &&
+                ShvHookTable[i].ShadowPhysAddr != 0)
+            {
+                isShadow = 1;
+                break;
+            }
+        }
+
+        if (isShadow)
+        {
+            // Mapeia GPA para a PA original (page == GPA == original PA),
+            // R=1 W=1 X=1: precisa de X=1 para que o CPU consiga fazer
+            // instruction fetch ao re-executar a instrucao (SkipRipAdvance=TRUE).
+            // Sem X=1, o fetch causa nova EPT violation -> loop infinito -> freeze.
+            // Janela de 1 instrucao (EPT per-CPU), MTF restaura shadow logo apos.
+            ShvVmxEptSetPhysAndPerms(VpData, page, page, 1, 1, 1);
+        }
+        else
+        {
+            ShvVmxEptSetPermissions(VpData, page, 1, 1, 1);
+        }
+    }
     ShvVmxInveptLocal(VpData);
 
     // Arma MTF para re-restringir apos essa instrucao
