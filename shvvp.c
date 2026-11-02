@@ -21,6 +21,7 @@ Environment:
 --*/
 
 #include "shv.h"
+#include "shv_comm.h"
 
 UINT8
 ShvIsOurHypervisorPresent (
@@ -30,28 +31,16 @@ ShvIsOurHypervisorPresent (
     INT32 cpuInfo[4];
 
     //
-    // Check if ECX[31h] ("Hypervisor Present Bit") is set in CPUID 1h
+    // Detect using our private CPUID leaf (SHV_CPUID_LEAF), not the Hyper-V
+    // "hypervisor present" bit (CPUID 1h ECX[31]). This keeps us hidden from
+    // detection tools like detect_shv that look for bit 31.
     //
-    __cpuid(cpuInfo, 1);
-    if (cpuInfo[2] & HYPERV_HYPERVISOR_PRESENT_BIT)
+    __cpuidex(cpuInfo, (INT32)SHV_CPUID_LEAF, SHV_QUERY_PRESENCE);
+    if (cpuInfo[0] == (INT32)SHV_CPUID_LEAF)
     {
-        //
-        // Next, check if this is a compatible Hypervisor, and if it has the
-        // SimpleVisor signature
-        //
-        __cpuid(cpuInfo, HYPERV_CPUID_INTERFACE);
-        if (cpuInfo[0] == ' vhS')
-        {
-            //
-            // It's us!
-            //
-            return TRUE;
-        }
+        return TRUE;
     }
 
-    //
-    // No Hypervisor, or someone else's
-    //
     return FALSE;
 }
 
