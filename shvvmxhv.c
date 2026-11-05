@@ -405,8 +405,9 @@ ShvVmxEptApplyHooks (
         }
         else
         {
-            r = 1;
-            w = (type & SHV_HOOK_WRITE) ? 0 : 1;
+            // READ hook requer r=0; EPT nao permite w=1 com r=0, logo w=0 tambem.
+            r = (type & SHV_HOOK_READ)  ? 0 : 1;
+            w = ((type & SHV_HOOK_WRITE) || (r == 0)) ? 0 : 1;
             x = (type & SHV_HOOK_EXEC)  ? 0 : 1;
             ShvVmxEptSetPermissions(VpData, pa, r, w, x);
         }
@@ -457,6 +458,7 @@ ShvVmxEptRearmHook (
         {
             if (ShvHookTable[i].Type & SHV_HOOK_EXEC)  x = 0;
             if (ShvHookTable[i].Type & SHV_HOOK_WRITE) w = 0;
+            if (ShvHookTable[i].Type & SHV_HOOK_READ)  { r = 0; w = 0; }
         }
     }
 
@@ -842,7 +844,7 @@ ShvReadGuestReturnAddress (
 //
 // Handler para EXIT_REASON_EPT_VIOLATION (razao 48).
 //
-// Suporta violacoes de Execute (bit 2) e Write (bit 1) na Exit Qualification.
+// Suporta violacoes de Execute (bit 2), Write (bit 1) e Read (bit 0).
 //
 // Fluxo para qualquer tipo de violacao:
 //   1. Identifica o tipo (exec/write) e o hook ativo (legado ou tabela).
@@ -905,16 +907,44 @@ ShvVmxHandleEptViolation (
         // ReturnAddr = [GUEST_RSP] = quem chamou a funcao que esta escrevendo.
         // Aux        = GPA da pagina que esta sendo escrita.
         //
+        // Nota: se a pagina tem SHV_HOOK_READ (r=0 w=0), um write tambem dispara
+        // bit 1. Nesse caso emitimos SHV_EVENT_EPT_READ (nao WRITE), porque o hook
+        // instalado e de leitura, nao de escrita.
+        //
+        UINT64 guestRip = ShvVmxRead(GUEST_RIP);
+        UINT64 retAddr  = ShvReadGuestReturnAddress();
+
+        for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
+        {
+            if (ShvHookTable[i].PhysAddr != page || ShvHookTable[i].ShadowPhysAddr != 0)
+                continue;
+            if (ShvHookTable[i].Type & SHV_HOOK_WRITE)
+            {
+                ShvHookTable[i].HitCount++;
+                ShvHvPushEvent(SHV_EVENT_EPT_WRITE, guestRip, retAddr, guestPa);
+            }
+            else if (ShvHookTable[i].Type & SHV_HOOK_READ)
+            {
+                // Write numa pagina read-restricted (r=0 w=0): reporta como READ
+                ShvHookTable[i].HitCount++;
+                ShvHvPushEvent(SHV_EVENT_EPT_READ, guestRip, retAddr, guestPa);
+            }
+        }
+    }
+    // Bit 0 = data read violation (leitura pura, sem write, sem exec)
+    else if ((exitQual & 0x1) != 0)
+    {
         UINT64 guestRip = ShvVmxRead(GUEST_RIP);
         UINT64 retAddr  = ShvReadGuestReturnAddress();
 
         for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
         {
             if ((ShvHookTable[i].PhysAddr == page) &&
-                (ShvHookTable[i].Type & SHV_HOOK_WRITE))
+                (ShvHookTable[i].ShadowPhysAddr == 0) &&
+                (ShvHookTable[i].Type & SHV_HOOK_READ))
             {
                 ShvHookTable[i].HitCount++;
-                ShvHvPushEvent(SHV_EVENT_EPT_WRITE, guestRip, retAddr, guestPa);
+                ShvHvPushEvent(SHV_EVENT_EPT_READ, guestRip, retAddr, guestPa);
             }
         }
     }

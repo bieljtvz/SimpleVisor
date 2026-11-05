@@ -67,6 +67,7 @@ Abstract:
 //
 #define SHV_HOOK_EXEC           0x01  // captura execucao (Execute=0 no EPT)
 #define SHV_HOOK_WRITE          0x02  // captura escrita  (Write=0 no EPT)
+#define SHV_HOOK_READ           0x04  // captura leitura  (Read=0, Write=0 no EPT)
 
 //
 // Status de resposta (prefixo SHVD_ para evitar conflito com SHV_STATUS_* de shv_x.h)
