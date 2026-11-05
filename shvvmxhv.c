@@ -68,7 +68,6 @@ typedef struct _SHV_HOOK_ENTRY
     UINT64 VirtAddr;       // VA original do hook (para exibicao na GUI)
     UINT64 Pid;            // PID do processo alvo (0 = kernel)
     UINT64 RangeSize;      // numero de paginas hookadas neste bloco
-    UINT64 TargetCr3;      // CR3 do processo alvo (0 = qualquer processo)
 } SHV_HOOK_ENTRY;
 
 static SHV_HOOK_ENTRY ShvHookTable[SHV_HOOK_MAX_ENTRIES];
@@ -151,8 +150,7 @@ ShvHookInstall (
     _In_ UINT8  HookType,
     _In_ UINT64 VirtAddr,
     _In_ UINT64 Pid,
-    _In_ UINT64 RangeSize,
-    _In_ UINT64 TargetCr3
+    _In_ UINT64 RangeSize
     )
 {
     UINT32 i;
@@ -177,10 +175,9 @@ ShvHookInstall (
             ShvHookTable[i].PhysAddr  = page;
             ShvHookTable[i].Type      = HookType;
             ShvHookTable[i].HitCount  = 0;
-            ShvHookTable[i].VirtAddr   = VirtAddr;
-            ShvHookTable[i].Pid        = Pid;
-            ShvHookTable[i].RangeSize  = RangeSize ? RangeSize : 1;
-            ShvHookTable[i].TargetCr3  = TargetCr3;
+            ShvHookTable[i].VirtAddr  = VirtAddr;
+            ShvHookTable[i].Pid       = Pid;
+            ShvHookTable[i].RangeSize = RangeSize ? RangeSize : 1;
             _InterlockedIncrement64((LONG64*)&ShvHookVersion);
             return SHVD_STATUS_OK;
         }
@@ -892,17 +889,13 @@ ShvVmxHandleEptViolation (
             ShvHvPushEvent(SHV_EVENT_EPT_EXEC, guestRip, retAddr, guestPa);
         }
 
+        for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
         {
-            UINT64 guestCr3 = ShvVmxRead(GUEST_CR3);
-            for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
+            if ((ShvHookTable[i].PhysAddr == page) &&
+                (ShvHookTable[i].Type & SHV_HOOK_EXEC))
             {
-                if ((ShvHookTable[i].PhysAddr == page) &&
-                    (ShvHookTable[i].Type & SHV_HOOK_EXEC) &&
-                    (ShvHookTable[i].TargetCr3 == 0 || guestCr3 == ShvHookTable[i].TargetCr3))
-                {
-                    ShvHookTable[i].HitCount++;
-                    ShvHvPushEvent(SHV_EVENT_EPT_EXEC, guestRip, retAddr, guestPa);
-                }
+                ShvHookTable[i].HitCount++;
+                ShvHvPushEvent(SHV_EVENT_EPT_EXEC, guestRip, retAddr, guestPa);
             }
         }
     }
@@ -921,25 +914,20 @@ ShvVmxHandleEptViolation (
         UINT64 guestRip = ShvVmxRead(GUEST_RIP);
         UINT64 retAddr  = ShvReadGuestReturnAddress();
 
+        for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
         {
-            UINT64 guestCr3 = ShvVmxRead(GUEST_CR3);
-            for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
+            if (ShvHookTable[i].PhysAddr != page || ShvHookTable[i].ShadowPhysAddr != 0)
+                continue;
+            if (ShvHookTable[i].Type & SHV_HOOK_WRITE)
             {
-                if (ShvHookTable[i].PhysAddr != page || ShvHookTable[i].ShadowPhysAddr != 0)
-                    continue;
-                if (ShvHookTable[i].TargetCr3 != 0 && guestCr3 != ShvHookTable[i].TargetCr3)
-                    continue;
-                if (ShvHookTable[i].Type & SHV_HOOK_WRITE)
-                {
-                    ShvHookTable[i].HitCount++;
-                    ShvHvPushEvent(SHV_EVENT_EPT_WRITE, guestRip, retAddr, guestPa);
-                }
-                else if (ShvHookTable[i].Type & SHV_HOOK_READ)
-                {
-                    // Write numa pagina read-restricted (r=0 w=0): reporta como READ
-                    ShvHookTable[i].HitCount++;
-                    ShvHvPushEvent(SHV_EVENT_EPT_READ, guestRip, retAddr, guestPa);
-                }
+                ShvHookTable[i].HitCount++;
+                ShvHvPushEvent(SHV_EVENT_EPT_WRITE, guestRip, retAddr, guestPa);
+            }
+            else if (ShvHookTable[i].Type & SHV_HOOK_READ)
+            {
+                // Write numa pagina read-restricted (r=0 w=0): reporta como READ
+                ShvHookTable[i].HitCount++;
+                ShvHvPushEvent(SHV_EVENT_EPT_READ, guestRip, retAddr, guestPa);
             }
         }
     }
@@ -949,18 +937,14 @@ ShvVmxHandleEptViolation (
         UINT64 guestRip = ShvVmxRead(GUEST_RIP);
         UINT64 retAddr  = ShvReadGuestReturnAddress();
 
+        for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
         {
-            UINT64 guestCr3 = ShvVmxRead(GUEST_CR3);
-            for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
+            if ((ShvHookTable[i].PhysAddr == page) &&
+                (ShvHookTable[i].ShadowPhysAddr == 0) &&
+                (ShvHookTable[i].Type & SHV_HOOK_READ))
             {
-                if ((ShvHookTable[i].PhysAddr == page) &&
-                    (ShvHookTable[i].ShadowPhysAddr == 0) &&
-                    (ShvHookTable[i].Type & SHV_HOOK_READ) &&
-                    (ShvHookTable[i].TargetCr3 == 0 || guestCr3 == ShvHookTable[i].TargetCr3))
-                {
-                    ShvHookTable[i].HitCount++;
-                    ShvHvPushEvent(SHV_EVENT_EPT_READ, guestRip, retAddr, guestPa);
-                }
+                ShvHookTable[i].HitCount++;
+                ShvHvPushEvent(SHV_EVENT_EPT_READ, guestRip, retAddr, guestPa);
             }
         }
     }
