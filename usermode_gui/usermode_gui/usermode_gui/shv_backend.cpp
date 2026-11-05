@@ -219,7 +219,7 @@ void ShvBackend::PollOnce()
             for (int i = 0; i < slots; i++)
             {
                 ShvEventEntry e = ShvClient::ReadEvent(i);
-                if (e.seqNum == 0 || e.seqNum <= m_lastSeqSeen) continue;
+                if (e.seqNum <= m_lastSeqSeen) continue;
                 ShvEventRecord& r = newEvs[newCount++];
                 r.seqNum     = e.seqNum;
                 r.type       = e.type;

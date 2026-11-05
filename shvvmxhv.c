@@ -136,7 +136,7 @@ ShvHvPushEvent (
     ev->ReturnAddr = ReturnAddr;
     ev->Aux        = Aux;
     _mm_sfence();
-    ev->SeqNum     = (UINT32)idx;
+    ev->SeqNum     = (UINT32)(idx + 1);
 }
 
 
