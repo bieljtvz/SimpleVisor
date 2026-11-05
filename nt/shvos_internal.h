@@ -28,7 +28,7 @@ Environment:
 // Funcoes do hipervisor (definidas em shvvmxhv.c) usadas pelo lado NT.
 // Repetidas aqui (nao incluimos shv.h) para evitar conflito com ntifs.h.
 // ============================================================
-UINT32 ShvHookInstall(_In_ UINT64 PhysAddr, _In_ UINT8 HookType, _In_ UINT64 VirtAddr, _In_ UINT64 Pid, _In_ UINT64 RangeSize);
+UINT32 ShvHookInstall(_In_ UINT64 PhysAddr, _In_ UINT8 HookType, _In_ UINT64 VirtAddr, _In_ UINT64 Pid, _In_ UINT64 RangeSize, _In_ UINT64 TargetCr3);
 UINT32 ShvListEptHooks(_Out_writes_(MaxCount) VOID* OutBuffer, _In_ UINT32 MaxCount, _In_ UINT32 EntrySize);
 UINT32 ShvHookRemove(_In_ UINT64 PhysAddr);
 VOID   ShvHookRemoveAll(VOID);

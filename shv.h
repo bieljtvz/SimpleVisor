@@ -244,6 +244,6 @@ extern UINT8 ShvEptExecuteOnlySupported;
 
 // Tabela de hooks EPT instalados via IOCTL (shvvmxhv.c)
 // Retornam SHVD_STATUS_* de shv_dbg.h
-UINT32 ShvHookInstall(_In_ UINT64 PhysAddr, _In_ UINT8 HookType, _In_ UINT64 VirtAddr, _In_ UINT64 Pid, _In_ UINT64 RangeSize);
+UINT32 ShvHookInstall(_In_ UINT64 PhysAddr, _In_ UINT8 HookType, _In_ UINT64 VirtAddr, _In_ UINT64 Pid, _In_ UINT64 RangeSize, _In_ UINT64 TargetCr3);
 UINT32 ShvHookRemove(_In_ UINT64 PhysAddr);
 

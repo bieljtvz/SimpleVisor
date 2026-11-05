@@ -276,7 +276,7 @@ ShvDispatchIoctl (
                 if ((pa.QuadPart & ~0xFFFULL) != 0)
                 {
                     ShvHookInstall(pa.QuadPart & ~0xFFFULL, req.Hook.HookType,
-                                   va, 0, req.Hook.RangeSize ? req.Hook.RangeSize : 1);
+                                   va, 0, req.Hook.RangeSize ? req.Hook.RangeSize : 1, 0);
                     hooked++;
                 }
             }
@@ -311,10 +311,13 @@ ShvDispatchIoctl (
             }
 
             // Trava as paginas fisicas (impede paging-out enquanto hook estiver ativo)
+            // Captura CR3 do processo alvo enquanto attachado (para filtro por CR3 no hypervisor)
+            UINT64 targetCr3 = 0;
             KeStackAttachProcess(process, &apcState);
             __try
             {
                 MmProbeAndLockPages(mdl, UserMode, IoReadAccess);
+                targetCr3 = __readcr3();
             }
             __except (EXCEPTION_EXECUTE_HANDLER)
             {
@@ -342,7 +345,8 @@ ShvDispatchIoctl (
                     ShvHookInstall(gpa, req.Hook.HookType,
                                    vaBase + (UINT64)i * PAGE_SIZE,
                                    req.Hook.Pid,
-                                   req.Hook.RangeSize ? req.Hook.RangeSize : 1);
+                                   req.Hook.RangeSize ? req.Hook.RangeSize : 1,
+                                   targetCr3);
                     hooked++;
                 }
             }
