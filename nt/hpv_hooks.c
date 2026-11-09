@@ -75,17 +75,18 @@ HpvWriteJmp12 (
 }
 
 //
-// ShvFlushHooksAllCpus -- causes a CPUID VM-exit on the current CPU so the
-// hypervisor's lazy hook applicator picks up the new ShvHookVersion.
-// Other CPUs pick it up on their next natural VM-exit.
+// ShvFlushHooksAllCpus -- forces a CPUID VM-exit on ALL CPUs synchronously via
+// KeGenericCallDpc, so every CPU's lazy hook applicator picks up the new
+// ShvHookVersion before this function returns. Safe to call before freeing a
+// shadow page because no CPU can be mid-execute on the old EPT mapping after
+// this returns.
 //
 VOID
 ShvFlushHooksAllCpus (
     VOID
     )
 {
-    INT32 info[4];
-    __cpuid(info, 0);
+    ShvOsForceAllCpuVmExit();
 }
 
 //

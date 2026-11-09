@@ -72,6 +72,9 @@ extern void*                   g_TrampolinePool;
 extern UINT32                  g_TrampolineUsed;
 extern SHV_SYSCALL_HOOK_ENTRY  g_SyscallHooks[SHV_SYSCALL_HOOK_MAX];
 
+// nt/shvos.c
+VOID     ShvOsForceAllCpuVmExit(VOID);
+
 // nt/hpv_hooks.c
 VOID     ShvFlushHooksAllCpus(VOID);
 UINT32   ShvInstrLen(_In_ const UINT8* p);

@@ -1252,6 +1252,35 @@ ShvOsRunCallbackOnProcessors (
     KeGenericCallDpc(ShvOsDpcRoutine, &dpcContext);
 }
 
+static VOID
+ShvFlushDpcRoutine (
+    _In_ struct _KDPC* Dpc,
+    _In_opt_ PVOID DeferredContext,
+    _In_opt_ PVOID SystemArgument1,
+    _In_opt_ PVOID SystemArgument2
+    )
+{
+    INT32 info[4];
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(DeferredContext);
+
+    // Trigger a VM-exit so this CPU's lazy hook applicator picks up the new ShvHookVersion.
+    // NOTE: must NOT call ShvVmxCleanup here — that routine fixes DS/FS after iretq (unload path).
+    // Calling it outside that context corrupts FS.base, breaking exception handling.
+    __cpuid(info, 0);
+
+    KeSignalCallDpcSynchronize(SystemArgument2);
+    KeSignalCallDpcDone(SystemArgument1);
+}
+
+VOID
+ShvOsForceAllCpuVmExit (
+    VOID
+    )
+{
+    KeGenericCallDpc(ShvFlushDpcRoutine, NULL);
+}
+
 VOID
 ShvOsRestoreContext(
     _In_ PCONTEXT ContextRecord
