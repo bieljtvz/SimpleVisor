@@ -84,6 +84,7 @@ typedef struct _SHV_DPC_CONTEXT
 
 PVOID           g_PowerCallbackRegistration;
 PDEVICE_OBJECT  g_ShvDeviceObject;
+volatile LONG   g_DriverUnloading = 0;
 
 // ============================================================
 // IOCTL Dispatcher
@@ -216,6 +217,14 @@ ShvDispatchIoctl (
     PVOID               buffer;
 
     UNREFERENCED_PARAMETER(DeviceObject);
+
+    if (InterlockedCompareExchange(&g_DriverUnloading, 0, 0) != 0)
+    {
+        Irp->IoStatus.Status      = STATUS_DEVICE_REMOVED;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_DEVICE_REMOVED;
+    }
 
     ioStack   = IoGetCurrentIrpStackLocation(Irp);
     buffer    = Irp->AssociatedIrp.SystemBuffer;
@@ -1311,25 +1320,32 @@ DriverUnload (
 
     ShvLog("[SHV] DriverUnload iniciado...\n");
 
-    // Remove symbolic link e device object
+    //
+    // Block new IOCTLs immediately so no IOCTL races during teardown
+    //
+    InterlockedExchange(&g_DriverUnloading, 1);
+
+    // Remove symbolic link to block new device opens
     IoDeleteSymbolicLink(&symLink);
-    if (g_ShvDeviceObject != NULL)
-    {
-        IoDeleteDevice(g_ShvDeviceObject);
-        g_ShvDeviceObject = NULL;
-    }
 
     //
-    // Uninit process filters (ObRegisterCallbacks)
+    // Uninit process filters (ObRegisterCallbacks) -- waits for in-flight callbacks
     //
     ShvLog("[SHV] Removendo filtros de processo...\n");
     ShvHooksUninit();
 
     //
-    // Remove EPT shadow policy hooks BEFORE freeing trampoline pool
+    // Remove EPT shadow policy hooks (from hook table; lazy per-vCPU EPT update pending)
     //
     ShvLog("[SHV] Removendo hooks de politica EPT...\n");
     ShvPolicyHooksUninit();
+
+    //
+    // Release user-mode MDLs and clear normal EPT hooks before VMXOFF
+    //
+    ShvLog("[SHV] Liberando MDLs e hooks EPT...\n");
+    ShvHookReleaseMdls();
+    ShvHookRemoveAll();
 
     //
     // Restore Beep dispatch table
@@ -1338,21 +1354,33 @@ DriverUnload (
     ShvBeepHijackTeardown();
 
     //
-    // Free trampoline pool (after hypervisor unload so no more EPT violations)
+    // Unregister the power callback
+    //
+    ExUnregisterCallback(g_PowerCallbackRegistration);
+
+    //
+    // VMXOFF on all CPUs -- after this, EPT does not exist and shadow pages
+    // can no longer execute; the trampoline pool is now safe to free.
+    //
+    ShvLog("[SHV] Descarregando hipervisor VMX (ShvUnload)...\n");
+    ShvUnload();
+
+    //
+    // Free trampoline pool AFTER VMXOFF: EPT is gone, shadow pages cannot
+    // execute, so no CPU can jump into the trampoline any more.
     //
     ShvLog("[SHV] Liberando trampoline pool...\n");
     HpvTrampolinePoolFree();
 
     //
-    // Unregister the power callback. We would not have loaded without it
+    // Delete device object last, after full teardown
     //
-    ExUnregisterCallback(g_PowerCallbackRegistration);
+    if (g_ShvDeviceObject != NULL)
+    {
+        IoDeleteDevice(g_ShvDeviceObject);
+        g_ShvDeviceObject = NULL;
+    }
 
-    //
-    // Unload the hypervisor
-    //
-    ShvLog("[SHV] Descarregando hipervisor VMX (ShvUnload)...\n");
-    ShvUnload();
     ShvLog("[SHV] DriverUnload concluido.\n");
 }
 
