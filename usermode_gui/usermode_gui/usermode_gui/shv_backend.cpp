@@ -213,7 +213,9 @@ void ShvBackend::PollOnce()
         if (total != m_lastSeqSeen)
         {
             int slots = (int)min(ringSize, (uint32_t)SHV_EVENT_RING_SIZE);
-            ShvEventRecord newEvs[SHV_EVENT_RING_SIZE];
+            // static: com SHV_EVENT_RING_SIZE=4096 isso nao caberia
+            // confortavelmente na stack da thread de poll a cada chamada.
+            static ShvEventRecord newEvs[SHV_EVENT_RING_SIZE];
             int newCount = 0;
 
             for (int i = 0; i < slots; i++)

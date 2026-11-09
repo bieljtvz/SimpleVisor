@@ -471,8 +471,31 @@ HpvUnhookFuncByVa (
 
             if (g_ShadowPages[i].RefCount == 0)
             {
+                //
+                // 1) ShvHookRemoveShadow desliga ShadowPhysAddr/Type mas mantem
+                //    PhysAddr na tabela, para que ShvVmxEptApplyHooks restaure o
+                //    PTE de EPT desta GPA para a PA original (r=1,w=1,x=1) na
+                //    proxima vez que cada vCPU reaplicar a tabela.
+                //
+                // 2) ShvOsForceAllCpuVmExit forca TODOS os CPUs (nao so o atual)
+                //    a processar um VM-exit (CPUID) sincronamente antes de
+                //    retornar -- cada um reaplica a tabela + INVEPT local no topo
+                //    de ShvVmxHandleExit. So depois disso nenhum CPU pode ter o
+                //    EPT ainda apontando para a shadow page.
+                //
+                // Sem (1)+(2), MmFreeContiguousMemory abaixo libera uma pagina
+                // fisica que um outro CPU ainda pode alcancar via EPT (TLB de EPT
+                // nao invalidado / tabela nao reaplicada); se essa memoria for
+                // reaproveitada enquanto isso, o outro CPU acaba executando dados
+                // arbitrarios -> bugcheck 0x139 (KERNEL_SECURITY_CHECK_FAILURE /
+                // guard_icall_bugcheck), como visto ao fechar o driver com o
+                // usermode.exe aberto (hook de NtOpenProcess ainda em uso por
+                // outra CPU no momento do unhook).
+                //
                 ShvHookRemoveShadow(gpa);
-                ShvFlushHooksAllCpus();
+                ShvOsForceAllCpuVmExit();
+                ShvHookFreeSlot(gpa);
+
                 MmFreeContiguousMemory(g_ShadowPages[i].ShadowVa);
                 RtlZeroMemory(&g_ShadowPages[i], sizeof(SHV_SHADOW_PAGE_RECORD));
                 ShvLog("[SHV-HOOK] Shadow page liberada: GPA=%016llX\n", gpa);

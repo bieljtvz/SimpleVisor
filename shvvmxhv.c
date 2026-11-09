@@ -24,6 +24,10 @@ Environment:
 #include "shv_comm.h"
 #include "shv_dbg.h"
 
+// Forward decl -- definida (FORCEINLINE) mais abaixo neste arquivo, mas
+// usada por ShvHvPushEvent antes desse ponto.
+uintptr_t FORCEINLINE ShvVmxRead(_In_ UINT32 VmcsFieldId);
+
 //
 // Contador de VM-exits. Incrementado a cada exit para confirmar que o
 // handler esta sendo chamado. Leia com o WinDbg: dd shv!ShvExitCount
@@ -103,7 +107,50 @@ typedef struct _SHV_HV_EVENT
     UINT64 Value;       // GuestRIP para violacoes EPT; valor do MSR para LSTAR
     UINT64 ReturnAddr;  // [GUEST_RSP] para exec hooks; GuestRIP para write hooks
     UINT64 Aux;         // GPA para write hooks; GUEST_RIP para LSTAR events
+    UINT64 Cr3;         // GUEST_CR3 no momento do evento -- identifica o
+                         // processo que estava executando (usado pela GUI
+                         // para resolver "Causador"/"CR3" e, via CR3, o
+                         // modulo user-mode em "Destino"/RIP/RetAddr).
+    UINT64 Timestamp;   // FILETIME (100ns desde 1601) no momento do evento --
+                         // usado pela GUI na coluna "Hora".
+    UINT64 LinearAddr;  // GUEST_LINEAR_ADDRESS -- VA do acesso que causou a
+                         // violacao de EPT (so para eventos EPT_*; 0 para LSTAR).
+                         // Usado pela GUI na coluna "VA Fault".
 } SHV_HV_EVENT, *PSHV_HV_EVENT;
+
+//
+// KUSER_SHARED_DATA->SystemTime -- endereco fixo (nao afetado por KASLR,
+// mapeado identico em todos os processos/modo kernel desde o XP) e sempre
+// residente, entao e seguro ler diretamente em VMX root mode (interrupcoes
+// desligadas) sem nenhuma chamada de SO. Layout (KSYSTEM_TIME, 12 bytes):
+// LowPart (ULONG) @ +0x00, High1Time (LONG) @ +0x04, High2Time (LONG) @ +0x08.
+// Os dois campos "High" sao escritos em sequencia nao-atomica pelo kernel
+// real durante a atualizacao; o padrao High1/Low/High2 + retry detecta e
+// descarta uma leitura tearing (mesmo truque usado por KeQuerySystemTime).
+//
+#define SHV_KUSER_SHARED_DATA       ((volatile UINT8*)0xFFFFF78000000000ULL)
+#define SHV_KUSER_SYSTEMTIME_OFFSET 0x14
+
+static UINT64
+ShvReadSystemTime (
+    VOID
+    )
+{
+    volatile INT32*  high1 = (volatile INT32*)(SHV_KUSER_SHARED_DATA + SHV_KUSER_SYSTEMTIME_OFFSET + 4);
+    volatile INT32*  high2 = (volatile INT32*)(SHV_KUSER_SHARED_DATA + SHV_KUSER_SYSTEMTIME_OFFSET + 8);
+    volatile UINT32* low   = (volatile UINT32*)(SHV_KUSER_SHARED_DATA + SHV_KUSER_SYSTEMTIME_OFFSET);
+    INT32  h1, h2;
+    UINT32 lo;
+
+    do
+    {
+        h1 = *high1;
+        lo = *low;
+        h2 = *high2;
+    } while (h1 != h2);
+
+    return ((UINT64)(UINT32)h1 << 32) | lo;
+}
 
 static SHV_HV_EVENT ShvEventBuffer[SHV_EVENT_RING_SIZE];
 volatile UINT64     ShvEventCount = 0; // total de eventos escritos (nunca decrementa)
@@ -118,7 +165,8 @@ ShvHvPushEvent (
     _In_ UINT8  Type,
     _In_ UINT64 Value,
     _In_ UINT64 ReturnAddr,
-    _In_ UINT64 Aux
+    _In_ UINT64 Aux,
+    _In_ UINT64 LinearAddr
     )
 {
     LONG64   idx;
@@ -135,6 +183,9 @@ ShvHvPushEvent (
     ev->Value      = Value;
     ev->ReturnAddr = ReturnAddr;
     ev->Aux        = Aux;
+    ev->Cr3        = ShvVmxRead(GUEST_CR3);
+    ev->Timestamp  = ShvReadSystemTime();
+    ev->LinearAddr = LinearAddr;
     _mm_sfence();
     ev->SeqNum     = (UINT32)(idx + 1);
 }
@@ -280,6 +331,23 @@ ShvHookInstallShadow (
 
 //
 // Remove um shadow hook da tabela global.
+//
+// NAO zera PhysAddr: so desliga ShadowPhysAddr/Type e mantem a entrada com
+// PhysAddr setado. Isso faz ShvVmxEptApplyHooks cair no ramo "else" (Type==0)
+// na proxima vez que cada vCPU reaplicar a tabela, restaurando o PTE de EPT
+// para a PA ORIGINAL com r=1,w=1,x=1 -- em vez de deixar o PTE apontando para
+// a shadow page indefinidamente (ShvVmxEptApplyHooks ignora entradas com
+// PhysAddr==0 via "continue", ou seja nunca desfaz o mapeamento antigo).
+//
+// Chamador (nt/hpv_hooks.c HpvUnhookFuncByVa) DEVE sincronizar todos os CPUs
+// (forcar cada um a processar um VM-exit, reaplicando a tabela + INVEPT) antes
+// de liberar a memoria fisica da shadow page, e so depois chamar
+// ShvHookFreeSlot para liberar o slot da tabela. Sem essa restauracao previa,
+// um CPU que ainda nao reaplicou a tabela continua com o EPT PTE apontando
+// para a shadow page; se ela for liberada e reaproveitada por outra alocacao
+// enquanto isso, esse CPU acaba executando memoria arbitraria -> bugcheck
+// (observado como 0x139 KERNEL_SECURITY_CHECK_FAILURE / guard_icall_bugcheck).
+//
 // Retorna SHVD_STATUS_OK ou SHVD_STATUS_ERR_NOTFOUND.
 //
 UINT32
@@ -295,11 +363,40 @@ ShvHookRemoveShadow (
         if (ShvHookTable[i].PhysAddr == page &&
             ShvHookTable[i].ShadowPhysAddr != 0)
         {
-            ShvHookTable[i].PhysAddr       = 0;
             ShvHookTable[i].ShadowPhysAddr = 0;
             ShvHookTable[i].Type           = 0;
             ShvHookTable[i].HitCount       = 0;
             _InterlockedIncrement64((LONG64*)&ShvHookVersion);
+            return SHVD_STATUS_OK;
+        }
+    }
+
+    return SHVD_STATUS_ERR_NOTFOUND;
+}
+
+//
+// Libera definitivamente o slot da tabela global apos ShvHookRemoveShadow +
+// a sincronizacao de todos os CPUs ja terem restaurado o PTE para a PA
+// original (ver comentario acima). Nao precisa incrementar ShvHookVersion:
+// o PTE ja esta correto (r=1,w=1,x=1 -> identidade) desde a reaplicacao
+// anterior; isso so libera o slot de SHV_HOOK_MAX_ENTRIES para reuso.
+//
+UINT32
+ShvHookFreeSlot (
+    _In_ UINT64 OriginalPhys
+    )
+{
+    UINT32 i;
+    UINT64 page = OriginalPhys & ~0xFFFULL;
+
+    for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
+    {
+        if (ShvHookTable[i].PhysAddr == page &&
+            ShvHookTable[i].ShadowPhysAddr == 0)
+        {
+            ShvHookTable[i].PhysAddr = 0;
+            ShvHookTable[i].Type     = 0;
+            ShvHookTable[i].HitCount = 0;
             return SHVD_STATUS_OK;
         }
     }
@@ -323,11 +420,20 @@ ShvVmxClearRestoreTables (
 // Limpa o ring buffer de eventos.
 // Chamado via IOCTL SHV_CMD_CLEAR_EVENTS.
 //
+// IMPORTANTE: zera o CONTEUDO do buffer, nao so o contador. So resetar
+// ShvEventCount para 0 deixava os slots antigos com SeqNum alto (da serie
+// anterior) intactos; como a GUI tambem zera seu "ultimo SeqNum visto" ao
+// limpar (para casar com o contador reiniciado), o proximo poll tratava
+// TODOS os slots com SeqNum > 0 como "novos" e reexibia o historico antigo
+// inteiro -- dando a impressao de que o botao "Limpar historico" nao fazia
+// nada.
+//
 VOID
 ShvClearEvents (
     VOID
     )
 {
+    __stosb((UINT8*)ShvEventBuffer, 0, sizeof(ShvEventBuffer));
     _InterlockedExchange64((LONG64*)&ShvEventCount, 0);
 }
 
@@ -405,11 +511,28 @@ ShvVmxEptApplyHooks (
         }
         else
         {
-            // READ hook requer r=0; EPT nao permite w=1 com r=0, logo w=0 tambem.
+            // Hook normal (ou entrada de shadow hook ja removido, restaurando
+            // identidade -- ver ShvHookRemoveShadow em shvvmxhv.c).
+            //
+            // NAO usar ShvVmxEptSetPermissions aqui: ela so altera os bits
+            // Read/Write/Execute da PTE, sem tocar no PageFrameNumber. Se esta
+            // entrada ERA um shadow hook (ShadowPhysAddr acabou de ser zerado
+            // por ShvHookRemoveShadow), a PTE ainda aponta para o PFN da shadow
+            // page -- usar SetPermissions deixaria a PTE com r=1,w=1,x=1
+            // (totalmente acessivel) MAS ainda apontando para a shadow page.
+            // Isso e exatamente o que causava o BSOD: ao liberar a shadow page
+            // (MmFreeContiguousMemory), a PTE continuava "viva" referenciando
+            // aquela memoria, que podia ser reaproveitada e executada por outro
+            // CPU -> bugcheck 0x139 (confirmado via WinDbg: "u" na GPA ainda
+            // mostrava o patch da shadow page mesmo apos "Shadow page liberada").
+            //
+            // ShvVmxEptSetPhysAndPerms(VpData, pa, pa, ...) forca o PFN de
+            // volta para a PA ORIGINAL (identidade) -- seguro tambem para hooks
+            // normais (nao-shadow), que sempre usam GPA==PA.
             r = (type & SHV_HOOK_READ)  ? 0 : 1;
             w = ((type & SHV_HOOK_WRITE) || (r == 0)) ? 0 : 1;
             x = (type & SHV_HOOK_EXEC)  ? 0 : 1;
-            ShvVmxEptSetPermissions(VpData, pa, r, w, x);
+            ShvVmxEptSetPhysAndPerms(VpData, pa, pa, r, w, x);
         }
     }
 
@@ -462,7 +585,11 @@ ShvVmxEptRearmHook (
         }
     }
 
-    ShvVmxEptSetPermissions(VpData, page, r, w, x);
+    // Mesma razao do ShvVmxEptApplyHooks acima: usar SetPhysAndPerms (nao
+    // SetPermissions) garante que, se esta PTE vinha de um shadow hook ja
+    // removido, o PFN tambem volte para a PA original (nao so os bits de
+    // permissao).
+    ShvVmxEptSetPhysAndPerms(VpData, page, page, r, w, x);
     ShvVmxInveptLocal(VpData);
 }
 
@@ -664,6 +791,39 @@ ShvVmxHandleCpuid (
             VpState->VpRegs->Rcx = aux.LowPart;
             VpState->VpRegs->Rdx = aux.HighPart;
         }
+        else if (subleaf >= SHV_QUERY_EVENT_EXT2_BASE &&
+                 subleaf <  SHV_QUERY_EVENT_EXT2_BASE + SHV_EVENT_RING_SIZE)
+        {
+            // Terceira parte do mesmo slot: GUEST_CR3 do evento.
+            // EAX=Cr3.Lo, EBX=Cr3.Hi
+            LARGE_INTEGER cr3;
+            ev = &ShvEventBuffer[subleaf - SHV_QUERY_EVENT_EXT2_BASE];
+            cr3.QuadPart         = ev->Cr3;
+            VpState->VpRegs->Rax = cr3.LowPart;
+            VpState->VpRegs->Rbx = cr3.HighPart;
+        }
+        else if (subleaf >= SHV_QUERY_EVENT_EXT3_BASE &&
+                 subleaf <  SHV_QUERY_EVENT_EXT3_BASE + SHV_EVENT_RING_SIZE)
+        {
+            // Quarta parte do mesmo slot: Timestamp (FILETIME) do evento.
+            // EAX=Timestamp.Lo, EBX=Timestamp.Hi
+            LARGE_INTEGER ts;
+            ev = &ShvEventBuffer[subleaf - SHV_QUERY_EVENT_EXT3_BASE];
+            ts.QuadPart          = ev->Timestamp;
+            VpState->VpRegs->Rax = ts.LowPart;
+            VpState->VpRegs->Rbx = ts.HighPart;
+        }
+        else if (subleaf >= SHV_QUERY_EVENT_EXT4_BASE &&
+                 subleaf <  SHV_QUERY_EVENT_EXT4_BASE + SHV_EVENT_RING_SIZE)
+        {
+            // Quinta parte do mesmo slot: GUEST_LINEAR_ADDRESS (VA Fault) do evento.
+            // EAX=LinearAddr.Lo, EBX=LinearAddr.Hi
+            LARGE_INTEGER la;
+            ev = &ShvEventBuffer[subleaf - SHV_QUERY_EVENT_EXT4_BASE];
+            la.QuadPart          = ev->LinearAddr;
+            VpState->VpRegs->Rax = la.LowPart;
+            VpState->VpRegs->Rbx = la.HighPart;
+        }
 
         return;
     }
@@ -757,7 +917,7 @@ ShvVmxHandleMsrRead (
         ShvLstarReadCount++;
         ShvLastLstarValue = value.QuadPart;
         // Value = valor do MSR, ReturnAddr = RIP de quem fez RDMSR, Aux = 0
-        ShvHvPushEvent(SHV_EVENT_LSTAR_READ, value.QuadPart, rip, 0);
+        ShvHvPushEvent(SHV_EVENT_LSTAR_READ, value.QuadPart, rip, 0, 0);
     }
 
     VpState->VpRegs->Rax = value.LowPart;
@@ -785,7 +945,7 @@ ShvVmxHandleMsrWrite (
         UINT64 rip = ShvVmxRead(GUEST_RIP);
         ShvLstarWriteCount++;
         ShvLastLstarValue = value.QuadPart;
-        ShvHvPushEvent(SHV_EVENT_LSTAR_WRITE, value.QuadPart, rip, 0);
+        ShvHvPushEvent(SHV_EVENT_LSTAR_WRITE, value.QuadPart, rip, 0, 0);
     }
 
     __writemsr(msr, value.QuadPart);
@@ -865,11 +1025,14 @@ ShvVmxHandleEptViolation (
     UINT64 guestPa;
     UINT64 page;
     UINT64 controls;
+    UINT64 linearAddr;
     UINT32 i;
 
-    exitQual = ShvVmxRead(EXIT_QUALIFICATION);
-    guestPa  = ShvVmxRead(GUEST_PHYSICAL_ADDRESS);
-    page     = guestPa & ~0xFFFULL;
+    exitQual   = ShvVmxRead(EXIT_QUALIFICATION);
+    guestPa    = ShvVmxRead(GUEST_PHYSICAL_ADDRESS);
+    page       = guestPa & ~0xFFFULL;
+    // VA do acesso que causou a violacao (so para a coluna "VA Fault" da GUI).
+    linearAddr = ShvVmxRead(GUEST_LINEAR_ADDRESS);
 
     // Bit 2 = instruction fetch (execute violation)
     if ((exitQual & 0x4) != 0)
@@ -886,7 +1049,7 @@ ShvVmxHandleEptViolation (
         if (page == ShvEptHookPhysical)
         {
             ShvEptHookHitCount++;
-            ShvHvPushEvent(SHV_EVENT_EPT_EXEC, guestRip, retAddr, guestPa);
+            ShvHvPushEvent(SHV_EVENT_EPT_EXEC, guestRip, retAddr, guestPa, linearAddr);
         }
 
         for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
@@ -895,7 +1058,7 @@ ShvVmxHandleEptViolation (
                 (ShvHookTable[i].Type & SHV_HOOK_EXEC))
             {
                 ShvHookTable[i].HitCount++;
-                ShvHvPushEvent(SHV_EVENT_EPT_EXEC, guestRip, retAddr, guestPa);
+                ShvHvPushEvent(SHV_EVENT_EPT_EXEC, guestRip, retAddr, guestPa, linearAddr);
             }
         }
     }
@@ -921,13 +1084,13 @@ ShvVmxHandleEptViolation (
             if (ShvHookTable[i].Type & SHV_HOOK_WRITE)
             {
                 ShvHookTable[i].HitCount++;
-                ShvHvPushEvent(SHV_EVENT_EPT_WRITE, guestRip, retAddr, guestPa);
+                ShvHvPushEvent(SHV_EVENT_EPT_WRITE, guestRip, retAddr, guestPa, linearAddr);
             }
             else if (ShvHookTable[i].Type & SHV_HOOK_READ)
             {
                 // Write numa pagina read-restricted (r=0 w=0): reporta como READ
                 ShvHookTable[i].HitCount++;
-                ShvHvPushEvent(SHV_EVENT_EPT_READ, guestRip, retAddr, guestPa);
+                ShvHvPushEvent(SHV_EVENT_EPT_READ, guestRip, retAddr, guestPa, linearAddr);
             }
         }
     }
@@ -944,7 +1107,7 @@ ShvVmxHandleEptViolation (
                 (ShvHookTable[i].Type & SHV_HOOK_READ))
             {
                 ShvHookTable[i].HitCount++;
-                ShvHvPushEvent(SHV_EVENT_EPT_READ, guestRip, retAddr, guestPa);
+                ShvHvPushEvent(SHV_EVENT_EPT_READ, guestRip, retAddr, guestPa, linearAddr);
             }
         }
     }

@@ -21,6 +21,7 @@ Environment:
 --*/
 
 #include <ntifs.h>
+#include <intrin.h>
 #include <stdarg.h>
 #include "..\shv_x.h"
 #include "..\shv_dbg.h"
@@ -128,6 +129,23 @@ typedef struct _SYSTEM_PROCESS_INFORMATION_SHV
 // Offset de KPROCESS.DirectoryTableBase dentro de EPROCESS no x64 Win10.
 // EPROCESS comeca com KPROCESS; Pcb.DirectoryTableBase esta em +0x28.
 #define EPROCESS_DIR_TABLE_BASE_OFFSET 0x28
+
+// Offset de EPROCESS.UserDirectoryTableBase -- o CR3 usado em ring-3 quando
+// KPTI/KVA-shadow (mitigacao Meltdown) esta ativo; DIFERENTE do CR3 "kernel"
+// acima (ver [[feedback_cr3_filter_broke_usermode]] na memoria do projeto:
+// eventos EPT disparados por acesso DIRETO em usermode carregam este CR3, nao
+// o de DirectoryTableBase, entao "Causador"/"Destino" na GUI nao resolviam o
+// processo para esses eventos sem isso).
+//
+// ATENCAO: ao contrario de DirectoryTableBase (estavel desde o x64 original),
+// este offset MUDA entre builds do Windows (o campo so existe desde a
+// mitigacao de Meltdown, ~jan/2018) e NAO foi verificado ao vivo neste
+// binario -- 0x388 e o valor publicamente documentado para builds 19041
+// (Windows 10 2004/20H1), que bate com o OS_VERSION visto nos dumps de BSOD
+// desta VM. Se "UserDirBase" aparecer sempre 0 ou com lixo na GUI, confirme
+// no WinDbg: `dt nt!_EPROCESS UserDirectoryTableBase` (ou ache o offset via
+// `dt nt!_EPROCESS` inteiro) e ajuste esta constante.
+#define EPROCESS_USER_DIR_TABLE_BASE_OFFSET 0x388
 
 typedef struct _RTL_PROCESS_MODULE_INFORMATION
 {
@@ -572,7 +590,8 @@ ShvDispatchIoctl (
                     PEPROCESS proc = NULL;
                     if (NT_SUCCESS(PsLookupProcessByProcessId(entry->UniqueProcessId, &proc)))
                     {
-                        pe->DirBase = *(UINT64*)((UINT8*)proc + EPROCESS_DIR_TABLE_BASE_OFFSET);
+                        pe->DirBase     = *(UINT64*)((UINT8*)proc + EPROCESS_DIR_TABLE_BASE_OFFSET);
+                        pe->UserDirBase = *(UINT64*)((UINT8*)proc + EPROCESS_USER_DIR_TABLE_BASE_OFFSET);
                         ObDereferenceObject(proc);
                     }
                 }
@@ -1250,6 +1269,43 @@ ShvOsRunCallbackOnProcessors (
     dpcContext.Routine = Routine;
     dpcContext.Context = Context;
     KeGenericCallDpc(ShvOsDpcRoutine, &dpcContext);
+}
+
+static VOID
+ShvForceVmExitDpcRoutine (
+    _In_ struct _KDPC* Dpc,
+    _In_opt_ PVOID DeferredContext,
+    _In_opt_ PVOID SystemArgument1,
+    _In_opt_ PVOID SystemArgument2
+    )
+{
+    INT32 info[4];
+
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(DeferredContext);
+
+    //
+    // CPUID causa VM-exit; ShvVmxHandleExit reaplica ShvHookTable (+ INVEPT
+    // local) para este CPU no topo da funcao, antes do switch de ExitReason,
+    // caso EptHookVersion esteja desatualizado -- ver shvvmxhv.c.
+    //
+    // NAO chamar ShvVmxCleanup aqui: essa rotina so faz sentido apos o iretq
+    // usado no caminho de VMXOFF (unload). Fora desse contexto ela corrompe
+    // DS/FS.base (troca para o seletor do TEB usermode), quebrando o tratamento
+    // de excecao do kernel e disparando INT3 em KeCheckStackAndTargetAddress.
+    //
+    __cpuid(info, 0);
+
+    KeSignalCallDpcSynchronize(SystemArgument2);
+    KeSignalCallDpcDone(SystemArgument1);
+}
+
+VOID
+ShvOsForceAllCpuVmExit (
+    VOID
+    )
+{
+    KeGenericCallDpc(ShvForceVmExitDpcRoutine, NULL);
 }
 
 VOID

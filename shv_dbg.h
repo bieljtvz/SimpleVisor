@@ -169,7 +169,10 @@ typedef struct _SHV_PROC_FILTER_ENTRY
 typedef struct _SHV_PROC_ENTRY
 {
     unsigned long long Pid;
-    unsigned long long DirBase;            // CR3 do processo
+    unsigned long long DirBase;            // CR3 "kernel" (KPROCESS.DirectoryTableBase)
+    unsigned long long UserDirBase;        // CR3 "user" (EPROCESS.UserDirectoryTableBase)
+                                            // -- usado em ring-3 quando KPTI/KVA-shadow
+                                            // esta ativo; 0 se nao suportado/nao lido.
     char               Name[SHV_PROC_NAME_LEN];
 } SHV_PROC_ENTRY, *PSHV_PROC_ENTRY;
 

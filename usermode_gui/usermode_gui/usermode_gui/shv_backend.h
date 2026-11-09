@@ -21,7 +21,7 @@ Abstract:
 // ============================================================
 // Constantes
 // ============================================================
-static constexpr int  kEventHistoryMax  = 2000;
+static constexpr int  kEventHistoryMax  = 20000;
 static constexpr DWORD kPollIntervalMs  = 1000;
 
 // ============================================================

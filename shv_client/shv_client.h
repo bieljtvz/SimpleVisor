@@ -40,7 +40,10 @@ Abstract:
 // Protocolo CPUID
 // ============================================================
 #define SHV_CPUID_LEAF              0x80000042u
-#define SHV_EVENT_RING_SIZE         256
+// PRECISA ser igual a SHV_EVENT_RING_SIZE em shv_comm.h (lado kernel) --
+// os sub-leaves EXT*_BASE abaixo sao calculados a partir deste valor dos
+// dois lados; se divergir, o protocolo CPUID desalinha.
+#define SHV_EVENT_RING_SIZE         4096
 
 #define SHV_QUERY_PRESENCE          0
 #define SHV_QUERY_LSTAR_READS       1
@@ -194,7 +197,9 @@ typedef struct {
 
 typedef struct {
     unsigned long long Pid;
-    unsigned long long DirBase;
+    unsigned long long DirBase;     // KPROCESS.DirectoryTableBase (CR3 "kernel")
+    unsigned long long UserDirBase; // EPROCESS.UserDirectoryTableBase (CR3 "user",
+                                     // valido so com KPTI/KVA-shadow ativo; 0 se nao suportado)
     char               Name[SHV_PROC_NAME_LEN];
 } SHV_PROC_ENTRY;
 

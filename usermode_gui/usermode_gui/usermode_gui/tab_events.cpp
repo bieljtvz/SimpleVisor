@@ -20,6 +20,7 @@ Abstract:
 #include <stdio.h>
 #include <vector>
 #include <unordered_map>
+#include <utility>
 #include <tlhelp32.h>
 
 // ── Metadados de tipo de evento ──────────────────────────────────────────────
@@ -49,11 +50,16 @@ static inline const char* EventName(uint8_t type)
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+// Compara contra DirBase (CR3 "kernel") E UserDirBase (CR3 "user", usado em
+// ring-3 quando KPTI/KVA-shadow esta ativo) -- um acesso usermode direto
+// (ex.: memcpy no proprio processo) carrega o CR3 "user" no evento, que NAO
+// bate com DirBase sozinho. Ver [[feedback_cr3_filter_broke_usermode]].
 static const char* ProcNameByCr3(const std::vector<SHV_PROC_ENTRY>& procs, uint64_t cr3)
 {
     if (cr3 == 0) return nullptr;
     for (const auto& p : procs)
-        if (p.DirBase == cr3) return p.Name;
+        if (p.DirBase == cr3 || (p.UserDirBase != 0 && p.UserDirBase == cr3))
+            return p.Name;
     return nullptr;
 }
 
@@ -129,7 +135,8 @@ static void RenderAddrCell(uint64_t va,
 // ── Cache de modulos de processos user-mode ──────────────────────────────────
 
 struct ProcModEntry {
-    uint64_t cr3;
+    uint64_t cr3;       // DirBase (CR3 "kernel")
+    uint64_t userCr3;    // UserDirBase (CR3 "user", eventos de acesso direto usermode)
     std::vector<SHV_MODULE_ENTRY> mods;
 };
 
@@ -143,13 +150,13 @@ static void RefreshProcModCache(const std::vector<SHV_PROC_ENTRY>& procs)
     s_procModRefreshMs = now;
     s_procModCache.clear();
 
-    // Build name -> cr3 map (case-insensitive, first match wins)
-    std::unordered_map<std::string, uint64_t> nameToCr3;
+    // Build name -> (cr3, userCr3) map (case-insensitive, first match wins)
+    std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> nameToCr3;
     for (const auto& p : procs)
     {
         std::string key(p.Name);
         for (char& c : key) c = (char)tolower((unsigned char)c);
-        nameToCr3.emplace(key, p.DirBase);
+        nameToCr3.emplace(key, std::make_pair(p.DirBase, p.UserDirBase));
     }
 
     HANDLE psnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -173,7 +180,8 @@ static void RefreshProcModCache(const std::vector<SHV_PROC_ENTRY>& procs)
         if (msnap == INVALID_HANDLE_VALUE) continue;
 
         ProcModEntry entry;
-        entry.cr3 = it->second;
+        entry.cr3     = it->second.first;
+        entry.userCr3 = it->second.second;
 
         MODULEENTRY32W me = {};
         me.dwSize = sizeof(me);
@@ -201,7 +209,8 @@ static const std::vector<SHV_MODULE_ENTRY>* ProcModsByCr3(uint64_t cr3)
 {
     if (cr3 == 0) return nullptr;
     for (const auto& e : s_procModCache)
-        if (e.cr3 == cr3) return &e.mods;
+        if (e.cr3 == cr3 || (e.userCr3 != 0 && e.userCr3 == cr3))
+            return &e.mods;
     return nullptr;
 }
 
@@ -285,22 +294,27 @@ static void RenderEventTable(ShvBackend& backend,
             if (useAddr && e.value != addrVal) continue;
 
             bool isSelected = s_hasSelected && (s_selectedEvent.seqNum == e.seqNum);
-            ImGui::TableNextRow(isSelected ? ImGuiTableRowFlags_None : ImGuiTableRowFlags_None);
-            ImGui::TableSetColumnIndex(0);
-            // Selectable invisivel sobre toda a linha
-            char selId[24];
-            snprintf(selId, sizeof(selId), "##sel%u", e.seqNum);
-            if (ImGui::Selectable(selId, isSelected,
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            // Selectable invisivel sobre toda a linha. Label vazio + PushID
+            // (em vez de embutir o id dentro da label, ex. "##sel137") --
+            // mesmo padrao ja usado em tab_procs.cpp/tab_drivers.cpp para
+            // Selectable compartilhando coluna com texto via SameLine.
+            ImGui::PushID((int)e.seqNum);
+            if (ImGui::Selectable("", isSelected,
                     ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap,
-                    ImVec2(0, ImGui::GetTextLineHeightWithSpacing())))
+                    ImVec2(0, 0)))
             {
                 s_selectedEvent = e;
                 s_hasSelected   = true;
             }
-            ImGui::SameLine();
+            ImGui::PopID();
+            ImGui::SameLine(0, 0);
 
-            // Coluna Hora: converte FILETIME kernel -> hora local HH:MM:SS.mmm
-            ImGui::TableNextColumn();
+            // Coluna Hora: converte FILETIME kernel -> hora local HH:MM:SS.mmm.
+            // Fica na MESMA coluna 0 onde o Selectable acima foi desenhado
+            // (via TableNextColumn(), nao TableSetColumnIndex+SameLine com
+            // espacamento) -- nao chamar outro TableNextColumn() aqui.
             if (e.timestamp != 0)
             {
                 FILETIME ft, localFt;
@@ -336,10 +350,18 @@ static void RenderEventTable(ShvBackend& backend,
                     ImGui::TextDisabled("---");
             }
 
-            // Destino: modulo/driver dona do RIP faultado
+            // Destino: modulo/driver dona do RIP faultado. Verifica modulos do
+            // kernel primeiro; se nao achar e o evento tiver CR3 de um processo
+            // conhecido, verifica tambem os modulos user-mode daquele processo
+            // (necessario para hooks instalados em codigo usermode, nao so em
+            // drivers/ntoskrnl).
             ImGui::TableNextColumn();
             {
+                const auto* pm = ProcModsByCr3(e.cr3);
                 const char* dstMod = ModuleNameByVa(modules, e.value);
+                if (!dstMod && pm)
+                    dstMod = ModuleNameByVa(*pm, e.value);
+
                 if (dstMod)
                 {
                     ImGui::TextUnformatted(dstMod);

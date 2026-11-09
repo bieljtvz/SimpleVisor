@@ -40,6 +40,7 @@ VOID   ShvHookReleaseMdls(VOID);
 VOID   ShvClearEvents(VOID);
 UINT32 ShvHookInstallShadow(_In_ UINT64 OriginalPhys, _In_ UINT64 ShadowPhys);
 UINT32 ShvHookRemoveShadow(_In_ UINT64 OriginalPhys);
+UINT32 ShvHookFreeSlot(_In_ UINT64 OriginalPhys);
 VOID   ShvVmxClearRestoreTables(VOID);
 
 extern UINT8 ShvEptExecuteOnlySupported;
@@ -71,6 +72,12 @@ extern SHV_SHADOW_PAGE_RECORD  g_ShadowPages[SHV_SHADOW_MAX];
 extern void*                   g_TrampolinePool;
 extern UINT32                  g_TrampolineUsed;
 extern SHV_SYSCALL_HOOK_ENTRY  g_SyscallHooks[SHV_SYSCALL_HOOK_MAX];
+
+// nt/shvos.c -- forca TODOS os CPUs a processar um VM-exit (via KeGenericCallDpc)
+// antes de retornar, garantindo que cada vCPU reaplicou ShvHookTable (e rodou
+// INVEPT local) com a versao atual. So entao e seguro liberar memoria fisica
+// que deixou de estar referenciada no EPT (ex.: shadow page apos unhook).
+VOID     ShvOsForceAllCpuVmExit(VOID);
 
 // nt/hpv_hooks.c
 VOID     ShvFlushHooksAllCpus(VOID);

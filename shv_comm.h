@@ -41,6 +41,16 @@ Abstract:
                                         //   ECX=Value.High, EDX=(Type<<8)|CpuNum
                                         // Value = GuestRIP para EPT; MSR value para LSTAR
 #define SHV_QUERY_EVENT_EXT_BASE    (SHV_QUERY_EVENT_BASE + SHV_EVENT_RING_SIZE)
+#define SHV_QUERY_EVENT_EXT2_BASE   (SHV_QUERY_EVENT_BASE + 2 * SHV_EVENT_RING_SIZE)
+                                        // ECX=EXT2_BASE+slot -> EAX=Cr3.Low, EBX=Cr3.High
+                                        // GUEST_CR3 no momento do evento (identifica o processo)
+#define SHV_QUERY_EVENT_EXT3_BASE   (SHV_QUERY_EVENT_BASE + 3 * SHV_EVENT_RING_SIZE)
+                                        // ECX=EXT3_BASE+slot -> EAX=Timestamp.Low, EBX=Timestamp.High
+                                        // FILETIME (100ns desde 1601) no momento do evento
+#define SHV_QUERY_EVENT_EXT4_BASE   (SHV_QUERY_EVENT_BASE + 4 * SHV_EVENT_RING_SIZE)
+                                        // ECX=EXT4_BASE+slot -> EAX=LinearAddr.Low, EBX=LinearAddr.High
+                                        // GUEST_LINEAR_ADDRESS (VA do acesso que causou a
+                                        // violacao de EPT); 0 para eventos LSTAR (nao aplicavel)
 
 //
 // Tipos de evento armazenados no ring buffer.
@@ -56,4 +66,7 @@ Abstract:
 // Tamanho do ring buffer de eventos. Deve ser potencia de 2.
 // Quando cheio, entradas mais antigas sao sobrescritas.
 //
-#define SHV_EVENT_RING_SIZE         256
+// PRECISA ser o MESMO valor em shv_client.h (lado GUI) -- os sub-leaves
+// EXT_BASE/EXT2_BASE/... sao calculados como SHV_QUERY_EVENT_BASE + N*RING_SIZE
+// dos dois lados; se os valores divergirem, o protocolo CPUID desalinha.
+#define SHV_EVENT_RING_SIZE         4096
