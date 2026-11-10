@@ -68,6 +68,10 @@ struct ShvShadowEntry {
     uint32_t offset;
     uint32_t len;
     uint8_t  bytes[SHV_SHADOW_PATCH_MAX];
+    uint64_t va;   // VA original usada pra achar essa GPA (0 = desconhecida --
+                   // so e conhecida quando a GUI mesma instalou o shadow via
+                   // VA+PID; shadows pre-existentes vistos so pelo poll nao tem VA).
+    uint64_t cr3;  // DirBase do processo dono da VA acima (0 = desconhecido/kernel).
 };
 
 struct ShvState {
@@ -125,10 +129,16 @@ public:
     CmdResult UnprotectName(const char* name);
     CmdResult MonitorName(const char* name);
     CmdResult UnmonitorName(const char* name);
-    CmdResult ShadowPatch(uint64_t gpa, uint32_t offset, const uint8_t* bytes, uint32_t len);
+    // va/cr3 (opcionais, default 0): quando o chamador ja sabe a VA e o CR3
+    // (DirBase) do processo dono dela -- ficam gravados localmente so pra
+    // exibicao na aba Filtros->Hook Shadow (o protocolo IOCTL em si continua
+    // baseado em GPA; o kernel nao guarda VA nenhuma).
+    CmdResult ShadowPatch(uint64_t gpa, uint32_t offset, const uint8_t* bytes, uint32_t len,
+                          uint64_t va = 0, uint64_t cr3 = 0);
     CmdResult Unshadow(uint64_t gpa);
     CmdResult BeepShadowSetup(uint64_t* outGpa);
     CmdResult ClearEvents();
+    CmdResult SetStackFilter(bool enabled);
     CmdResult ListEptHooks();
 
     // Linha de status (ultima operacao)

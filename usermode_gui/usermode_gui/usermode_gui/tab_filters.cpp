@@ -320,101 +320,106 @@ void RenderTabFilters(ShvBackend& backend)
     // ── Hook Shadow Patch ─────────────────────────────────────────────────────
     if (ImGui::BeginTabItem("Hook Shadow"))
     {
-        std::vector<ShvShadowEntry> kPatches, uPatches;
+        // Lista unica a partir do poll (kernelShadows) -- e sempre o estado
+        // real e completo do kernel (g_ShadowPages[]), ja enriquecido com
+        // VA/CR3 quando conhecidos (ver merge em ShvBackend::Refresh). Usar
+        // tambem m_state.shadowPatches aqui so causava linhas duplicadas pra
+        // cada shadow instalado pela propria GUI (uma copia local "[U]" e
+        // outra vinda do poll "[K]", mesma GPA, mesmos bytes).
+        std::vector<ShvShadowEntry>   shadows;
+        std::vector<SHV_MODULE_ENTRY> kernMods;
         backend.Lock();
-        kPatches = backend.State().kernelShadows;
-        uPatches = backend.State().shadowPatches;
+        shadows  = backend.State().kernelShadows;
+        kernMods = backend.State().kernelModules;
         backend.Unlock();
 
-        ImGui::TextDisabled("%zu kernel  +  %zu IOCTL", kPatches.size(), uPatches.size());
+        ImGui::TextDisabled("%zu shadow patch(es) ativos", shadows.size());
         ImGui::Spacing();
 
-        static uint64_t s_ctxGpa = 0;
+        static uint64_t s_selGpa    = 0;
+        static bool     s_hasSel    = false;
 
-        if (ImGui::BeginTable("shd_tbl", 6,
+        ImGui::BeginDisabled(!s_hasSel);
+        if (ImGui::Button("Remover Shadow selecionado"))
+        {
+            backend.Unshadow(s_selGpa);
+            s_hasSel = false;
+        }
+        ImGui::EndDisabled();
+        if (s_hasSel)
+        {
+            ImGui::SameLine(0, 12);
+            ImGui::TextDisabled("GPA selecionada: 0x%016llX", (unsigned long long)s_selGpa);
+        }
+        ImGui::Spacing();
+
+        if (ImGui::BeginTable("shd_tbl", 7,
                 ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                 ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit,
                 ImVec2(0, 0)))
         {
             ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn("Tipo",   ImGuiTableColumnFlags_WidthFixed,  30.0f);
             ImGui::TableSetupColumn("GPA",    ImGuiTableColumnFlags_WidthFixed, 145.0f);
-            ImGui::TableSetupColumn("Offset", ImGuiTableColumnFlags_WidthFixed,  60.0f);
-            ImGui::TableSetupColumn("Len",    ImGuiTableColumnFlags_WidthFixed,  36.0f);
-            ImGui::TableSetupColumn("Bytes",  ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("##act",  ImGuiTableColumnFlags_WidthFixed,  24.0f);
+            ImGui::TableSetupColumn("VA",      ImGuiTableColumnFlags_WidthFixed, 145.0f);
+            ImGui::TableSetupColumn("Modulo",  ImGuiTableColumnFlags_WidthFixed, 130.0f);
+            ImGui::TableSetupColumn("CR3",     ImGuiTableColumnFlags_WidthFixed, 145.0f);
+            ImGui::TableSetupColumn("Offset",  ImGuiTableColumnFlags_WidthFixed,  60.0f);
+            ImGui::TableSetupColumn("Len",     ImGuiTableColumnFlags_WidthFixed,  36.0f);
+            ImGui::TableSetupColumn("Bytes",   ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableHeadersRow();
 
-            // Kernel startup hooks (read-only, sem botao de remocao)
-            static const ImVec4 kColorKernel = { 0.50f, 0.80f, 1.00f, 1.0f };
-            for (int i = 0; i < (int)kPatches.size(); i++)
+            for (int i = 0; i < (int)shadows.size(); i++)
             {
-                const ShvShadowEntry& p = kPatches[i];
+                const ShvShadowEntry& p = shadows[i];
+                bool isSelected = s_hasSel && (s_selGpa == p.gpa);
                 ImGui::TableNextRow();
-                ImGui::PushID((int)(0x10000 + i));
-
-                ImGui::TableNextColumn();
-                ImGui::PushStyleColor(ImGuiCol_Text, kColorKernel);
-                ImGui::TextUnformatted("[K]");
-                ImGui::PopStyleColor();
-
-                ImGui::TableNextColumn();
-                ImGui::PushStyleColor(ImGuiCol_Text, kColorKernel);
-                ImGui::Text("0x%016llX", (unsigned long long)p.gpa);
-                ImGui::PopStyleColor();
-
-                ImGui::TableNextColumn();
-                ImGui::Text("0x%X", p.offset);
-
-                ImGui::TableNextColumn();
-                ImGui::Text("%u", p.len);
-
-                ImGui::TableNextColumn();
-                {
-                    char hexBuf[SHV_SHADOW_PATCH_MAX * 3 + 1];
-                    char* q = hexBuf;
-                    for (uint32_t b = 0; b < p.len && b < SHV_SHADOW_PATCH_MAX; b++)
-                        q += snprintf(q, 4, "%02X ", p.bytes[b]);
-                    if (q > hexBuf) *(q - 1) = '\0';
-                    ImGui::PushStyleColor(ImGuiCol_Text, kColorWarn);
-                    ImGui::TextUnformatted(hexBuf);
-                    ImGui::PopStyleColor();
-                }
-
-                ImGui::TableNextColumn();
-                ImGui::TextDisabled("---");
-                ImGui::PopID();
-            }
-
-            // IOCTL patches (instalados pela GUI, removiveis)
-            for (int i = 0; i < (int)uPatches.size(); i++)
-            {
-                const ShvShadowEntry& p = uPatches[i];
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn();
                 ImGui::PushID(i);
 
-                ImGui::PushStyleColor(ImGuiCol_Text, kColorOk);
-                ImGui::TextUnformatted("[U]");
-                ImGui::PopStyleColor();
-
                 ImGui::TableNextColumn();
-                ImGui::Selectable("", false,
-                    ImGuiSelectableFlags_SpanAllColumns |
-                    ImGuiSelectableFlags_AllowItemOverlap,
-                    ImVec2(0, 0));
-                if (ImGui::IsItemClicked(ImGuiMouseButton_Right))
-                    s_ctxGpa = p.gpa;
+                if (ImGui::Selectable("", isSelected,
+                        ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap,
+                        ImVec2(0, 0)))
+                {
+                    s_selGpa = p.gpa;
+                    s_hasSel = true;
+                }
                 if (ImGui::BeginPopupContextItem("shd_ctx"))
                 {
                     if (ImGui::MenuItem("Remover Shadow"))
-                        backend.Unshadow(s_ctxGpa);
+                        backend.Unshadow(p.gpa);
                     ImGui::EndPopup();
                 }
                 ImGui::SameLine(0, 0);
                 ImGui::Text("0x%016llX", (unsigned long long)p.gpa);
 
                 ImGui::TableNextColumn();
+                if (p.va != 0) ImGui::Text("0x%016llX", (unsigned long long)p.va);
+                else            ImGui::TextDisabled("---");
+
+                ImGui::TableNextColumn();
+                {
+                    const char* modName = nullptr;
+                    if (p.va != 0)
+                    {
+                        for (const auto& m : kernMods)
+                        {
+                            if (p.va >= m.Base && p.va < m.Base + m.Size)
+                            {
+                                const char* base = strrchr(m.Name, '\\');
+                                modName = base ? base + 1 : m.Name;
+                                break;
+                            }
+                        }
+                    }
+                    if (modName) ImGui::TextUnformatted(modName);
+                    else          ImGui::TextDisabled("---");
+                }
+
+                ImGui::TableNextColumn();
+                if (p.cr3 != 0) ImGui::Text("0x%016llX", (unsigned long long)p.cr3);
+                else             ImGui::TextDisabled("kernel");
+
+                ImGui::TableNextColumn();
                 ImGui::Text("0x%X", p.offset);
 
                 ImGui::TableNextColumn();
@@ -432,15 +437,10 @@ void RenderTabFilters(ShvBackend& backend)
                     ImGui::PopStyleColor();
                 }
 
-                ImGui::TableNextColumn();
-                char rmLbl[16]; snprintf(rmLbl, sizeof(rmLbl), "X##s%d", i);
-                if (ImGui::SmallButton(rmLbl))
-                    backend.Unshadow(p.gpa);
-
                 ImGui::PopID();
             }
 
-            if (kPatches.empty() && uPatches.empty())
+            if (shadows.empty())
             {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();

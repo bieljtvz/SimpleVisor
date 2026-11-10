@@ -62,7 +62,11 @@ Abstract:
 #define SHV_QUERY_EVENT_EXT6_BASE   (SHV_QUERY_EVENT_BASE + 6 * SHV_EVENT_RING_SIZE)
 #define SHV_QUERY_EVENT_EXT7_BASE   (SHV_QUERY_EVENT_BASE + 7 * SHV_EVENT_RING_SIZE)
 #define SHV_QUERY_EVENT_EXT8_BASE   (SHV_QUERY_EVENT_BASE + 8 * SHV_EVENT_RING_SIZE)
-#define SHV_EVENT_STACK_FRAMES      8
+#define SHV_QUERY_EVENT_EXT9_BASE   (SHV_QUERY_EVENT_BASE + 9 * SHV_EVENT_RING_SIZE)
+#define SHV_QUERY_EVENT_EXT10_BASE  (SHV_QUERY_EVENT_BASE + 10 * SHV_EVENT_RING_SIZE)
+#define SHV_QUERY_EVENT_EXT11_BASE  (SHV_QUERY_EVENT_BASE + 11 * SHV_EVENT_RING_SIZE)
+#define SHV_QUERY_EVENT_EXT12_BASE  (SHV_QUERY_EVENT_BASE + 12 * SHV_EVENT_RING_SIZE)
+#define SHV_EVENT_STACK_FRAMES      16
 
 #define SHV_EVENT_LSTAR_READ        1
 #define SHV_EVENT_LSTAR_WRITE       2
@@ -108,6 +112,7 @@ Abstract:
 #define SHV_CMD_LIST_SHADOW_PATCHES 22
 #define SHV_CMD_CLEAR_EVENTS        23
 #define SHV_CMD_LIST_EPT_HOOKS      24
+#define SHV_CMD_SET_STACK_FILTER    25
 
 // Status de resposta
 #define SHVD_STATUS_OK             0
@@ -275,7 +280,7 @@ struct ShvEventEntry {
     uint64_t cr3;        // GUEST_CR3 -- identifica o processo
     uint64_t timestamp;  // hora do fault: 100ns desde 1601 (Windows FILETIME)
     uint64_t linearAddr; // GUEST_LINEAR_ADDRESS: VA do acesso que causou o fault (0 se nao disponivel)
-    uint64_t stack[SHV_EVENT_STACK_FRAMES]; // RSP[0..7] no momento do fault (0 = nao disponivel)
+    uint64_t stack[SHV_EVENT_STACK_FRAMES]; // RSP[0..15] no momento do fault (0 = nao disponivel)
 };
 
 // ============================================================
@@ -362,6 +367,11 @@ public:
 
     // Zera o ring buffer de eventos no kernel e reseta o contador.
     bool ClearEvents();
+
+    // Liga/desliga o filtro de call-site do stack walk heuristico (ShvLooksLikeCallSite).
+    // enabled=false mostra qualquer VA plausivel sem checar se parece uma CALL
+    // (equivalente ao `ed shv!ShvStackWalkDebugNoFilter 1` usado em debug manual).
+    bool SetStackFilter(bool enabled);
 
     // Lista EPT hooks instalados via IOCTL.
     bool ListEptHooks(SHV_EPT_HOOK_INFO* out, uint32_t maxCount, uint32_t* outCount);

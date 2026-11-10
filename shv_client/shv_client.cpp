@@ -201,6 +201,22 @@ ShvEventEntry ShvClient::ReadEvent(int slot)
     e.stack[6] = ((uint64_t)(uint32_t)r[1] << 32) | (uint32_t)r[0];
     e.stack[7] = ((uint64_t)(uint32_t)r[3] << 32) | (uint32_t)r[2];
 
+    __cpuidex(r, SHV_CPUID_LEAF, SHV_QUERY_EVENT_EXT9_BASE + slot);
+    e.stack[8] = ((uint64_t)(uint32_t)r[1] << 32) | (uint32_t)r[0];
+    e.stack[9] = ((uint64_t)(uint32_t)r[3] << 32) | (uint32_t)r[2];
+
+    __cpuidex(r, SHV_CPUID_LEAF, SHV_QUERY_EVENT_EXT10_BASE + slot);
+    e.stack[10] = ((uint64_t)(uint32_t)r[1] << 32) | (uint32_t)r[0];
+    e.stack[11] = ((uint64_t)(uint32_t)r[3] << 32) | (uint32_t)r[2];
+
+    __cpuidex(r, SHV_CPUID_LEAF, SHV_QUERY_EVENT_EXT11_BASE + slot);
+    e.stack[12] = ((uint64_t)(uint32_t)r[1] << 32) | (uint32_t)r[0];
+    e.stack[13] = ((uint64_t)(uint32_t)r[3] << 32) | (uint32_t)r[2];
+
+    __cpuidex(r, SHV_CPUID_LEAF, SHV_QUERY_EVENT_EXT12_BASE + slot);
+    e.stack[14] = ((uint64_t)(uint32_t)r[1] << 32) | (uint32_t)r[0];
+    e.stack[15] = ((uint64_t)(uint32_t)r[3] << 32) | (uint32_t)r[2];
+
     return e;
 }
 
@@ -208,6 +224,14 @@ bool ShvClient::ClearEvents()
 {
     SHV_REQUEST req = {};
     req.Command = SHV_CMD_CLEAR_EVENTS;
+    return Submit(req) && m_resp.Status == SHVD_STATUS_OK;
+}
+
+bool ShvClient::SetStackFilter(bool enabled)
+{
+    SHV_REQUEST req = {};
+    req.Command = SHV_CMD_SET_STACK_FILTER;
+    req.ProcFilter.Pid = enabled ? 1 : 0;
     return Submit(req) && m_resp.Status == SHVD_STATUS_OK;
 }
 

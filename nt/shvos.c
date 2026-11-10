@@ -698,6 +698,11 @@ ShvDispatchIoctl (
         resp->Status = SHVD_STATUS_OK;
         break;
 
+    case SHV_CMD_SET_STACK_FILTER:
+        ShvSetStackFilterEnabled((UINT8)req.ProcFilter.Pid);
+        resp->Status = SHVD_STATUS_OK;
+        break;
+
     // ----------------------------------------------------------------
     // Filtros de processo (NtOpenProcess via ObRegisterCallbacks)
     // ----------------------------------------------------------------
@@ -877,6 +882,13 @@ ShvDispatchIoctl (
                 // Shadow page already exists -- just apply new patch
                 RtlCopyMemory((UINT8*)g_ShadowPages[i].ShadowVa + offset,
                               req.Shadow.PatchBytes, patchLen);
+                // Atualiza a metadata exibida (Offset/Len/Bytes) pro ultimo
+                // patch aplicado nesse slot -- faltava aqui, entao reaplicar
+                // um patch num shadow ja existente nunca atualizava o que a
+                // GUI mostra em Filtros->Hook Shadow.
+                g_ShadowPages[i].Offset   = offset;
+                g_ShadowPages[i].PatchLen = patchLen;
+                RtlCopyMemory(g_ShadowPages[i].PatchBytes, req.Shadow.PatchBytes, patchLen);
                 g_ShadowPages[i].RefCount++;
                 resp->Status = SHVD_STATUS_OK;
                 break;
@@ -1019,11 +1031,29 @@ ShvDispatchIoctl (
             if (g_ShadowPages[i].Gpa != 0)
             {
                 PSHV_SHADOW_HOOK_INFO shi = &resp->ShadowHookInfos[count];
+                UINT32 j;
                 RtlZeroMemory(shi, sizeof(*shi));
                 shi->GpaPage  = g_ShadowPages[i].Gpa;
                 shi->Offset   = g_ShadowPages[i].Offset;
                 shi->PatchLen = g_ShadowPages[i].PatchLen;
                 shi->FuncVa   = 0;
+
+                // g_ShadowPages nao guarda a VA original -- so a GPA (pagina).
+                // Quem sabe a VA de verdade e g_SyscallHooks[] (hooks de
+                // funcao via HpvHookFuncByVa, ex. NtOpenProcess), entao acha
+                // por correspondencia de GPA (pagina) pra nao devolver sempre
+                // FuncVa=0 pra esses casos -- era por isso que a coluna "VA"
+                // em Filtros->Hook Shadow nunca aparecia preenchida na GUI.
+                for (j = 0; j < SHV_SYSCALL_HOOK_MAX; j++)
+                {
+                    if (g_SyscallHooks[j].InUse &&
+                        (g_SyscallHooks[j].FuncGpa & ~0xFFFULL) == g_ShadowPages[i].Gpa)
+                    {
+                        shi->FuncVa = (UINT64)(ULONG_PTR)g_SyscallHooks[j].FuncVa;
+                        break;
+                    }
+                }
+
                 if (g_ShadowPages[i].PatchLen <= SHV_SHADOW_PATCH_MAX)
                     RtlCopyMemory(shi->PatchBytes, g_ShadowPages[i].PatchBytes,
                                   g_ShadowPages[i].PatchLen);
@@ -1253,6 +1283,43 @@ ShvOsGetPhysicalAddress (
     // Let the memory manager convert it
     //
     return MmGetPhysicalAddress(BaseAddress).QuadPart;
+}
+
+UINT8
+ShvOsIsAddressValid (
+    _In_ PVOID Va
+    )
+{
+    //
+    // MmIsAddressValid e documentada como segura em qualquer IRQL (so
+    // consulta a PTE correspondente, nao bloqueia e nao causa fault).
+    //
+    return MmIsAddressValid(Va) ? 1 : 0;
+}
+
+UINT8
+ShvOsReadPhysical (
+    _In_  UINT64  Pa,
+    _Out_ UINT64* OutValue
+    )
+{
+    MM_COPY_ADDRESS addr;
+    SIZE_T          bytesRead = 0;
+    NTSTATUS        status;
+
+    *OutValue = 0;
+
+    addr.PhysicalAddress.QuadPart = (LONGLONG)Pa;
+    status = MmCopyMemory(OutValue, addr, sizeof(UINT64),
+                          MM_COPY_MEMORY_PHYSICAL, &bytesRead);
+
+    if (!NT_SUCCESS(status) || bytesRead != sizeof(UINT64))
+    {
+        *OutValue = 0;
+        return 0;
+    }
+
+    return 1;
 }
 
 VOID

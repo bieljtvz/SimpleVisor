@@ -61,6 +61,7 @@ Abstract:
 #define SHV_CMD_LIST_SHADOW_PATCHES 22 // lista shadow patches (nao implementado)
 #define SHV_CMD_CLEAR_EVENTS       23  // limpa ring buffer de eventos
 #define SHV_CMD_LIST_EPT_HOOKS     24  // lista EPT hooks instalados
+#define SHV_CMD_SET_STACK_FILTER   25  // liga/desliga o filtro de call-site do stack walk (ProcFilter.Pid = 0/1)
 
 //
 // Tipos de hook EPT (bitmask)

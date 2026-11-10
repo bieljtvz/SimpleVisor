@@ -200,6 +200,30 @@ void ShvBackend::PollOnce()
                 e.len    = (buf[i].PatchLen < SHV_SHADOW_PATCH_MAX)
                                ? buf[i].PatchLen : SHV_SHADOW_PATCH_MAX;
                 memcpy(e.bytes, buf[i].PatchBytes, e.len);
+
+                // FuncVa agora vem de verdade do kernel pra hooks instalados
+                // via HpvHookFuncByVa (ex. NtOpenProcess) -- o kernel acha por
+                // correspondencia de GPA em g_SyscallHooks[] (ver shvos.c).
+                // Pra shadows criados manualmente pela propria GUI (aba
+                // Memoria->Shadow Patch, modo "Por VA+PID"), o kernel nao tem
+                // de onde tirar isso, entao complementa com o cache local
+                // (shadowPatches) nesse caso.
+                e.va  = buf[i].FuncVa;
+                if (e.va == 0)
+                {
+                    for (const auto& s : m_state.shadowPatches)
+                    {
+                        if (s.gpa == e.gpa) { e.va = s.va; e.cr3 = s.cr3; break; }
+                    }
+                }
+                else
+                {
+                    for (const auto& s : m_state.shadowPatches)
+                    {
+                        if (s.gpa == e.gpa) { e.cr3 = s.cr3; break; }
+                    }
+                }
+
                 m_state.kernelShadows.push_back(e);
             }
         }
@@ -404,20 +428,26 @@ ShvBackend::CmdResult ShvBackend::UnmonitorName(const char* name)
 }
 
 ShvBackend::CmdResult ShvBackend::ShadowPatch(uint64_t gpa, uint32_t offset,
-                                              const uint8_t* bytes, uint32_t len)
+                                              const uint8_t* bytes, uint32_t len,
+                                              uint64_t va, uint64_t cr3)
 {
     Lock();
     bool _ok = m_client.ShadowPatch(gpa, offset, bytes, len);
     uint32_t _st = m_client.LastStatus();
     if (_ok)
     {
-        PostStatus(false, "Shadow patch GPA 0x%llX+0x%X (%u bytes)", gpa, offset, len);
+        // Gpa efetivamente usada pelo kernel ja vem pageada (ShvClient::ShadowPatch
+        // faz "gpa & ~0xFFF") -- alinhar aqui tambem, senao essa entrada nao bate
+        // com a mesma GPA que volta no proximo poll via ListShadowPatches (kernel
+        // sempre guarda/retorna a GPA alinhada), e vira uma linha duplicada na lista.
+        uint64_t gpaAligned = gpa & ~0xFFFULL;
+        PostStatus(false, "Shadow patch GPA 0x%llX+0x%X (%u bytes)", gpaAligned, offset, len);
         bool found = false;
         for (auto& s : m_state.shadowPatches)
         {
-            if (s.gpa == gpa)
+            if (s.gpa == gpaAligned)
             {
-                s.offset = offset; s.len = len;
+                s.offset = offset; s.len = len; s.va = va; s.cr3 = cr3;
                 memcpy(s.bytes, bytes, min(len, (uint32_t)SHV_SHADOW_PATCH_MAX));
                 found = true; break;
             }
@@ -425,7 +455,7 @@ ShvBackend::CmdResult ShvBackend::ShadowPatch(uint64_t gpa, uint32_t offset,
         if (!found)
         {
             ShvShadowEntry e = {};
-            e.gpa = gpa; e.offset = offset;
+            e.gpa = gpaAligned; e.offset = offset; e.va = va; e.cr3 = cr3;
             e.len = min(len, (uint32_t)SHV_SHADOW_PATCH_MAX);
             memcpy(e.bytes, bytes, e.len);
             m_state.shadowPatches.push_back(e);
@@ -465,6 +495,19 @@ ShvBackend::CmdResult ShvBackend::ClearEvents()
         PostStatus(false, "Historico de eventos limpo");
     }
     else PostStatus(true, "ClearEvents falhou: %s", ShvClient::StatusString(_st));
+    Unlock();
+    return { _ok, _st };
+}
+
+ShvBackend::CmdResult ShvBackend::SetStackFilter(bool enabled)
+{
+    Lock();
+    bool _ok = m_client.SetStackFilter(enabled);
+    uint32_t _st = m_client.LastStatus();
+    if (_ok)
+        PostStatus(false, enabled ? "Filtro de call-site ligado" : "Filtro de call-site desligado");
+    else
+        PostStatus(true, "SetStackFilter falhou: %s", ShvClient::StatusString(_st));
     Unlock();
     return { _ok, _st };
 }

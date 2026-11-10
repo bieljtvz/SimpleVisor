@@ -213,6 +213,42 @@ ShvOsGetPhysicalAddress (
     _In_ VOID* BaseAddress
     );
 
+//
+// Wrapper para MmCopyMemory com MM_COPY_MEMORY_PHYSICAL -- documentada pela
+// Microsoft como segura em IRQL <= DISPATCH_LEVEL (ao contrario da variante
+// MM_COPY_MEMORY_VIRTUAL, que exige PASSIVE_LEVEL). Copia os bytes
+// diretamente, sem exigir um VA dereferenciavel -- mais apropriada aqui que
+// MmGetVirtualForPhysical+dereference: nesse projeto, pra paginas que SAO
+// elas mesmas tabelas de pagina de outro processo, a dupla
+// MmGetVirtualForPhysical+dereference chegou a devolver conteudo
+// INCORRETO (confirmado comparando com leitura fisica direta via WinDbg
+// "!dq"), mesmo sem travar nada -- silenciosamente errado, pior que um
+// bugcheck. MmCopyMemory(PHYSICAL) e o mecanismo que o proprio WinDbg usa
+// internamente pra isso. Usada por ShvTranslateGvaWithCr3/ShvReadGvaWithCr3
+// em shvvmxhv.c pra andar e ler as tabelas de pagina (PML4/PDPT/PD/PT) de um
+// CR3 arbitrario (ex.: processo usermode) dentro do handler de VM-exit.
+//
+UINT8
+ShvOsReadPhysical (
+    _In_  UINT64  Pa,
+    _Out_ UINT64* OutValue
+    );
+
+//
+// Wrapper para MmIsAddressValid -- documentado pela Microsoft como seguro em
+// QUALQUER IRQL (so consulta a PTE, nunca bloqueia nem toca o conteudo da
+// pagina). Usado pelo stack-walk heuristico em VMX root para verificar se um
+// candidato a endereco de retorno e realmente residente ANTES de ler os bytes
+// perto dele (checagem de "call-site") -- ler um endereco arbitrario tirado
+// da pilha sem essa checagem e exatamente a classe de erro que ja causou
+// bugchecks 0xD1 DISABLED_INTERRUPT_FAULT neste projeto (ver
+// [[feedback_direct_map_single_offset_bugcheck]] na memoria).
+//
+UINT8
+ShvOsIsAddressValid (
+    _In_ VOID* Va
+    );
+
 #ifndef __BASE_H__
 VOID
 ShvOsDebugPrint (

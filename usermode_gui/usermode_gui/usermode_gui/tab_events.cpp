@@ -104,32 +104,97 @@ static bool FindModuleForVa(const std::vector<SHV_MODULE_ENTRY>& mods, uint64_t 
     return false;
 }
 
-static void RenderAddrCell(uint64_t va,
-                            const std::vector<SHV_MODULE_ENTRY>& kernMods,
-                            const std::vector<SHV_MODULE_ENTRY>* procMods,
-                            bool showModOff)
+// Monta o texto de uma celula de endereco (modulo+offset ou hex cru) sem
+// desenhar nada -- usado tanto pelo RenderAddrCell "antigo" (stack panel)
+// quanto pela tabela principal, que precisa da string pronta pra alimentar
+// RenderCopyableCell (medida de largura + menu de copiar).
+static std::string FormatAddrCell(uint64_t va,
+                                   const std::vector<SHV_MODULE_ENTRY>& kernMods,
+                                   const std::vector<SHV_MODULE_ENTRY>* procMods,
+                                   bool showModOff,
+                                   bool* outDisabled)
 {
-    if (va == 0) { ImGui::TextDisabled("---"); return; }
+    *outDisabled = false;
+    char buf[160];
+
+    if (va == 0) { *outDisabled = true; return "---"; }
 
     if (showModOff)
     {
         const char* name; uint64_t base;
         if (FindModuleForVa(kernMods, va, &name, &base))
         {
-            ImGui::Text("%s+0x%llX", name, (unsigned long long)(va - base));
-            return;
+            snprintf(buf, sizeof(buf), "%s+0x%llX", name, (unsigned long long)(va - base));
+            return buf;
         }
         if (procMods && FindModuleForVa(*procMods, va, &name, &base))
         {
-            ImGui::Text("%s+0x%llX", name, (unsigned long long)(va - base));
-            return;
+            snprintf(buf, sizeof(buf), "%s+0x%llX", name, (unsigned long long)(va - base));
+            return buf;
         }
         // Nao resolvido: mostra endereco cru sem prefixo enganoso
-        ImGui::Text("0x%016llX", (unsigned long long)va);
-        return;
+        snprintf(buf, sizeof(buf), "0x%016llX", (unsigned long long)va);
+        return buf;
     }
 
-    ImGui::Text("0x%016llX", (unsigned long long)va);
+    snprintf(buf, sizeof(buf), "0x%016llX", (unsigned long long)va);
+    return buf;
+}
+
+static void RenderAddrCell(uint64_t va,
+                            const std::vector<SHV_MODULE_ENTRY>& kernMods,
+                            const std::vector<SHV_MODULE_ENTRY>* procMods,
+                            bool showModOff)
+{
+    bool disabled = false;
+    std::string s = FormatAddrCell(va, kernMods, procMods, showModOff, &disabled);
+    if (disabled) ImGui::TextDisabled("%s", s.c_str());
+    else           ImGui::Text("%s", s.c_str());
+}
+
+// Desenha (se ci == selCol) o Selectable invisivel que cobre a linha inteira
+// (ImGuiSelectableFlags_SpanAllColumns), usado pra selecionar o evento ao
+// clicar em qualquer parte da linha. PRECISA ser desenhado na primeira coluna
+// VISIVEL da tabela (selCol), nao sempre na coluna 0 ("Hora") -- se "Hora"
+// estiver desabilitada via "Colunas", TableNextColumn() pra ela retorna uma
+// celula de largura zero/oculta, e um Selectable desenhado ali nao recebe
+// clique nenhum (bug relatado: so dava pra selecionar a linha com "Hora"
+// ativa). selCol e calculado uma vez por frame (primeira coluna com
+// g_cfg.evtColVis[ci]==true), antes do loop de linhas.
+static bool PlaceRowSelectableIfOwned(int selCol, int ci, bool isSelected)
+{
+    if (ci != selCol) return false;
+    bool clicked = ImGui::Selectable("", isSelected,
+            ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap,
+            ImVec2(0, 0));
+    ImGui::SameLine(0, 0);
+    return clicked;
+}
+
+// Desenha o texto de uma celula "copiavel": clique direito abre um menu de
+// contexto com "Copiar" (copia o texto exato da celula pra area de
+// transferencia via ImGui::SetClipboardText). Tambem atualiza *widthSlot com
+// a largura em pixels do texto, usado pelo auto-fit de largura de coluna
+// (ver s_colWidth/RenderEventTable) -- o chamador deve envolver cada celula
+// num ImGui::PushID/PopID exclusivo (linha+coluna) pra o popup de contexto
+// nao colidir entre celulas.
+static void RenderCopyableCell(float* widthSlot, const char* text,
+                                const ImVec4* color = nullptr, bool disabled = false)
+{
+    if (color) ImGui::PushStyleColor(ImGuiCol_Text, *color);
+    if (disabled) ImGui::TextDisabled("%s", text);
+    else           ImGui::TextUnformatted(text);
+    if (color) ImGui::PopStyleColor();
+
+    float w = ImGui::CalcTextSize(text).x;
+    if (w > *widthSlot) *widthSlot = w;
+
+    if (ImGui::BeginPopupContextItem("cellctx"))
+    {
+        if (ImGui::Selectable("Copiar"))
+            ImGui::SetClipboardText(text);
+        ImGui::EndPopup();
+    }
 }
 
 // ── Cache de modulos de processos user-mode ──────────────────────────────────
@@ -234,8 +299,20 @@ static void RenderEventTable(ShvBackend& backend,
                              size_t      addrFilterSz,
                              uint32_t&   lastSeenSeq,
                              const std::vector<SHV_PROC_ENTRY>&   procs,
-                             const std::vector<SHV_MODULE_ENTRY>& modules)
+                             const std::vector<SHV_MODULE_ENTRY>& modules,
+                             bool        showStackFilterToggle = false)
 {
+    // Filtro de call-site do stack walk heuristico (ShvLooksLikeCallSite no
+    // hypervisor) -- so exibido na aba EPT, onde o stack walk e usado. Estado
+    // local (nao persiste entre sessoes): reflete o default do kernel
+    // (ShvStackWalkDebugNoFilter=0 == filtro ligado).
+    static bool s_stackFilterEnabled = true;
+    if (showStackFilterToggle)
+    {
+        if (ImGui::Checkbox("Filtro call-site (stack)", &s_stackFilterEnabled))
+            backend.SetStackFilter(s_stackFilterEnabled);
+        ImGui::SameLine(0, 12);
+    }
     ImGui::SetNextItemWidth(170);
     ImGui::InputText("RIP/Addr##filt", addrFilter, addrFilterSz);
     ImGui::SameLine(0, 12);
@@ -254,6 +331,16 @@ static void RenderEventTable(ShvBackend& backend,
     }
     ImGui::Spacing();
 
+    // Largura de cada coluna, auto-ajustada ao conteudo mais largo ja visto
+    // (medido quadro a quadro em colWNext abaixo e aplicado no proximo
+    // TableSetupColumn -- atraso de 1 frame, padrao usual pra "auto-fit" em
+    // ImGui modo imediato). Comeca nos valores fixos originais; nunca encolhe
+    // abaixo da largura do proprio label do cabecalho.
+    static float s_colWidth[11] = { 85, 55, 30, 90, 120, 130, 145, 145, 145, 145, 145 };
+    float colWNext[11];
+    for (int ci = 0; ci < 11; ci++)
+        colWNext[ci] = ImGui::CalcTextSize(kEptColNames[ci]).x + 16.0f;
+
     // Reserva espaco para o painel de stack (140px) na parte inferior.
     float stackPanelH = 140.0f;
     ImVec2 tableSize = ImVec2(0.0f, ImGui::GetContentRegionAvail().y - stackPanelH - 28.0f);
@@ -264,20 +351,20 @@ static void RenderEventTable(ShvBackend& backend,
             tableSize))
     {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Hora",      ImGuiTableColumnFlags_WidthFixed,   85.0f);
-        ImGui::TableSetupColumn("Seq",       ImGuiTableColumnFlags_WidthFixed,   55.0f);
-        ImGui::TableSetupColumn("CPU",       ImGuiTableColumnFlags_WidthFixed,   30.0f);
-        ImGui::TableSetupColumn("Tipo",      ImGuiTableColumnFlags_WidthFixed,   90.0f);
-        ImGui::TableSetupColumn("Causador",  ImGuiTableColumnFlags_WidthFixed,  120.0f);
-        ImGui::TableSetupColumn("Destino",   ImGuiTableColumnFlags_WidthFixed,  130.0f);
-        ImGui::TableSetupColumn("RIP/Value", ImGuiTableColumnFlags_WidthFixed,  145.0f);
-        ImGui::TableSetupColumn("RetAddr",   ImGuiTableColumnFlags_WidthFixed,  145.0f);
-        ImGui::TableSetupColumn("Aux/GPA",   ImGuiTableColumnFlags_WidthFixed,  145.0f);
-        ImGui::TableSetupColumn("VA Fault",  ImGuiTableColumnFlags_WidthFixed,  145.0f);
-        ImGui::TableSetupColumn("CR3",       ImGuiTableColumnFlags_WidthFixed,  145.0f);
+        for (int ci = 0; ci < 11; ci++)
+            ImGui::TableSetupColumn(kEptColNames[ci], ImGuiTableColumnFlags_WidthFixed, s_colWidth[ci]);
         for (int ci = 0; ci < 11; ci++)
             ImGui::TableSetColumnEnabled(ci, g_cfg.evtColVis[ci]);
         ImGui::TableHeadersRow();
+
+        // Primeira coluna visivel -- e onde o Selectable de selecao de linha
+        // (SpanAllColumns) precisa ser desenhado neste frame (ver
+        // PlaceRowSelectableIfOwned acima).
+        int selCol = 0;
+        for (int ci = 0; ci < 11; ci++)
+        {
+            if (g_cfg.evtColVis[ci]) { selCol = ci; break; }
+        }
 
         backend.Lock();
         const auto& events = backend.State().events;
@@ -296,58 +383,78 @@ static void RenderEventTable(ShvBackend& backend,
             bool isSelected = s_hasSelected && (s_selectedEvent.seqNum == e.seqNum);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            // Selectable invisivel sobre toda a linha. Label vazio + PushID
-            // (em vez de embutir o id dentro da label, ex. "##sel137") --
-            // mesmo padrao ja usado em tab_procs.cpp/tab_drivers.cpp para
-            // Selectable compartilhando coluna com texto via SameLine.
+            // Todas as celulas da linha (inclusive o Selectable abaixo) ficam
+            // dentro deste PushID(seqNum) -- cada RenderCopyableCell faz seu
+            // proprio PushID(coluna) por dentro, entao a dupla (seqNum, coluna)
+            // da um ID unico pro menu de contexto "Copiar" de cada celula.
             ImGui::PushID((int)e.seqNum);
-            if (ImGui::Selectable("", isSelected,
-                    ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap,
-                    ImVec2(0, 0)))
+
+            if (PlaceRowSelectableIfOwned(selCol, 0, isSelected))
             {
                 s_selectedEvent = e;
                 s_hasSelected   = true;
             }
-            ImGui::PopID();
-            ImGui::SameLine(0, 0);
 
             // Coluna Hora: converte FILETIME kernel -> hora local HH:MM:SS.mmm.
             // Fica na MESMA coluna 0 onde o Selectable acima foi desenhado
             // (via TableNextColumn(), nao TableSetColumnIndex+SameLine com
             // espacamento) -- nao chamar outro TableNextColumn() aqui.
-            if (e.timestamp != 0)
             {
-                FILETIME ft, localFt;
-                ft.dwLowDateTime  = (DWORD)(e.timestamp & 0xFFFFFFFFULL);
-                ft.dwHighDateTime = (DWORD)(e.timestamp >> 32);
-                SYSTEMTIME st = {};
-                if (FileTimeToLocalFileTime(&ft, &localFt) &&
-                    FileTimeToSystemTime(&localFt, &st))
+                char horaBuf[32] = "---";
+                if (e.timestamp != 0)
                 {
-                    ImGui::Text("%02u:%02u:%02u.%03u",
-                        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+                    FILETIME ft, localFt;
+                    ft.dwLowDateTime  = (DWORD)(e.timestamp & 0xFFFFFFFFULL);
+                    ft.dwHighDateTime = (DWORD)(e.timestamp >> 32);
+                    SYSTEMTIME st = {};
+                    if (FileTimeToLocalFileTime(&ft, &localFt) &&
+                        FileTimeToSystemTime(&localFt, &st))
+                    {
+                        snprintf(horaBuf, sizeof(horaBuf), "%02u:%02u:%02u.%03u",
+                            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+                    }
                 }
-                else ImGui::TextDisabled("---");
+                ImGui::PushID(0);
+                RenderCopyableCell(&colWNext[0], horaBuf, nullptr, horaBuf[0] == '-');
+                ImGui::PopID();
             }
-            else ImGui::TextDisabled("---");
 
-            ImGui::TableNextColumn(); ImGui::Text("%u", e.seqNum);
-            ImGui::TableNextColumn(); ImGui::Text("%u", e.cpu);
             ImGui::TableNextColumn();
-            ImGui::PushStyleColor(ImGuiCol_Text, EventColor(e.type));
-            ImGui::TextUnformatted(EventName(e.type));
-            ImGui::PopStyleColor();
+            if (PlaceRowSelectableIfOwned(selCol, 1, isSelected)) { s_selectedEvent = e; s_hasSelected = true; }
+            {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "%u", e.seqNum);
+                ImGui::PushID(1);
+                RenderCopyableCell(&colWNext[1], buf);
+                ImGui::PopID();
+            }
+            ImGui::TableNextColumn();
+            if (PlaceRowSelectableIfOwned(selCol, 2, isSelected)) { s_selectedEvent = e; s_hasSelected = true; }
+            {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "%u", e.cpu);
+                ImGui::PushID(2);
+                RenderCopyableCell(&colWNext[2], buf);
+                ImGui::PopID();
+            }
+            ImGui::TableNextColumn();
+            if (PlaceRowSelectableIfOwned(selCol, 3, isSelected)) { s_selectedEvent = e; s_hasSelected = true; }
+            {
+                ImVec4 col = EventColor(e.type);
+                ImGui::PushID(3);
+                RenderCopyableCell(&colWNext[3], EventName(e.type), &col);
+                ImGui::PopID();
+            }
 
             // Causador: processo que estava executando quando o fault ocorreu (via CR3)
             ImGui::TableNextColumn();
+            if (PlaceRowSelectableIfOwned(selCol, 4, isSelected)) { s_selectedEvent = e; s_hasSelected = true; }
             {
                 const char* srcName = ProcNameByCr3(procs, e.cr3);
-                if (srcName)
-                    ImGui::TextUnformatted(srcName);
-                else if (e.cr3 != 0)
-                    ImGui::TextDisabled("nao identificado");
-                else
-                    ImGui::TextDisabled("---");
+                const char* text = srcName ? srcName : (e.cr3 != 0 ? "nao identificado" : "---");
+                ImGui::PushID(4);
+                RenderCopyableCell(&colWNext[4], text, nullptr, srcName == nullptr);
+                ImGui::PopID();
             }
 
             // Destino: modulo/driver dona do RIP faultado. Verifica modulos do
@@ -356,39 +463,85 @@ static void RenderEventTable(ShvBackend& backend,
             // (necessario para hooks instalados em codigo usermode, nao so em
             // drivers/ntoskrnl).
             ImGui::TableNextColumn();
+            if (PlaceRowSelectableIfOwned(selCol, 5, isSelected)) { s_selectedEvent = e; s_hasSelected = true; }
             {
                 const auto* pm = ProcModsByCr3(e.cr3);
                 const char* dstMod = ModuleNameByVa(modules, e.value);
                 if (!dstMod && pm)
                     dstMod = ModuleNameByVa(*pm, e.value);
 
+                const char* text;
+                bool disabled = false;
                 if (dstMod)
                 {
-                    ImGui::TextUnformatted(dstMod);
+                    text = dstMod;
                 }
                 else if (e.value != 0)
                 {
-                    if (e.value >= 0xFFFF800000000000ULL)
-                        ImGui::TextDisabled("kernel");
-                    else
-                        ImGui::TextDisabled("nao identificado");
+                    disabled = true;
+                    text = (e.value >= 0xFFFF800000000000ULL) ? "kernel" : "nao identificado";
                 }
                 else
                 {
-                    ImGui::TextDisabled("---");
+                    disabled = true;
+                    text = "---";
                 }
+                ImGui::PushID(5);
+                RenderCopyableCell(&colWNext[5], text, nullptr, disabled);
+                ImGui::PopID();
             }
 
             {
                 const auto* pm = ProcModsByCr3(e.cr3);
-                ImGui::TableNextColumn(); RenderAddrCell(e.value,      modules, pm, g_cfg.evtShowModOff);
-                ImGui::TableNextColumn(); RenderAddrCell(e.returnAddr, modules, pm, g_cfg.evtShowModOff);
+                bool disabled;
+                std::string s;
+
                 ImGui::TableNextColumn();
-                if (e.aux) ImGui::Text("0x%016llX", (unsigned long long)e.aux);
-                else       ImGui::TextDisabled("---");
-                ImGui::TableNextColumn(); RenderAddrCell(e.linearAddr, modules, pm, g_cfg.evtShowModOff);
+                if (PlaceRowSelectableIfOwned(selCol, 6, isSelected)) { s_selectedEvent = e; s_hasSelected = true; }
+                disabled = false;
+                s = FormatAddrCell(e.value, modules, pm, g_cfg.evtShowModOff, &disabled);
+                ImGui::PushID(6);
+                RenderCopyableCell(&colWNext[6], s.c_str(), nullptr, disabled);
+                ImGui::PopID();
+
+                ImGui::TableNextColumn();
+                if (PlaceRowSelectableIfOwned(selCol, 7, isSelected)) { s_selectedEvent = e; s_hasSelected = true; }
+                disabled = false;
+                s = FormatAddrCell(e.returnAddr, modules, pm, g_cfg.evtShowModOff, &disabled);
+                ImGui::PushID(7);
+                RenderCopyableCell(&colWNext[7], s.c_str(), nullptr, disabled);
+                ImGui::PopID();
+
+                ImGui::TableNextColumn();
+                if (PlaceRowSelectableIfOwned(selCol, 8, isSelected)) { s_selectedEvent = e; s_hasSelected = true; }
+                char auxBuf[32];
+                bool auxDisabled = (e.aux == 0);
+                if (auxDisabled) snprintf(auxBuf, sizeof(auxBuf), "---");
+                else              snprintf(auxBuf, sizeof(auxBuf), "0x%016llX", (unsigned long long)e.aux);
+                ImGui::PushID(8);
+                RenderCopyableCell(&colWNext[8], auxBuf, nullptr, auxDisabled);
+                ImGui::PopID();
+
+                ImGui::TableNextColumn();
+                if (PlaceRowSelectableIfOwned(selCol, 9, isSelected)) { s_selectedEvent = e; s_hasSelected = true; }
+                disabled = false;
+                s = FormatAddrCell(e.linearAddr, modules, pm, g_cfg.evtShowModOff, &disabled);
+                ImGui::PushID(9);
+                RenderCopyableCell(&colWNext[9], s.c_str(), nullptr, disabled);
+                ImGui::PopID();
             }
-            ImGui::TableNextColumn(); ImGui::Text("0x%016llX", e.cr3);
+
+            ImGui::TableNextColumn();
+            if (PlaceRowSelectableIfOwned(selCol, 10, isSelected)) { s_selectedEvent = e; s_hasSelected = true; }
+            {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "0x%016llX", (unsigned long long)e.cr3);
+                ImGui::PushID(10);
+                RenderCopyableCell(&colWNext[10], buf);
+                ImGui::PopID();
+            }
+
+            ImGui::PopID(); // seqNum
         }
 
         // Scroll para o final somente quando novos eventos chegarem
@@ -404,6 +557,11 @@ static void RenderEventTable(ShvBackend& backend,
 
         backend.Unlock();
         ImGui::EndTable();
+
+        // Aplica a largura medida neste frame pra o proximo TableSetupColumn
+        // (auto-fit com 1 frame de atraso -- ver comentario acima de s_colWidth).
+        for (int ci = 0; ci < 11; ci++)
+            s_colWidth[ci] = colWNext[ci];
     }
 
     // ── Painel de stack trace ──────────────────────────────────────────────────
@@ -486,7 +644,8 @@ void RenderTabEvents(ShvBackend& backend)
                          s_autoScroll, s_paused,
                          s_addrEpt, sizeof(s_addrEpt),
                          s_lastSeqEpt,
-                         s_procs, s_modules);
+                         s_procs, s_modules,
+                         /*showStackFilterToggle=*/true);
         ImGui::EndTabItem();
     }
 

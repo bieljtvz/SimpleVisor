@@ -38,6 +38,7 @@ VOID   ShvHookSetMdl(_In_ UINT64 Pa, _In_ PMDL Mdl);
 PMDL   ShvHookTakeMdl(_In_ UINT64 Pa);
 VOID   ShvHookReleaseMdls(VOID);
 VOID   ShvClearEvents(VOID);
+VOID   ShvSetStackFilterEnabled(_In_ UINT8 Enabled);
 UINT32 ShvHookInstallShadow(_In_ UINT64 OriginalPhys, _In_ UINT64 ShadowPhys);
 UINT32 ShvHookRemoveShadow(_In_ UINT64 OriginalPhys);
 UINT32 ShvHookFreeSlot(_In_ UINT64 OriginalPhys);

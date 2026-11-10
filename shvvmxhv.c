@@ -116,6 +116,9 @@ typedef struct _SHV_HV_EVENT
     UINT64 LinearAddr;  // GUEST_LINEAR_ADDRESS -- VA do acesso que causou a
                          // violacao de EPT (so para eventos EPT_*; 0 para LSTAR).
                          // Usado pela GUI na coluna "VA Fault".
+    UINT64 Stack[SHV_EVENT_STACK_FRAMES]; // Stack trace HEURISTICO (ver
+                         // ShvCaptureStackHeuristic) -- nao e um unwind
+                         // estruturado de verdade, so = 0 se nao capturado.
 } SHV_HV_EVENT, *PSHV_HV_EVENT;
 
 //
@@ -152,6 +155,357 @@ ShvReadSystemTime (
     return ((UINT64)(UINT32)h1 << 32) | lo;
 }
 
+#define SHV_KERNEL_VA_MIN   0xFFFF800000000000ULL
+#define SHV_PTE_PRESENT     0x1ULL
+#define SHV_PTE_PS          0x80ULL
+#define SHV_PTE_PHYS_MASK   0x000FFFFFFFFFF000ULL // bits 12-51, serve pra PML4E/PDPTE/PDE/PTE de 4KB
+
+//
+// Contadores de diagnostico do stack walk usermode -- leia no WinDbg com
+// "dq shv!ShvStackWalk<Nome>" (mesmo padrao ja usado no projeto pra
+// ShvPaToVaRejectCount/ShvPaToVaLastBadResult). Dizem exatamente em qual
+// nivel da traducao PML4/PDPT/PD/PT as falhas estao acontecendo, sem
+// precisar adicionar nada na GUI.
+//
+volatile UINT64 ShvStackWalkAttempts     = 0; // vezes que ShvCaptureStackHeuristic rodou com RSP usermode
+volatile UINT64 ShvStackWalkSuccess      = 0; // traducoes de slot da pilha que deram certo (pelo menos 1 QWORD lido)
+volatile UINT64 ShvStackWalkPml4Fail     = 0;
+volatile UINT64 ShvStackWalkPdptFail     = 0;
+volatile UINT64 ShvStackWalkPdFail       = 0;
+volatile UINT64 ShvStackWalkPtFail       = 0;
+volatile UINT64 ShvStackWalkFinalFail    = 0; // leitura fisica final (ShvOsReadPhysical) falhou
+volatile UINT64 ShvStackWalkCallSiteReject = 0; // slot traduzido e valido, mas nao passou no filtro de call-site
+volatile UINT64 ShvStackWalkLastCr3      = 0; // Cr3 usado na ULTIMA tentativa (kernel ou usermode)
+volatile UINT64 ShvStackWalkLastGva      = 0; // GVA que estava sendo traduzido na ULTIMA falha
+
+// Diagnostico fino do nivel PDPT (o que mais falhou no primeiro teste):
+// distingue "nao conseguiu nem LER a PDPTE" (problema de ShvOsReadPhysical)
+// de "leu certinho mas o bit Present era 0" (a propria entrada diz que nao
+// esta mapeado). So preenchido quando o nivel PDPT falha.
+volatile UINT64 ShvStackWalkPdptReadFail = 0; // ShvOsReadPhysical da PDPTE falhou (nao chegou nem a ler)
+volatile UINT64 ShvStackWalkLastPml4Entry= 0; // valor cru da PML4E que levou a essa PDPTE
+volatile UINT64 ShvStackWalkLastPdptPa   = 0; // endereco FISICO que tentamos ler pra PDPTE
+volatile UINT64 ShvStackWalkLastPdptEntry= 0; // valor cru lido (0 se ShvOsReadPhysical falhou)
+
+// Toggle de diagnostico -- escreva 1 AO VIVO via WinDbg, sem precisar
+// recompilar/redeployar:
+//   ed shv!ShvStackWalkDebugNoFilter 1
+// Com isso ligado, ShvCaptureStackHeuristic para de filtrar por
+// ShvLooksLikeCallSite e guarda os primeiros QWORDs traduzidos com sucesso
+// da pilha usermode CRUS (so passando pelo filtro grosso de "parece um VA
+// canonico de usermode"), pra inspecionar manualmente no WinDbg/GUI o que
+// realmente esta la, sem depender do meu padrao de opcode estar certo.
+volatile UINT8  ShvStackWalkDebugNoFilter = 0;
+
+//
+// Liga/desliga o filtro de call-site em runtime via IOCTL (SHV_CMD_SET_STACK_FILTER),
+// pra poder comparar lado a lado no GUI sem precisar do WinDbg/`ed`. Enabled=1
+// -> filtro ligado (ShvStackWalkDebugNoFilter=0); Enabled=0 -> filtro desligado
+// (mostra tudo que parece um VA plausivel, sem checar call-site).
+//
+VOID
+ShvSetStackFilterEnabled (
+    _In_ UINT8 Enabled
+    )
+{
+    ShvStackWalkDebugNoFilter = Enabled ? 0 : 1;
+}
+
+//
+// Traduz um GVA de QUALQUER processo (identificado por Cr3) pro endereco
+// FISICO correspondente, andando manualmente PML4->PDPT->PD->PT (4KB, 2MB ou
+// 1GB). Cada nivel vira uma leitura fisica via ShvOsReadPhysical (MmCopyMemory
+// com MM_COPY_MEMORY_PHYSICAL -- documentada como segura em IRQL <=
+// DISPATCH_LEVEL) -- nunca um offset ou snapshot cacheado da tabela de
+// paginas. Retorna 0 (sem escrever em *OutPa) se qualquer nivel nao estiver
+// presente ou nao puder ser lido -- nunca "adivinha" um resultado.
+//
+// Devolve o endereco FISICO (nao um VA pra dereferenciar) de proposito: a
+// primeira versao usava MmGetVirtualForPhysical pra obter um VA e
+// dereferenciava direto, mas uma comparacao com leitura fisica real via
+// WinDbg ("!dq") mostrou que esse VA podia devolver conteudo DIFERENTE do
+// que estava realmente na memoria fisica (silenciosamente errado, sem
+// travar nada -- pior que um bugcheck). MmCopyMemory(PHYSICAL) e o mecanismo
+// que o proprio WinDbg usa pra leitura fisica; ler o QWORD final tambem
+// passa por ele agora (ver ShvReadGvaWithCr3), nunca por um dereference direto.
+//
+static UINT8
+ShvTranslateGvaWithCr3 (
+    _In_  UINT64  Cr3,
+    _In_  UINT64  Gva,
+    _Out_ UINT64* OutPa
+    )
+{
+    UINT64 entry;
+    UINT64 pa;
+
+    *OutPa = 0;
+    ShvStackWalkLastCr3 = Cr3;
+    ShvStackWalkLastGva = Gva;
+
+    // PML4E
+    pa = (Cr3 & SHV_PTE_PHYS_MASK) + ((Gva >> 39) & 0x1FF) * 8;
+    if (!ShvOsReadPhysical(pa, &entry) || !(entry & SHV_PTE_PRESENT))
+    {
+        _InterlockedIncrement64((LONG64*)&ShvStackWalkPml4Fail);
+        return 0;
+    }
+    ShvStackWalkLastPml4Entry = entry;
+
+    // PDPTE
+    pa = (entry & SHV_PTE_PHYS_MASK) + ((Gva >> 30) & 0x1FF) * 8;
+    ShvStackWalkLastPdptPa = pa;
+    {
+        UINT8 readOk = ShvOsReadPhysical(pa, &entry);
+        ShvStackWalkLastPdptEntry = readOk ? entry : 0;
+        if (!readOk)
+            _InterlockedIncrement64((LONG64*)&ShvStackWalkPdptReadFail);
+        if (!readOk || !(entry & SHV_PTE_PRESENT))
+        {
+            _InterlockedIncrement64((LONG64*)&ShvStackWalkPdptFail);
+            return 0;
+        }
+    }
+    if (entry & SHV_PTE_PS)
+    {
+        // Pagina de 1GB: bits 30-51 da entrada sao a base fisica
+        *OutPa = (entry & 0x000FFFFFC0000000ULL) + (Gva & 0x3FFFFFFFULL);
+        _InterlockedIncrement64((LONG64*)&ShvStackWalkSuccess);
+        return 1;
+    }
+
+    // PDE
+    pa = (entry & SHV_PTE_PHYS_MASK) + ((Gva >> 21) & 0x1FF) * 8;
+    if (!ShvOsReadPhysical(pa, &entry) || !(entry & SHV_PTE_PRESENT))
+    {
+        _InterlockedIncrement64((LONG64*)&ShvStackWalkPdFail);
+        return 0;
+    }
+    if (entry & SHV_PTE_PS)
+    {
+        // Pagina de 2MB: bits 21-51 da entrada sao a base fisica
+        *OutPa = (entry & 0x000FFFFFFFE00000ULL) + (Gva & 0x1FFFFFULL);
+        _InterlockedIncrement64((LONG64*)&ShvStackWalkSuccess);
+        return 1;
+    }
+
+    // PTE (pagina normal de 4KB)
+    pa = (entry & SHV_PTE_PHYS_MASK) + ((Gva >> 12) & 0x1FF) * 8;
+    if (!ShvOsReadPhysical(pa, &entry) || !(entry & SHV_PTE_PRESENT))
+    {
+        _InterlockedIncrement64((LONG64*)&ShvStackWalkPtFail);
+        return 0;
+    }
+
+    *OutPa = (entry & SHV_PTE_PHYS_MASK) + (Gva & 0xFFFULL);
+    _InterlockedIncrement64((LONG64*)&ShvStackWalkSuccess);
+    return 1;
+}
+
+//
+// Traduz Gva (via Cr3) e le o QWORD final -- sempre por ShvOsReadPhysical,
+// nunca por dereference de um VA obtido separadamente (ver comentario acima
+// em ShvTranslateGvaWithCr3 sobre por que isso importa).
+//
+static UINT8
+ShvReadGvaWithCr3 (
+    _In_  UINT64  Cr3,
+    _In_  UINT64  Gva,
+    _Out_ UINT64* OutValue
+    )
+{
+    UINT64 pa;
+
+    *OutValue = 0;
+
+    if (!ShvTranslateGvaWithCr3(Cr3, Gva, &pa))
+        return 0;
+
+    if (!ShvOsReadPhysical(pa, OutValue))
+    {
+        _InterlockedIncrement64((LONG64*)&ShvStackWalkFinalFail);
+        return 0;
+    }
+
+    return 1;
+}
+
+//
+// Quantos QWORDs acima do RSP sao varridos procurando candidatos a endereco
+// de retorno -- bem mais que SHV_EVENT_STACK_FRAMES, porque nem todo QWORD
+// que esta fisicamente na pilha e um retorno de verdade (lixo de chamadas
+// antigas, variaveis locais, etc.); o filtro de "call-site" em
+// ShvLooksLikeCallSite e o que reduz esse ruido.
+//
+// 64 (512 bytes) se mostrou PEQUENO DEMAIS num teste real: comparando com
+// "dps" do WinDbg (com simbolos, processo ainda vivo), a janela inteira de
+// 64 QWORDs acima do RSP era quase so preenchimento de build debug
+// (0xCCCCCCCC) -- nenhum endereco de retorno de verdade cabia ali. Frames de
+// pilha sem otimizacao (padding, canario do /RTC, locals maiores) passam
+// facil de 512 bytes. 512 QWORDs (4KB, ~1 pagina) da bem mais margem sem
+// ficar arbitrariamente grande.
+#define SHV_STACK_SCAN_WINDOW 512
+
+//
+// Verifica se os 8 bytes antes de Candidate terminam numa instrucao CALL
+// plausivel -- call rel32 direto (E8 xx xx xx xx, 5 bytes) ou call r/m64
+// indireto por registrador (FF /2, 2 ou 3 bytes com prefixo REX). E uma
+// HEURISTICA (opcao 2 discutida com o usuario): nao cobre call por memoria
+// com ModRM/SIB mais longos, mas pega os casos mais comuns sem precisar de
+// um parser de instrucoes completo.
+//
+// Candidate pode ser kernel ou usermode (Cr3 so e usado no segundo caso).
+// Rejeita (sem tentar ler nada) a rara janela que cruzaria uma fronteira de
+// pagina de 4KB -- so os casos comuns (Candidate com pelo menos 8 bytes de
+// folga desde o inicio da propria pagina) sao verificados; o resto conta
+// como "nao parece call-site" (consistente com a natureza heuristica desta
+// funcao -- pode pular um frame real ocasionalmente, nunca arrisca uma
+// segunda traducao so pra cobrir esse caso raro).
+//
+// So le os bytes depois de confirmar residencia (direto via
+// ShvOsIsAddressValid pra kernel, ou via ShvTranslateGvaWithCr3 pra
+// usermode) -- Candidate vem de um valor QUALQUER lido da pilha, nao de um
+// endereco confiavel por construcao; ler sem essa checagem e exatamente a
+// classe de erro que ja causou bugchecks 0xD1 DISABLED_INTERRUPT_FAULT
+// neste projeto (ver [[feedback_direct_map_single_offset_bugcheck]]).
+//
+static UINT8
+ShvLooksLikeCallSite (
+    _In_ UINT64 Cr3,
+    _In_ UINT64 Candidate
+    )
+{
+    UINT64 windowStart;
+    UINT64 qword;
+    UINT8* bytes;
+
+    if (Candidate < 8 || (Candidate & 0xFFFULL) < 8)
+        return 0;
+
+    windowStart = Candidate - 8;
+
+    if (windowStart >= SHV_KERNEL_VA_MIN)
+    {
+        // Enderecos de kernel: leitura direta continua segura (mapeados
+        // identicos em qualquer CR3, sempre residentes para codigo carregado).
+        if (!ShvOsIsAddressValid((VOID*)windowStart))
+            return 0;
+        qword = *(volatile UINT64*)windowStart;
+    }
+    else
+    {
+        if (!ShvReadGvaWithCr3(Cr3, windowStart, &qword))
+            return 0;
+    }
+
+    bytes = (UINT8*)&qword;
+
+    // CALL rel32: E8 cd (5 bytes, terminando exatamente em Candidate)
+    if (bytes[3] == 0xE8)
+        return 1;
+
+    // CALL r/m64 indireto: FF /2 (ModRM.reg == 2, binario 010 -> mascara 0x38 == 0x10)
+    if (bytes[6] == 0xFF && (bytes[7] & 0x38) == 0x10)
+        return 1;
+
+    // Mesma coisa com prefixo REX (necessario para registradores R8-R15)
+    if (bytes[5] >= 0x40 && bytes[5] <= 0x4F &&
+        bytes[6] == 0xFF && (bytes[7] & 0x38) == 0x10)
+        return 1;
+
+    // CALL indireto via IAT/ponteiro de funcao: FF 15 disp32 ("call qword ptr
+    // [rip+disp32]", 6 bytes: ModRM=00/010/101=0x15, SEM SIB/base/index
+    // variaveis). E o padrao mais comum pra chamar funcoes importadas
+    // (CRT/API do Windows) em builds sem otimizacao -- faltava aqui e
+    // explicava a maioria das rejeicoes no teste real (CallSiteReject alto,
+    // zero frames aceitos apesar de Success alto).
+    if (bytes[2] == 0xFF && bytes[3] == 0x15)
+        return 1;
+
+    return 0;
+}
+
+//
+// Stack trace heuristico a partir de GuestRsp -- varre SHV_STACK_SCAN_WINDOW
+// QWORDs acima do RSP e guarda em OutFrames (ate SHV_EVENT_STACK_FRAMES) os
+// valores que: (1) sao um VA plausivel no mesmo "mundo" do RSP (kernel ou
+// usermode -- nunca mistura os dois), (2) tem bit0==0 (alinhamento de
+// instrucao), e (3) sao precedidos por algo que parece uma instrucao CALL
+// (ShvLooksLikeCallSite). NAO e um unwind estruturado de verdade (sem usar
+// .pdata/UNWIND_INFO) -- pode pular frames reais ou, raramente, aceitar um
+// falso positivo; e a opcao 2 que foi discutida e escolhida (meio-termo
+// entre o scan bruto e um unwinder completo).
+//
+// RSP de kernel: leitura direta (enderecos de kernel sao mapeados
+// identicos em qualquer CR3, e o proprio RSP ja esta residente por
+// definicao -- a CPU estava usando-o AGORA). RSP de usermode: cada slot e
+// traduzido individualmente via ShvTranslateGvaWithCr3, usando o Cr3 do
+// proprio evento (GUEST_CR3 -- o CR3 da thread que causou o evento, ou seja
+// exatamente a pilha que queremos andar).
+//
+static VOID
+ShvCaptureStackHeuristic (
+    _In_ UINT64 Cr3,
+    _In_ UINT64 GuestRsp,
+    _Out_writes_(SHV_EVENT_STACK_FRAMES) UINT64* OutFrames
+    )
+{
+    UINT32 i;
+    UINT32 found = 0;
+    UINT8  isKernel;
+
+    for (i = 0; i < SHV_EVENT_STACK_FRAMES; i++)
+        OutFrames[i] = 0;
+
+    if ((GuestRsp & 0x7) != 0)
+        return;
+
+    isKernel = (GuestRsp >= SHV_KERNEL_VA_MIN) ? 1 : 0;
+
+    if (!isKernel)
+        _InterlockedIncrement64((LONG64*)&ShvStackWalkAttempts);
+
+    for (i = 0; i < SHV_STACK_SCAN_WINDOW && found < SHV_EVENT_STACK_FRAMES; i++)
+    {
+        UINT64 slotGva = GuestRsp + (UINT64)i * 8;
+        UINT64 value;
+
+        if (isKernel)
+        {
+            if (!ShvOsIsAddressValid((VOID*)slotGva))
+                break; // saiu da regiao residente da pilha
+            value = *(volatile UINT64*)slotGva;
+        }
+        else
+        {
+            // slotGva e sempre 8-byte alinhado aqui, entao nunca cruza uma
+            // fronteira de pagina de 4KB sozinho -- 1 traducao por slot basta.
+            if (!ShvReadGvaWithCr3(Cr3, slotGva, &value))
+                break;
+        }
+
+        if (isKernel)
+        {
+            if (value < SHV_KERNEL_VA_MIN || (value & 0x1) != 0)
+                continue; // nao parece um VA de kernel/instrucao valido
+        }
+        else
+        {
+            // Teto real de um VA canonico de usermode (bits 47-63 devem ser
+            // zero) -- nao so "< SHV_KERNEL_VA_MIN", que deixava passar lixo
+            // nao-canonico (ex.: 0xCCCCCCCCCCCCCCCC, padrao classico de
+            // memoria de pilha nao inicializada em build debug).
+            if (value < 0x10000ULL || value >= 0x0000800000000000ULL || (value & 0x1) != 0)
+                continue; // nao parece um VA de usermode/instrucao valido
+        }
+
+        if ((!isKernel && ShvStackWalkDebugNoFilter) || ShvLooksLikeCallSite(Cr3, value))
+            OutFrames[found++] = value;
+        else if (!isKernel)
+            _InterlockedIncrement64((LONG64*)&ShvStackWalkCallSiteReject);
+    }
+}
+
 static SHV_HV_EVENT ShvEventBuffer[SHV_EVENT_RING_SIZE];
 volatile UINT64     ShvEventCount = 0; // total de eventos escritos (nunca decrementa)
 
@@ -186,6 +540,7 @@ ShvHvPushEvent (
     ev->Cr3        = ShvVmxRead(GUEST_CR3);
     ev->Timestamp  = ShvReadSystemTime();
     ev->LinearAddr = LinearAddr;
+    ShvCaptureStackHeuristic(ev->Cr3, ShvVmxRead(GUEST_RSP), ev->Stack);
     _mm_sfence();
     ev->SeqNum     = (UINT32)(idx + 1);
 }
@@ -823,6 +1178,23 @@ ShvVmxHandleCpuid (
             la.QuadPart          = ev->LinearAddr;
             VpState->VpRegs->Rax = la.LowPart;
             VpState->VpRegs->Rbx = la.HighPart;
+        }
+        else if (subleaf >= SHV_QUERY_EVENT_EXT5_BASE &&
+                 subleaf <  SHV_QUERY_EVENT_EXT12_BASE + SHV_EVENT_RING_SIZE)
+        {
+            // Stack trace heuristico: EXT5..EXT12, 2 frames por sub-leaf.
+            // EAX/EBX = Stack[2*N], ECX/EDX = Stack[2*N+1]
+            LARGE_INTEGER f0, f1;
+            UINT32 group = (subleaf - SHV_QUERY_EVENT_EXT5_BASE) / SHV_EVENT_RING_SIZE;
+            UINT32 slot  = (subleaf - SHV_QUERY_EVENT_EXT5_BASE) % SHV_EVENT_RING_SIZE;
+
+            ev = &ShvEventBuffer[slot];
+            f0.QuadPart = ev->Stack[group * 2];
+            f1.QuadPart = ev->Stack[group * 2 + 1];
+            VpState->VpRegs->Rax = f0.LowPart;
+            VpState->VpRegs->Rbx = f0.HighPart;
+            VpState->VpRegs->Rcx = f1.LowPart;
+            VpState->VpRegs->Rdx = f1.HighPart;
         }
 
         return;

@@ -203,11 +203,28 @@ void RenderTabMemory(ShvBackend& backend)
     {
         ImGui::Spacing();
         {
+            static int  s_useVa        = 1;
+            static char s_vaStr[32]    = "";
+            static char s_pidStr[16]   = "0";
             static char s_gpaStr[32]   = "";
             static char s_offStr[16]   = "0";
             static char s_bytesStr[80] = "";
+            static char s_lastMsg[160] = "";
+            static bool s_lastOk       = true;
 
-            ImGui::SetNextItemWidth(200); ImGui::InputText("GPA (hex)##sh", s_gpaStr, sizeof(s_gpaStr));
+            ImGui::RadioButton("Por VA+PID##sh", &s_useVa, 1);  ImGui::SameLine();
+            ImGui::RadioButton("Por GPA direta##sh", &s_useVa, 0);
+
+            if (s_useVa)
+            {
+                ImGui::SetNextItemWidth(200); ImGui::InputText("VA (hex)##sh", s_vaStr, sizeof(s_vaStr));
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(90);  ImGui::InputText("PID##sh", s_pidStr, sizeof(s_pidStr));
+            }
+            else
+            {
+                ImGui::SetNextItemWidth(200); ImGui::InputText("GPA (hex)##sh", s_gpaStr, sizeof(s_gpaStr));
+            }
             ImGui::SameLine();
             ImGui::SetNextItemWidth(80);  ImGui::InputText("Offset##sh", s_offStr, sizeof(s_offStr));
             ImGui::SetNextItemWidth(360);
@@ -216,21 +233,78 @@ void RenderTabMemory(ShvBackend& backend)
             ImGui::SameLine();
             if (ImGui::Button("Aplicar##sh"))
             {
-                uint64_t gpa    = strtoull(s_gpaStr,  nullptr, 16);
                 uint32_t offset = (uint32_t)strtoul(s_offStr, nullptr, 16);
                 uint8_t  bytes[SHV_SHADOW_PATCH_MAX];
                 int      len = HexStringToBytes(s_bytesStr, bytes, SHV_SHADOW_PATCH_MAX);
-                if (len > 0) backend.ShadowPatch(gpa, offset, bytes, (uint32_t)len);
+
+                if (len <= 0)
+                {
+                    s_lastOk = false;
+                    snprintf(s_lastMsg, sizeof(s_lastMsg), "Bytes invalidos");
+                }
+                else if (s_useVa)
+                {
+                    uint64_t va  = strtoull(s_vaStr,  nullptr, 16);
+                    uint64_t pid = strtoull(s_pidStr, nullptr, 10);
+                    uint64_t gpa = 0;
+                    auto tr = backend.TranslateVa(va, pid, &gpa);
+                    if (!tr.ok || gpa == 0)
+                    {
+                        s_lastOk = false;
+                        snprintf(s_lastMsg, sizeof(s_lastMsg),
+                                 "TranslateVa falhou: %s", ShvClient::StatusString(tr.status));
+                    }
+                    else
+                    {
+                        // CR3 (DirBase) do processo dono da VA, so pra exibicao
+                        // na aba Filtros->Hook Shadow -- pid=0 (kernel) fica 0.
+                        uint64_t cr3 = 0;
+                        if (pid != 0)
+                        {
+                            backend.Lock();
+                            for (const auto& p : backend.State().procs)
+                                if (p.Pid == pid) { cr3 = p.DirBase; break; }
+                            backend.Unlock();
+                        }
+                        auto r = backend.ShadowPatch(gpa, offset, bytes, (uint32_t)len, va, cr3);
+                        s_lastOk = r.ok;
+                        if (r.ok)
+                            snprintf(s_lastMsg, sizeof(s_lastMsg), "OK: VA 0x%llX -> GPA 0x%llX", va, gpa);
+                        else
+                            snprintf(s_lastMsg, sizeof(s_lastMsg), "ShadowPatch falhou: %s", ShvClient::StatusString(r.status));
+                    }
+                }
+                else
+                {
+                    uint64_t gpa = strtoull(s_gpaStr, nullptr, 16);
+                    auto r = backend.ShadowPatch(gpa, offset, bytes, (uint32_t)len);
+                    s_lastOk = r.ok;
+                    snprintf(s_lastMsg, sizeof(s_lastMsg),
+                             r.ok ? "OK" : "ShadowPatch falhou: %s", ShvClient::StatusString(r.status));
+                }
             }
             ImGui::SameLine();
             if (ImGui::Button("Remover##sh"))
-                backend.Unshadow(strtoull(s_gpaStr, nullptr, 16));
+            {
+                uint64_t gpa = s_useVa ? 0 : strtoull(s_gpaStr, nullptr, 16);
+                if (gpa != 0) backend.Unshadow(gpa);
+            }
             ImGui::SameLine();
             if (ImGui::Button("Beep Shadow Setup"))
             {
                 uint64_t gpa = 0;
                 backend.BeepShadowSetup(&gpa);
             }
+
+            if (s_lastMsg[0])
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, s_lastOk ? kColorOk : kColorErr);
+                ImGui::TextUnformatted(s_lastMsg);
+                ImGui::PopStyleColor();
+            }
+
+            ImGui::TextDisabled("Remocao por GPA: a lista em Filtros->Hook Shadow "
+                                 "tem um botao de remover por linha selecionada.");
         }
         ImGui::EndTabItem();
     }

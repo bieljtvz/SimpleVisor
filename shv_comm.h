@@ -51,6 +51,29 @@ Abstract:
                                         // ECX=EXT4_BASE+slot -> EAX=LinearAddr.Low, EBX=LinearAddr.High
                                         // GUEST_LINEAR_ADDRESS (VA do acesso que causou a
                                         // violacao de EPT); 0 para eventos LSTAR (nao aplicavel)
+//
+// EXT5-EXT12: stack trace heuristico (SHV_EVENT_STACK_FRAMES entradas, 2 por
+// sub-leaf -- cada CPUID devolve 4 registradores de 32 bits = 2 UINT64):
+//   EXT5+slot  -> EAX/EBX=stack[0],  ECX/EDX=stack[1]
+//   EXT6+slot  -> EAX/EBX=stack[2],  ECX/EDX=stack[3]
+//   EXT7+slot  -> EAX/EBX=stack[4],  ECX/EDX=stack[5]
+//   EXT8+slot  -> EAX/EBX=stack[6],  ECX/EDX=stack[7]
+//   EXT9+slot  -> EAX/EBX=stack[8],  ECX/EDX=stack[9]
+//   EXT10+slot -> EAX/EBX=stack[10], ECX/EDX=stack[11]
+//   EXT11+slot -> EAX/EBX=stack[12], ECX/EDX=stack[13]
+//   EXT12+slot -> EAX/EBX=stack[14], ECX/EDX=stack[15]
+// Ver ShvCaptureStackHeuristic em shvvmxhv.c pra como esses valores sao
+// obtidos (scan heuristico da pilha, nao um unwind estruturado de verdade).
+//
+#define SHV_QUERY_EVENT_EXT5_BASE   (SHV_QUERY_EVENT_BASE + 5 * SHV_EVENT_RING_SIZE)
+#define SHV_QUERY_EVENT_EXT6_BASE   (SHV_QUERY_EVENT_BASE + 6 * SHV_EVENT_RING_SIZE)
+#define SHV_QUERY_EVENT_EXT7_BASE   (SHV_QUERY_EVENT_BASE + 7 * SHV_EVENT_RING_SIZE)
+#define SHV_QUERY_EVENT_EXT8_BASE   (SHV_QUERY_EVENT_BASE + 8 * SHV_EVENT_RING_SIZE)
+#define SHV_QUERY_EVENT_EXT9_BASE   (SHV_QUERY_EVENT_BASE + 9 * SHV_EVENT_RING_SIZE)
+#define SHV_QUERY_EVENT_EXT10_BASE  (SHV_QUERY_EVENT_BASE + 10 * SHV_EVENT_RING_SIZE)
+#define SHV_QUERY_EVENT_EXT11_BASE  (SHV_QUERY_EVENT_BASE + 11 * SHV_EVENT_RING_SIZE)
+#define SHV_QUERY_EVENT_EXT12_BASE  (SHV_QUERY_EVENT_BASE + 12 * SHV_EVENT_RING_SIZE)
+#define SHV_EVENT_STACK_FRAMES      16
 
 //
 // Tipos de evento armazenados no ring buffer.

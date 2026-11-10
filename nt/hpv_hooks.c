@@ -368,6 +368,15 @@ HpvHookFuncByVa (
     shadowPage = (UINT8*)g_ShadowPages[slot].ShadowVa;
     HpvWriteJmp12(shadowPage + offset, (UINT64)(ULONG_PTR)HookFunc);
 
+    // Grava offset/tamanho/bytes do patch nesse slot -- sem isso,
+    // SHV_CMD_LIST_SHADOW_PATCHES (usado pela GUI em Filtros->Hook Shadow)
+    // sempre devolvia Offset=0/PatchLen=0/PatchBytes vazio pra hooks
+    // instalados por este caminho (so o manual via SHV_CMD_HOOK_SHADOW
+    // preenchia esses campos) -- a GPA aparecia, o resto nao.
+    g_ShadowPages[slot].Offset   = offset;
+    g_ShadowPages[slot].PatchLen = 12;
+    RtlCopyMemory(g_ShadowPages[slot].PatchBytes, shadowPage + offset, 12);
+
     // Register EPT shadow hook (installs on next VM-exit on each CPU)
     if (newShadow)
     {
