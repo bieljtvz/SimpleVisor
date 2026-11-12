@@ -115,6 +115,7 @@ void ShvBackend::PollOnce()
         s.lstarReads  = ShvClient::QueryCounter(SHV_QUERY_LSTAR_READS);
         s.lstarWrites = ShvClient::QueryCounter(SHV_QUERY_LSTAR_WRITES);
         s.lastLstar   = ShvClient::QueryCounter(SHV_QUERY_LAST_LSTAR);
+        s.copyVmHits  = ShvClient::QueryCounter(SHV_QUERY_COPYVM_HITS);
 
         int r[4];
         __cpuidex(r, SHV_CPUID_LEAF, SHV_QUERY_EPT_CAPS);

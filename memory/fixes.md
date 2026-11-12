@@ -4,6 +4,109 @@ Histórico de bugs resolvidos: o que quebrava, a causa raiz e a correção aplic
 
 ---
 
+## 2026-11-12 — EPT Hook: VA exibido na GUI sempre virava o início da página
+
+**Symptom:** usuário instalou um EPT hook em `0x40009` (dentro da página `0x40000`); a coluna
+VA em Filtros/Status mostrava `0x40000` em vez de `0x40009`. Suspeita inicial (confirmada como
+NÃO ser bug): múltiplos eventos de leitura em endereços consecutivos (`0x40000..0x40003`) para
+um único acesso de DWORD — na verdade causado pela ferramenta de teste (CE) fazendo leituras
+byte a byte separadas, não um bug do hypervisor (EPT já loga o `GUEST_LINEAR_ADDRESS` exato por
+violação, coluna "VA Fault").
+
+**Root cause (bug real, 2 partes):**
+1. `nt/shvos.c` (`SHV_CMD_HOOK_EPT`): `vaBase = req.Hook.VirtAddr & ~0xFFF` fazia o IOCTL
+   arredondar o VA para o início da página *antes* de passar pra `ShvHookInstall`, tanto no
+   caminho kernel (loop por `va`) quanto no caminho usermode (loop por `pfnArray[i]`) — o VA
+   exato pedido pelo usuário nunca era armazenado, só o VA da página.
+2. `shvvmxhv.c` (`ShvHookInstall`): quando já existia uma entrada pra mesma página física
+   (ex.: um hook anterior de teste em `0x40000`), o código só fazia `Type |= HookType` e
+   retornava — nunca atualizava `VirtAddr`/`Pid`/`RangeSize` da entrada existente. Então um
+   hook novo na mesma página mantinha o VA/RangeSize do hook antigo.
+
+**Fix:**
+- `nt/shvos.c`: primeira página do range agora guarda `req.Hook.VirtAddr` (VA exato, com
+  offset dentro da página) em vez do VA alinhado; páginas seguintes (quando `RangeSize > 1`)
+  continuam usando o VA de página (não há "VA exato" pra elas).
+- `shvvmxhv.c` (`ShvHookInstall`): a branch de "entrada já existe pra esta página" agora
+  também atualiza `VirtAddr`, `Pid` e `RangeSize`, não só o `Type`.
+- O matching de violação EPT continua por página (`SHV_HOOK_PAGE_IN_RANGE`), que é o
+  comportamento correto/esperado em hardware — só a exibição do VA na GUI estava errada.
+
+Driver recompilado com `MSBuild.exe shv.sln /p:Configuration="Windows NT" /p:Platform=x64`,
+sem erros, `shv.sys` assinado com sucesso.
+
+---
+
+## 2026-11-12 — EPT Hook: filtro por byte exato (não só por página)
+
+**Symptom:** mesmo depois do fix do VA acima, hookar `0x40009` com range pequeno e ler
+`0x40000` (fora do range pedido, mas na mesma página de 4KB) ainda gerava evento/hit.
+Pedido explícito do usuário: `VA=0x40009, Range=1` só deveria contar hit se o acesso real
+fosse exatamente em `0x40009`; `Range=2` só se fosse em `0x40009` ou `0x4000A`; etc.
+
+**Root cause:** EPT só pode restringir permissão por página inteira (4KB) — isso é limite
+de hardware, continua sendo. Mas o código nunca comparava o `GUEST_LINEAR_ADDRESS` exato
+contra o range de bytes pedido antes de contar `HitCount++`/logar o evento — qualquer
+acesso em qualquer lugar da página batia.
+
+**Fix:**
+- `shvvmxhv.c`: campo novo `ByteLen` em `SHV_HOOK_ENTRY` (tamanho exato em bytes do range
+  pedido, separado de `RangeSize` que agora é só "quantas páginas aplicar permissão EPT").
+  Novo macro `SHV_HOOK_VA_MATCH(entryIdx, va)`: `va` tem que cair em
+  `[VirtAddr, VirtAddr+ByteLen)` (ou `VirtAddr==0` desativa o filtro). Aplicado nos três
+  branches de `ShvVmxHandleEptViolation` (EXEC/WRITE/READ) antes de `HitCount++`/
+  `ShvHvPushEvent` — a página continua sendo liberada/re-armada por 1 instrução
+  normalmente (isso é obrigatório, hardware não tem escolha), só o *log/contagem* do hit
+  é filtrado por byte agora.
+- `ShvHookInstall` ganhou parâmetro `ByteLen` (assinatura atualizada em `shv.h` e
+  `nt/shvos_internal.h`).
+- `nt/shvos.c` (`SHV_CMD_HOOK_EPT`): corrigida a conflação bytes/páginas que causava o bug
+  anterior do VA errado de voltar — agora calcula `pageCountTotal` (páginas realmente
+  cobertas, usado só pra aplicar a permissão EPT) separado de `byteLen` (o valor "Range" da
+  GUI, em bytes, usado só pro filtro de VA exato). Antes o mesmo valor bruto de
+  `req.Hook.RangeSize` era passado tanto como "páginas para abrir EPT" quanto embutido nas
+  entradas da tabela, misturando os dois conceitos.
+
+Driver recompilado (`MSBuild.exe shv.sln /p:Configuration="Windows NT" /p:Platform=x64`),
+sem erros, `shv.sys` assinado com sucesso. Semântica final do campo "Range" na GUI de EPT
+Hook: número de BYTES a partir do VA, não páginas.
+
+---
+
+## 2026-11-12 — EPT Hook/Shadow: leitura às vezes não dispara nenhuma violação
+
+**Symptom:** usuário reportou que, mesmo com hook instalado corretamente, algumas leituras
+de teste não geram evento/hit nenhum — como se o hook simplesmente não existisse pra
+aquele acesso específico (intermitente, não determinístico).
+
+**Root cause:** o EPT é **por CPU** (cada core tem sua própria cópia das tabelas de
+paginação EPT, ver `ShvVmxEptApplyHooks`/comentário "EPT per-CPU" em `shvvmxhv.c`).
+`ShvHookInstall`/`ShvHookInstallShadow`/`ShvHookRemove*` só atualizam a tabela GLOBAL
+(`ShvHookTable[]`) e incrementam `ShvHookVersion` — cada CPU só aplica essa mudança à
+PRÓPRIA cópia do EPT de forma *lazy*, no topo do próximo VM-exit que ele mesmo tomar
+(`if (VpData->EptHookVersion != ShvHookVersion) ShvVmxEptApplyHooks(VpData);` em
+`ShvVmxHandleExit`). Se a thread de teste for escalonada pra um core que não toma NENHUM
+VM-exit entre o IOCTL de instalação e a leitura de teste (comum em cores ociosos/pouco
+usados — não há VM-exits "espontâneos" o suficiente), aquele core continua rodando com o
+EPT antigo (sem o hook) e a leitura passa batida, sem violação, sem log.
+
+Achamos até uma função já existente feita exatamente pra resolver isso —
+`ShvOsForceAllCpuVmExit()` (`nt/shvos.c`, usa `KeGenericCallDpc` pra forçar TODOS os CPUs a
+executarem um CPUID síncrono, o que dispara `ShvVmxHandleExit` em cada um e reaplica a
+tabela de hooks) — mas ela nunca era chamada em lugar nenhum do código.
+
+**Fix:** `nt/shvos.c` agora chama `ShvOsForceAllCpuVmExit()` logo após toda operação que
+muda `ShvHookTable[]`/`g_ShadowPages[]` com sucesso: `SHV_CMD_HOOK_EPT` (os dois ramos,
+kernel e usermode), `SHV_CMD_UNHOOK_EPT` (os dois ramos), `SHV_CMD_HOOK_SHADOW` e
+`SHV_CMD_UNHOOK_SHADOW` (logo depois de `ShvHookRemoveShadow`, reforçando também a
+proteção contra o BSOD 0x139 de shadow page liberada enquanto algum core ainda não
+reaplicou — ver fix "Fix BSOD on driver stop" anterior). Agora o IOCTL só retorna pro
+usermode depois que o hook/unhook já está ativo em 100% dos CPUs, eliminando a janela de
+leitura perdida.
+
+Driver recompilado (`MSBuild.exe shv.sln /p:Configuration="Windows NT" /p:Platform=x64`),
+sem erros, `shv.sys` assinado com sucesso.
+
 ## BSOD 0x139 (KERNEL_SECURITY_CHECK_FAILURE / guard_icall_bugcheck) ao dar `stop` no driver depois de usar o hook de NtOpenProcess (2026-11-09)
 
 **Sintoma:** `sc stop hpv` sozinho (start → stop, sem rodar nada) funcionava sempre. Mas se o `usermode_gui.exe` fosse aberto (mesmo só abrir e fechar uma vez) antes do stop, o `DriverUnload` dava BSOD logo depois do log `[SHV-HOOK] Shadow page liberada: GPA=...`. O motivo de o GUI disparar o bug e o `usermode.exe` de teste não: o Windows Defender (`MsMpEng.exe`) escaneia processos novos chamando `NtOpenProcess`, então abrir o GUI garante que o hook de `NtOpenProcess` seja de fato executado por outra CPU durante a janela de unload; sem isso, o hook quase nunca era exercitado no teste rápido.
@@ -203,5 +306,29 @@ Além disso, a VA nunca é guardada em `g_ShadowPages[]` (só a GPA da página) 
 - `usermode_gui/shv_backend.cpp` (`Refresh`): usa esse `FuncVa` vindo do kernel como fonte primária da coluna VA; só cai pro cache local (`shadowPatches`, só preenchido quando a própria GUI cria o shadow via Memória->Shadow Patch "Por VA+PID") quando o kernel não souber.
 
 Driver e GUI recompilados sem erro; ainda não testado na VM.
+
+**Update 2026-11-10 (feature): shadow hook em `MmCopyVirtualMemory` (nt/hpv_policy_hooks.c).**
+
+`MmCopyVirtualMemory` é a função usada internamente pelo kernel pra copiar memória entre processos (caminho de `NtReadVirtualMemory`/`NtWriteVirtualMemory`, ou seja, `ReadProcessMemory`/`WriteProcessMemory` em usermode, e também usada por drivers que fazem acesso cross-process direto). Não está declarada em `ntifs.h`/`wdm.h` desta WDK, então só foi criado o tipo do trampolim (`PfnMmCopyVirtualMemory`) — a resolução é dinâmica por nome via `HpvHookFuncByName`/`MmGetSystemRoutineAddress`, igual o hook de `NtOpenProcess` já existente, sem precisar de declaração estática importada.
+
+**Implementação:** `HpvCopyVirtualMemoryHook` — pega o PID de `FromProcess`/`ToProcess` via `PsGetProcessId`, reusa os helpers já existentes (`CheckProcess`/`PidProtected`/`PidMonitored`/`ShvHooksIsTrustedName`) pra aplicar a MESMA política do hook de `NtOpenProcess`: loga se qualquer um dos dois lados estiver monitorado, e bloqueia (retorna `STATUS_ACCESS_DENIED`, zera `NumberOfBytesCopied`) se o processo de origem (`FromProcess`) estiver protegido e o chamador não for um nome confiável. `ShvReadVirtualMemoryHookHitCount` (contador que já existia na ABI, mas sempre voltava 0 — "placeholder" deixado de propósito) agora é incrementado de verdade a cada chamada interceptada.
+
+Instalado em `ShvPolicyHooksInit`/removido em `ShvPolicyHooksUninit`, do mesmo jeito que `NtOpenProcess` — mas como falha **não é fatal** (o hook de `NtOpenProcess` continua sendo o crítico; este é bônus de visibilidade). Driver recompilado sem erro; ainda não testado na VM.
+
+**Update 2026-11-10:** log do hook passou a incluir o nome do processo sendo LIDO (`FromProcess`), via `PsGetProcessImageFileName(FromProcess)` (seguro sem `__try` — só lê o campo `ImageFileName` do próprio `EPROCESS`, não toca memória de usuário).
+
+**Update 2026-11-10 (usuário reportou que o hook não aparece no log mesmo com o Cheat Engine marcado como monitorado):** a lógica de monitoramento em si está correta (mesmos helpers `CheckProcess`/`PidMonitored` já usados e validados pelo hook de `NtOpenProcess`) — não encontrei bug nela. Explicação mais provável, registrada aqui porque não é óbvia pelo código: **o Cheat Engine, quando tem o driver kernel dele próprio carregado/habilitado (DBK/DBVM — visível neste projeto pelas ferramentas MCP `read_process_memory_cr3`, `dbk_get_cr3`, etc.), lê memória de outro processo fazendo ELE MESMO o walk de page table via CR3 e lendo a física diretamente — sem nunca passar por `NtReadVirtualMemory`/`MmCopyVirtualMemory`.** Se for esse o caso, não existe hook de função de kernel que capture isso (é exatamente a técnica que projetos como este existem pra estudar/testar). Hooking de EPT nas páginas físicas sendo lidas seria a única forma de ver esse tipo de acesso, não hooking de função.
+
+**Update 2026-11-10:** faltava o nome também na linha de log do caminho BLOQUEADO (`MmCopyVirtualMemory BLOQUEADO: caller=... -> PID=...`) — só a linha do caminho "monitorado" (não bloqueado) tinha o nome do processo lido. Adicionado `fromName` (via `PsGetProcessImageFileName(FromProcess)`) também nessa linha.
+
+**Diagnóstico adicionado pra confirmar a causa:** novo sub-leaf CPUID `SHV_QUERY_COPYVM_HITS=7` (shv_comm.h/shv_client.h) expõe `ShvReadVirtualMemoryHookHitCount` (incrementado pelo hook de `MmCopyVirtualMemory`) sem depender do filtro de monitorado — `shvvmxhv.c` lê esse global NT-side diretamente via `extern` (é só um `UINT64`, sem dependência de WDK). GUI: novo campo `ShvStats.copyVmHits`, exibido em `Status` como "MmCopyVirtualMemory Hits". **Como usar pra diagnosticar:** se esse contador ficar em 0 mesmo fazendo o Cheat Engine ler outro processo normalmente, confirma que a chamada nem está passando por `MmCopyVirtualMemory` (reforça a teoria do driver próprio do CE); se o contador subir mas nenhuma linha aparecer no log, aí sim é bug na lógica de PID/monitorado (não encontrado até agora). Driver e GUI recompilados sem erro; ainda não testado na VM.
+
+**Update 2026-11-12 (usuário reportou: hook EPT com "range de 1 byte" ainda hookeia a página inteira).**
+
+**Resposta curta: isso é esperado e inevitável — EPT (Extended Page Tables) só tem granularidade de página (4KB), nunca de byte.** Uma PTE de EPT cobre a página inteira; não existe jeito de restringir leitura/escrita/execução a um sub-trecho dela no hardware. Qualquer acesso em QUALQUER byte da página hookada dispara a violação — é por isso que a coluna "VA Fault" (`GUEST_LINEAR_ADDRESS`) existe: ela mostra o endereço EXATO do acesso que disparou, pra filtrar depois na GUI quais eventos realmente caem no endereço de interesse, já que o hook em si nunca pode ser mais fino que a página inteira.
+
+**Mas investigando encontrei um bug real e diferente, no campo "Range" (múltiplas páginas), que respondia: `ShvVmxEptApplyHooks`/`ShvVmxEptRearmHook`/`ShvVmxHandleEptViolation` (shvvmxhv.c) sempre compararam `ShvHookTable[i].PhysAddr == page`** (igualdade exata com a PRIMEIRA página do hook) **em vez de verificar se `page` cai dentro do intervalo `[PhysAddr, PhysAddr + RangeSize*0x1000)`.** Resultado: um hook instalado com `RangeSize > 1` (via aba Memória->EPT Hook, campo "Range") só de fato cobria a primeira página — `ShvVmxEptApplyHooks` nunca aplicava a permissão nas páginas seguintes do range, e mesmo que aplicasse, o matching no VM-exit só reconheceria a primeira página mesmo assim. O campo "Range" > 1 era puramente cosmético, sem efeito real.
+
+**Fix:** novo helper `SHV_HOOK_PAGE_IN_RANGE(entryIdx, pg)` (shvvmxhv.c) centraliza o cálculo `pg >= PhysAddr && pg < PhysAddr + max(RangeSize,1)*0x1000`. `ShvVmxEptApplyHooks` agora itera `j = 0..RangeSize-1` aplicando a permissão em `PhysAddr + j*0x1000` pra cada página do range (hooks com shadow page continuam sempre de 1 página só, por construção — shadow é 1 PFN). `ShvVmxEptRearmHook` e os 3 pontos de matching em `ShvVmxHandleEptViolation` (EXEC/WRITE/READ) trocaram a comparação exata pelo novo helper, então agora reconhecem corretamente qualquer página dentro do range, não só a primeira. Driver recompilado sem erro; ainda não testado na VM.
 
 **Melhoria pedida em seguida (não é fix de bug, é feature):** (1) toggle no GUI (aba Eventos → EPT) pra ligar/desligar o filtro de call-site (`ShvLooksLikeCallSite`) sem precisar do WinDbg/`ed` — novo comando IOCTL `SHV_CMD_SET_STACK_FILTER` (shv_dbg.h/shv_client.h), nova função `ShvSetStackFilterEnabled` (shvvmxhv.c, só inverte `ShvStackWalkDebugNoFilter`), novo método `ShvClient::SetStackFilter`/`ShvBackend::SetStackFilter`, e um checkbox "Filtro call-site (stack)" em `tab_events.cpp` (só na sub-aba EPT, via novo parâmetro `showStackFilterToggle` em `RenderEventTable`). (2) `SHV_EVENT_STACK_FRAMES` subiu de 8 para 16 (shv_comm.h/shv_client.h) — adicionadas sub-leaves CPUID `EXT9_BASE`..`EXT12_BASE` (mesmo esquema de 2 frames por sub-leaf dos EXT5-8) pro ring buffer carregar as 8 frames extras; o range-check do handler CPUID em `shvvmxhv.c` (`subleaf >= EXT5_BASE && subleaf < ...`) só precisou do limite superior ajustado pra `EXT12_BASE`, porque o cálculo de `group`/`slot` já era genérico. Lado GUI (`tab_events.cpp`, painel de stack trace) já iterava via `SHV_EVENT_STACK_FRAMES`, então passou a mostrar 16 frames automaticamente sem mudança de código ali. Driver e GUI recompilados sem erro; ainda não testado na VM.

@@ -53,6 +53,7 @@ struct ShvStats {
     uint64_t lastLstar;
     bool     eptExecOnly;
     uint32_t totalEvents;
+    uint64_t copyVmHits;   // total de chamadas interceptadas em MmCopyVirtualMemory
 };
 
 struct ShvEptHookEntry {

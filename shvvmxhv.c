@@ -55,6 +55,11 @@ volatile UINT64 ShvLastLstarValue  = 0;
 volatile UINT64 ShvEptHookPhysical = 0;
 volatile UINT64 ShvEptHookHitCount = 0;
 
+// Definido em nt/hpv_policy_hooks.c (NT-side, PASSIVE_LEVEL) -- so um UINT64,
+// sem dependencia de WDK, pode ser lido direto daqui pra expor via CPUID
+// (SHV_QUERY_COPYVM_HITS).
+extern volatile UINT64 ShvReadVirtualMemoryHookHitCount;
+
 //
 // Tabela de hooks EPT instalados pelo usermode via IOCTL.
 // A versao (ShvHookVersion) e incrementada a cada install/remove.
@@ -69,13 +74,45 @@ typedef struct _SHV_HOOK_ENTRY
     UINT64 ShadowPhysAddr; // PA da shadow page; 0 = hook EPT normal
     UINT8  Type;           // SHV_HOOK_EXEC | SHV_HOOK_WRITE (para hooks normais)
     UINT64 HitCount;
-    UINT64 VirtAddr;       // VA original do hook (para exibicao na GUI)
+    UINT64 VirtAddr;       // VA exato pedido pelo usuario (inicio do range de bytes)
     UINT64 Pid;            // PID do processo alvo (0 = kernel)
-    UINT64 RangeSize;      // numero de paginas hookadas neste bloco
+    UINT64 RangeSize;      // numero de PAGINAS hookadas neste bloco (p/ EPT, sempre >=1)
+    UINT64 ByteLen;        // tamanho EXATO em bytes do range pedido (p/ filtro de VA
+                           // na violacao -- EPT so pode restringir por pagina, mas o
+                           // handler usa isto + VirtAddr pra so logar/contar hit quando
+                           // GUEST_LINEAR_ADDRESS cai dentro de [VirtAddr, VirtAddr+ByteLen))
 } SHV_HOOK_ENTRY;
 
 static SHV_HOOK_ENTRY ShvHookTable[SHV_HOOK_MAX_ENTRIES];
 volatile UINT64       ShvHookVersion = 0;
+
+//
+// Verifica se uma pagina (ja alinhada a 4KB) cai dentro do range de um hook
+// de multiplas paginas. RangeSize==0 e tratado como 1 pagina (mesma
+// convencao ja usada em ShvHookInstall/ShvListEptHooks). SEM esse cheque,
+// ShvVmxEptApplyHooks/ShvVmxEptRearmHook/ShvVmxHandleEptViolation so
+// enxergavam a PRIMEIRA pagina do range (comparacao exata PhysAddr==page) --
+// um hook instalado com RangeSize>1 nunca de fato cobria as paginas depois
+// da primeira, e o "Range" exibido na GUI ficava so cosmetico, sem efeito.
+//
+#define SHV_HOOK_PAGE_IN_RANGE(entryIdx, pg) \
+    ((pg) >= ShvHookTable[entryIdx].PhysAddr && \
+     (pg) < ShvHookTable[entryIdx].PhysAddr + \
+            (ShvHookTable[entryIdx].RangeSize ? ShvHookTable[entryIdx].RangeSize : 1) * 0x1000ULL)
+
+//
+// Filtro fino por VA exato: a violacao de EPT sempre dispara pra pagina
+// inteira (limitacao de hardware -- ver SHV_HOOK_PAGE_IN_RANGE acima), mas
+// o usuario pode pedir um range de bytes bem menor (ex.: VA=0x40009,
+// RangeSize(bytes)=1 -> so deve "contar hit"/logar evento quando o acesso
+// real for exatamente em 0x40009, nao em qualquer lugar da pagina 0x40000).
+// VirtAddr==0 (hook sem VA conhecido) desativa o filtro, sempre casa.
+//
+#define SHV_HOOK_VA_MATCH(entryIdx, va) \
+    (ShvHookTable[entryIdx].VirtAddr == 0 || \
+     ((va) >= ShvHookTable[entryIdx].VirtAddr && \
+      (va) <  ShvHookTable[entryIdx].VirtAddr + \
+              (ShvHookTable[entryIdx].ByteLen ? ShvHookTable[entryIdx].ByteLen : 1)))
 
 UINT8 ShvEptExecuteOnlySupported = 0;
 
@@ -556,7 +593,8 @@ ShvHookInstall (
     _In_ UINT8  HookType,
     _In_ UINT64 VirtAddr,
     _In_ UINT64 Pid,
-    _In_ UINT64 RangeSize
+    _In_ UINT64 RangeSize,
+    _In_ UINT64 ByteLen
     )
 {
     UINT32 i;
@@ -567,7 +605,11 @@ ShvHookInstall (
     {
         if (ShvHookTable[i].PhysAddr == page)
         {
-            ShvHookTable[i].Type |= HookType;
+            ShvHookTable[i].Type     |= HookType;
+            ShvHookTable[i].VirtAddr  = VirtAddr;
+            ShvHookTable[i].Pid       = Pid;
+            ShvHookTable[i].RangeSize = RangeSize ? RangeSize : 1;
+            ShvHookTable[i].ByteLen   = ByteLen ? ByteLen : 1;
             _InterlockedIncrement64((LONG64*)&ShvHookVersion);
             return SHVD_STATUS_OK;
         }
@@ -584,6 +626,7 @@ ShvHookInstall (
             ShvHookTable[i].VirtAddr  = VirtAddr;
             ShvHookTable[i].Pid       = Pid;
             ShvHookTable[i].RangeSize = RangeSize ? RangeSize : 1;
+            ShvHookTable[i].ByteLen   = ByteLen ? ByteLen : 1;
             _InterlockedIncrement64((LONG64*)&ShvHookVersion);
             return SHVD_STATUS_OK;
         }
@@ -841,7 +884,9 @@ ShvVmxEptApplyHooks (
 
     for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
     {
-        UINT64 pa;
+        UINT64 basePa;
+        UINT64 rangePages;
+        UINT64 j;
         UINT8  type;
         UINT8  r, w, x;
 
@@ -850,44 +895,53 @@ ShvVmxEptApplyHooks (
             continue;
         }
 
-        pa   = ShvHookTable[i].PhysAddr;
-        type = ShvHookTable[i].Type;
+        basePa     = ShvHookTable[i].PhysAddr;
+        type       = ShvHookTable[i].Type;
+        // Hooks com shadow page nunca sao de multiplas paginas (shadow e
+        // sempre 1 PFN so) -- so o hook normal itera o range inteiro.
+        rangePages = (ShvHookTable[i].ShadowPhysAddr != 0) ? 1
+                   : (ShvHookTable[i].RangeSize ? ShvHookTable[i].RangeSize : 1);
 
-        // Garante que a pagina grande foi dividida em 4KB PTEs
-        ShvVmxEptSplitLargePage(VpData, pa);
+        for (j = 0; j < rangePages; j++)
+        {
+            UINT64 pa = basePa + j * 0x1000ULL;
 
-        if (ShvHookTable[i].ShadowPhysAddr != 0)
-        {
-            // Shadow hook: EPT PTE aponta para shadow page, execute-only.
-            // Leituras/escritas na GPA original causam violacao e servimos
-            // a pagina original por 1 instrucao via MTF.
-            ShvVmxEptSetPhysAndPerms(VpData, pa, ShvHookTable[i].ShadowPhysAddr,
-                                     0, 0, 1);
-        }
-        else
-        {
-            // Hook normal (ou entrada de shadow hook ja removido, restaurando
-            // identidade -- ver ShvHookRemoveShadow em shvvmxhv.c).
-            //
-            // NAO usar ShvVmxEptSetPermissions aqui: ela so altera os bits
-            // Read/Write/Execute da PTE, sem tocar no PageFrameNumber. Se esta
-            // entrada ERA um shadow hook (ShadowPhysAddr acabou de ser zerado
-            // por ShvHookRemoveShadow), a PTE ainda aponta para o PFN da shadow
-            // page -- usar SetPermissions deixaria a PTE com r=1,w=1,x=1
-            // (totalmente acessivel) MAS ainda apontando para a shadow page.
-            // Isso e exatamente o que causava o BSOD: ao liberar a shadow page
-            // (MmFreeContiguousMemory), a PTE continuava "viva" referenciando
-            // aquela memoria, que podia ser reaproveitada e executada por outro
-            // CPU -> bugcheck 0x139 (confirmado via WinDbg: "u" na GPA ainda
-            // mostrava o patch da shadow page mesmo apos "Shadow page liberada").
-            //
-            // ShvVmxEptSetPhysAndPerms(VpData, pa, pa, ...) forca o PFN de
-            // volta para a PA ORIGINAL (identidade) -- seguro tambem para hooks
-            // normais (nao-shadow), que sempre usam GPA==PA.
-            r = (type & SHV_HOOK_READ)  ? 0 : 1;
-            w = ((type & SHV_HOOK_WRITE) || (r == 0)) ? 0 : 1;
-            x = (type & SHV_HOOK_EXEC)  ? 0 : 1;
-            ShvVmxEptSetPhysAndPerms(VpData, pa, pa, r, w, x);
+            // Garante que a pagina grande foi dividida em 4KB PTEs
+            ShvVmxEptSplitLargePage(VpData, pa);
+
+            if (ShvHookTable[i].ShadowPhysAddr != 0)
+            {
+                // Shadow hook: EPT PTE aponta para shadow page, execute-only.
+                // Leituras/escritas na GPA original causam violacao e servimos
+                // a pagina original por 1 instrucao via MTF.
+                ShvVmxEptSetPhysAndPerms(VpData, pa, ShvHookTable[i].ShadowPhysAddr,
+                                         0, 0, 1);
+            }
+            else
+            {
+                // Hook normal (ou entrada de shadow hook ja removido, restaurando
+                // identidade -- ver ShvHookRemoveShadow em shvvmxhv.c).
+                //
+                // NAO usar ShvVmxEptSetPermissions aqui: ela so altera os bits
+                // Read/Write/Execute da PTE, sem tocar no PageFrameNumber. Se esta
+                // entrada ERA um shadow hook (ShadowPhysAddr acabou de ser zerado
+                // por ShvHookRemoveShadow), a PTE ainda aponta para o PFN da shadow
+                // page -- usar SetPermissions deixaria a PTE com r=1,w=1,x=1
+                // (totalmente acessivel) MAS ainda apontando para a shadow page.
+                // Isso e exatamente o que causava o BSOD: ao liberar a shadow page
+                // (MmFreeContiguousMemory), a PTE continuava "viva" referenciando
+                // aquela memoria, que podia ser reaproveitada e executada por outro
+                // CPU -> bugcheck 0x139 (confirmado via WinDbg: "u" na GPA ainda
+                // mostrava o patch da shadow page mesmo apos "Shadow page liberada").
+                //
+                // ShvVmxEptSetPhysAndPerms(VpData, pa, pa, ...) forca o PFN de
+                // volta para a PA ORIGINAL (identidade) -- seguro tambem para hooks
+                // normais (nao-shadow), que sempre usam GPA==PA.
+                r = (type & SHV_HOOK_READ)  ? 0 : 1;
+                w = ((type & SHV_HOOK_WRITE) || (r == 0)) ? 0 : 1;
+                x = (type & SHV_HOOK_EXEC)  ? 0 : 1;
+                ShvVmxEptSetPhysAndPerms(VpData, pa, pa, r, w, x);
+            }
         }
     }
 
@@ -915,6 +969,8 @@ ShvVmxEptRearmHook (
         if (ShvHookTable[i].PhysAddr == page &&
             ShvHookTable[i].ShadowPhysAddr != 0)
         {
+            // Shadow hooks nunca sao multi-pagina (ver ShvVmxEptApplyHooks) --
+            // comparacao exata continua certa aqui, nao precisa de range-check.
             ShvVmxEptSetPhysAndPerms(VpData, page, ShvHookTable[i].ShadowPhysAddr,
                                      0, 0, 1);
             ShvVmxInveptLocal(VpData);
@@ -928,11 +984,14 @@ ShvVmxEptRearmHook (
         x = 0;
     }
 
-    // Tabela de hooks do usermode (EPT normal)
+    // Tabela de hooks do usermode (EPT normal) -- range-check (nao so a
+    // primeira pagina), pra re-armar corretamente qualquer pagina de um hook
+    // de multiplas paginas (RangeSize > 1).
     for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
     {
-        if (ShvHookTable[i].PhysAddr == page &&
-            ShvHookTable[i].ShadowPhysAddr == 0)
+        if (ShvHookTable[i].PhysAddr != 0 &&
+            ShvHookTable[i].ShadowPhysAddr == 0 &&
+            SHV_HOOK_PAGE_IN_RANGE(i, page))
         {
             if (ShvHookTable[i].Type & SHV_HOOK_EXEC)  x = 0;
             if (ShvHookTable[i].Type & SHV_HOOK_WRITE) w = 0;
@@ -1131,6 +1190,16 @@ ShvVmxHandleCpuid (
         {
             // EAX bit0 = execute-only EPT suportado pelo hardware
             VpState->VpRegs->Rax = ShvEptExecuteOnlySupported & 1u;
+        }
+        else if (subleaf == SHV_QUERY_COPYVM_HITS)
+        {
+            // ShvReadVirtualMemoryHookHitCount e um global NT-side comum
+            // (nt/hpv_policy_hooks.c, atualizado em PASSIVE_LEVEL pelo hook de
+            // MmCopyVirtualMemory) -- shvvmxhv.c so declara o extern e le o
+            // valor, sem depender de nenhum header WDK (e so um UINT64).
+            counter.QuadPart     = ShvReadVirtualMemoryHookHitCount;
+            VpState->VpRegs->Rax = counter.LowPart;
+            VpState->VpRegs->Rbx = counter.HighPart;
         }
         else if (subleaf >= SHV_QUERY_EVENT_EXT_BASE &&
                  subleaf <  SHV_QUERY_EVENT_EXT_BASE + SHV_EVENT_RING_SIZE)
@@ -1426,7 +1495,9 @@ ShvVmxHandleEptViolation (
 
         for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
         {
-            if ((ShvHookTable[i].PhysAddr == page) &&
+            if ((ShvHookTable[i].PhysAddr != 0) &&
+                SHV_HOOK_PAGE_IN_RANGE(i, page) &&
+                SHV_HOOK_VA_MATCH(i, linearAddr) &&
                 (ShvHookTable[i].Type & SHV_HOOK_EXEC))
             {
                 ShvHookTable[i].HitCount++;
@@ -1451,7 +1522,11 @@ ShvVmxHandleEptViolation (
 
         for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
         {
-            if (ShvHookTable[i].PhysAddr != page || ShvHookTable[i].ShadowPhysAddr != 0)
+            if (ShvHookTable[i].PhysAddr == 0 || ShvHookTable[i].ShadowPhysAddr != 0)
+                continue;
+            if (!SHV_HOOK_PAGE_IN_RANGE(i, page))
+                continue;
+            if (!SHV_HOOK_VA_MATCH(i, linearAddr))
                 continue;
             if (ShvHookTable[i].Type & SHV_HOOK_WRITE)
             {
@@ -1474,8 +1549,10 @@ ShvVmxHandleEptViolation (
 
         for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
         {
-            if ((ShvHookTable[i].PhysAddr == page) &&
+            if ((ShvHookTable[i].PhysAddr != 0) &&
                 (ShvHookTable[i].ShadowPhysAddr == 0) &&
+                SHV_HOOK_PAGE_IN_RANGE(i, page) &&
+                SHV_HOOK_VA_MATCH(i, linearAddr) &&
                 (ShvHookTable[i].Type & SHV_HOOK_READ))
             {
                 ShvHookTable[i].HitCount++;

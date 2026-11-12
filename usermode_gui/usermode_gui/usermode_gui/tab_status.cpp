@@ -86,6 +86,7 @@ void RenderTabStatus(ShvBackend& backend)
         LabelValue("LSTAR Writes",    "%llu",        st.stats.lstarWrites);
         LabelValue("LSTAR Atual",     "0x%016llX",   st.stats.lastLstar);
         LabelValue("Eventos (total)", "%u",           st.stats.totalEvents);
+        LabelValue("MmCopyVirtualMemory Hits", "%llu", st.stats.copyVmHits);
 
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);

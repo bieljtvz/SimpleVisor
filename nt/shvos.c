@@ -291,6 +291,15 @@ ShvDispatchIoctl (
         regionBytes = (ULONG)(vaEnd - vaBase);
         if (regionBytes == 0) regionBytes = PAGE_SIZE;
 
+        // RangeSize (campo "Range" da GUI) e em BYTES -- so afeta quantas paginas
+        // precisam ser EPT-hookadas (pageCountTotal); o filtro fino por VA exato
+        // (ByteLen, abaixo) e quem decide se um acesso dentro da(s) pagina(s)
+        // hookada(s) realmente conta como hit.
+        {
+        UINT64 pageCountTotal = (vaEnd - vaBase) / PAGE_SIZE;
+        UINT64 byteLen        = req.Hook.RangeSize ? req.Hook.RangeSize : 1;
+        if (pageCountTotal == 0) pageCountTotal = 1;
+
         if (req.Hook.Pid == 0)
         {
             // Kernel: paginas nao-paginadas; itera direto por VA
@@ -302,8 +311,12 @@ ShvDispatchIoctl (
                 __except (EXCEPTION_EXECUTE_HANDLER) { pa.QuadPart = 0; }
                 if ((pa.QuadPart & ~0xFFFULL) != 0)
                 {
+                    // Primeira pagina guarda o VA exato pedido (com o offset dentro
+                    // da pagina), nao o VA arredondado para o inicio da pagina --
+                    // so pra exibicao na GUI, o match de EPT continua sendo por pagina.
+                    UINT64 displayVa = (va == vaBase) ? req.Hook.VirtAddr : va;
                     ShvHookInstall(pa.QuadPart & ~0xFFFULL, req.Hook.HookType,
-                                   va, 0, req.Hook.RangeSize ? req.Hook.RangeSize : 1);
+                                   displayVa, 0, pageCountTotal, byteLen);
                     hooked++;
                 }
             }
@@ -365,11 +378,16 @@ ShvDispatchIoctl (
                 UINT64 gpa = (UINT64)pfnArray[i] << PAGE_SHIFT;
                 if (gpa != 0)
                 {
+                    // Primeira pagina guarda o VA exato pedido (com offset), nao o
+                    // VA arredondado para o inicio da pagina -- so pra exibicao.
+                    UINT64 displayVa = (i == 0) ? req.Hook.VirtAddr
+                                                 : vaBase + (UINT64)i * PAGE_SIZE;
                     if (i == 0) firstPa = gpa;
                     ShvHookInstall(gpa, req.Hook.HookType,
-                                   vaBase + (UINT64)i * PAGE_SIZE,
+                                   displayVa,
                                    req.Hook.Pid,
-                                   req.Hook.RangeSize ? req.Hook.RangeSize : 1);
+                                   pageCountTotal,
+                                   byteLen);
                     hooked++;
                 }
             }
@@ -387,6 +405,19 @@ ShvDispatchIoctl (
             ShvLog("[SHV-IOCTL] HOOK_EPT PID=%llu VA=%016llX-%016llX pages=%u locked\n",
                    req.Hook.Pid, vaBase, vaEnd, hooked);
         }
+        }
+
+        // ShvHookInstall so atualiza a tabela global (ShvHookVersion++); cada CPU
+        // so aplica a mudanca ao PROPRIO EPT de forma lazy, no topo do proximo
+        // VM-exit que ele tomar (ver ShvVmxHandleExit). Se o core que vai fazer a
+        // leitura de teste ficar sem tomar nenhum VM-exit entre o install e a
+        // leitura (comum em cores ociosos/pouco usados), ele ainda esta rodando
+        // com o EPT antigo (sem o hook) e a leitura passa batido, sem violation.
+        // Forca TODOS os CPUs a tomar um VM-exit (CPUID) agora, sincronamente,
+        // pra garantir que o hook ja esta ativo em todo mundo antes do IOCTL
+        // retornar pro usermode.
+        if (hooked) ShvOsForceAllCpuVmExit();
+
         break;
     }
 
@@ -416,6 +447,7 @@ ShvDispatchIoctl (
                 break;
             }
             resp->Status = ShvHookRemove(pa.QuadPart & ~0xFFFULL);
+            ShvOsForceAllCpuVmExit();
         }
         else
         {
@@ -463,6 +495,7 @@ ShvDispatchIoctl (
                 ShvHookRemove(pa.QuadPart & ~0xFFFULL);
             }
             resp->Status = SHVD_STATUS_OK;
+            ShvOsForceAllCpuVmExit();
         }
         break;
     }
@@ -953,6 +986,10 @@ ShvDispatchIoctl (
             MmFreeContiguousMemory(shadowVa);
             RtlZeroMemory(&g_ShadowPages[freeSlot], sizeof(SHV_SHADOW_PAGE_RECORD));
         }
+        else
+        {
+            ShvOsForceAllCpuVmExit();
+        }
         break;
     }
 
@@ -972,6 +1009,7 @@ ShvDispatchIoctl (
                 if (g_ShadowPages[i].RefCount == 0)
                 {
                     ShvHookRemoveShadow(gpa);
+                    ShvOsForceAllCpuVmExit();
                     MmFreeContiguousMemory(g_ShadowPages[i].ShadowVa);
                     RtlZeroMemory(&g_ShadowPages[i], sizeof(SHV_SHADOW_PAGE_RECORD));
                 }

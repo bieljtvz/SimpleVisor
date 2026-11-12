@@ -52,6 +52,7 @@ Abstract:
 #define SHV_QUERY_LAST_LSTAR        4
 #define SHV_QUERY_HOOK_HITS         5
 #define SHV_QUERY_EPT_CAPS          6
+#define SHV_QUERY_COPYVM_HITS       7
 #define SHV_QUERY_EVENT_INFO        10
 #define SHV_QUERY_EVENT_BASE        11
 #define SHV_QUERY_EVENT_EXT_BASE    (SHV_QUERY_EVENT_BASE + SHV_EVENT_RING_SIZE)

@@ -35,6 +35,7 @@ Abstract:
 #define SHV_QUERY_LAST_LSTAR        4   // ultimo valor lido/escrito no LSTAR
 #define SHV_QUERY_HOOK_HITS         5   // total de EPT execute hooks disparados (KiSystemCall64)
 #define SHV_QUERY_EPT_CAPS          6   // EAX bit0=execute-only EPT suportado
+#define SHV_QUERY_COPYVM_HITS       7   // total de chamadas interceptadas em MmCopyVirtualMemory
 #define SHV_QUERY_EVENT_INFO        10  // EAX=total de eventos escritos, EBX=ring size
 #define SHV_QUERY_EVENT_BASE        11  // ECX=11+slot -> entrada do ring buffer:
                                         //   EAX=SeqNum, EBX=Value.Low,
