@@ -20,6 +20,7 @@ Abstract:
 #include <stdio.h>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <tlhelp32.h>
 
@@ -319,6 +320,9 @@ static void RenderEventTable(ShvBackend& backend,
     if (ImGui::Button("Limpar historico"))
         backend.ClearEvents();
     ImGui::SameLine(0, 12);
+    static bool s_ignoreDuplicates = false;
+    ImGui::Checkbox("Ignorar Duplicados", &s_ignoreDuplicates);
+    ImGui::SameLine(0, 12);
     ImGui::Checkbox("Show Mod&Off", &g_cfg.evtShowModOff);
     ImGui::SameLine(0, 12);
     if (ImGui::Button("Colunas"))
@@ -374,11 +378,34 @@ static void RenderEventTable(ShvBackend& backend,
         if (useAddr)
             addrVal = strtoull(addrFilter, nullptr, 16);
 
+        // "Ignorar Duplicados": compara cada linha contra TODAS as ja vistas
+        // nesta mesma renderizacao (nao so a anterior), pela assinatura
+        // Tipo+RIP/Value+RetAddr+Aux+CR3+VA Fault (ignora SeqNum/Timestamp/
+        // tickMs, que sempre diferem mesmo pra retries da mesma leitura
+        // real -- ver fix "1 leitura gerando 1-3 eventos" em memory/fixes.md).
+        // Hash set em vez de O(n^2) pra nao travar com historico grande.
+        std::unordered_set<uint64_t> seenSignatures;
+        auto DedupSignature = [](const ShvEventRecord& ev) -> uint64_t
+        {
+            uint64_t h = ev.type;
+            h = h * 1099511628211ULL ^ ev.value;
+            h = h * 1099511628211ULL ^ ev.returnAddr;
+            h = h * 1099511628211ULL ^ ev.aux;
+            h = h * 1099511628211ULL ^ ev.cr3;
+            h = h * 1099511628211ULL ^ ev.linearAddr;
+            return h;
+        };
+
         for (const auto& e : events)
         {
             uint8_t t = (e.type < 6) ? e.type : 0;
             if (!(typeMask & (1u << t))) continue;
             if (useAddr && e.value != addrVal) continue;
+            if (s_ignoreDuplicates)
+            {
+                uint64_t sig = DedupSignature(e);
+                if (!seenSignatures.insert(sig).second) continue;
+            }
 
             bool isSelected = s_hasSelected && (s_selectedEvent.seqNum == e.seqNum);
             ImGui::TableNextRow();

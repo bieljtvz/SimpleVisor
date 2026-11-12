@@ -1456,6 +1456,54 @@ ShvReadGuestReturnAddress (
 // SkipRipAdvance = TRUE: a instrucao que causou a violation nao foi executada
 // ainda -- o guest deve re-tenta-la com as permissoes temporariamente restauradas.
 //
+
+static volatile UINT64 ShvLastEptEventLinearAddr = 0;
+static volatile UINT64 ShvLastEptEventCr3         = 0;
+static volatile UINT64 ShvLastEptEventTimestamp   = 0;
+static volatile UINT8  ShvLastEptEventType        = 0xFF;
+
+//
+// Dedup de evento EPT por janela de tempo curta.
+//
+// O EPT e por-CPU (cada core mantem sua PROPRIA copia das paginas EPT -- ver
+// comentario em ShvVmxEptApplyHooks). O mecanismo de "abrir a pagina por 1
+// instrucao" (restaura RWX, arma MTF, guest re-executa, MTF re-restringe) so
+// abre a pagina NO CORE ATUAL. Se o Windows migrar a thread que esta
+// re-executando a instrucao pra OUTRO core core ANTES dela de fato rodar
+// (preempcao por interrupcao entre o VM-entry e a instrucao retirar), o novo
+// core ainda tem a pagina restrita (nunca recebeu o override temporario) e
+// gera OUTRA violacao de EPT real pro MESMO acesso logico -- cada core por
+// onde a thread passar loga seu proprio evento, fazendo "1 leitura" aparecer
+// como 2 ou 3 eventos identicos (mesmo VA/Cr3/Tipo), nao-deterministico
+// dependendo de quantas migracoes acontecerem. Sem suporte a abrir a pagina
+// em TODOS os cores de uma vez (custaria um IPI broadcast por violation),
+// filtramos aqui: se o evento tem o mesmo Tipo+VA+CR3 do ultimo evento EPT
+// dentro de uma janela curta, e' quase certamente um retry migrado do MESMO
+// acesso, nao um acesso novo -- nao loga de novo.
+//
+#define SHV_EPT_EVENT_DEDUP_WINDOW_100NS  500ULL // ~50 microsegundos
+
+static UINT8
+ShvHookShouldDedupEvent (
+    _In_ UINT8  Type,
+    _In_ UINT64 LinearAddr,
+    _In_ UINT64 Cr3
+    )
+{
+    UINT64 now = ShvReadSystemTime();
+    UINT8  dup = (UINT8)(Type == ShvLastEptEventType &&
+                          LinearAddr == ShvLastEptEventLinearAddr &&
+                          Cr3 == ShvLastEptEventCr3 &&
+                          (now - ShvLastEptEventTimestamp) < SHV_EPT_EVENT_DEDUP_WINDOW_100NS);
+
+    ShvLastEptEventType       = Type;
+    ShvLastEptEventLinearAddr = LinearAddr;
+    ShvLastEptEventCr3        = Cr3;
+    ShvLastEptEventTimestamp  = now;
+
+    return dup;
+}
+
 VOID
 ShvVmxHandleEptViolation (
     _In_ PSHV_VP_STATE VpState,
@@ -1467,6 +1515,7 @@ ShvVmxHandleEptViolation (
     UINT64 page;
     UINT64 controls;
     UINT64 linearAddr;
+    UINT64 guestCr3;
     UINT32 i;
 
     exitQual   = ShvVmxRead(EXIT_QUALIFICATION);
@@ -1474,6 +1523,7 @@ ShvVmxHandleEptViolation (
     page       = guestPa & ~0xFFFULL;
     // VA do acesso que causou a violacao (so para a coluna "VA Fault" da GUI).
     linearAddr = ShvVmxRead(GUEST_LINEAR_ADDRESS);
+    guestCr3   = ShvVmxRead(GUEST_CR3);
 
     // Bit 2 = instruction fetch (execute violation)
     if ((exitQual & 0x4) != 0)
@@ -1501,7 +1551,8 @@ ShvVmxHandleEptViolation (
                 (ShvHookTable[i].Type & SHV_HOOK_EXEC))
             {
                 ShvHookTable[i].HitCount++;
-                ShvHvPushEvent(SHV_EVENT_EPT_EXEC, guestRip, retAddr, guestPa, linearAddr);
+                if (!ShvHookShouldDedupEvent(SHV_EVENT_EPT_EXEC, linearAddr, guestCr3))
+                    ShvHvPushEvent(SHV_EVENT_EPT_EXEC, guestRip, retAddr, guestPa, linearAddr);
             }
         }
     }
@@ -1531,13 +1582,15 @@ ShvVmxHandleEptViolation (
             if (ShvHookTable[i].Type & SHV_HOOK_WRITE)
             {
                 ShvHookTable[i].HitCount++;
-                ShvHvPushEvent(SHV_EVENT_EPT_WRITE, guestRip, retAddr, guestPa, linearAddr);
+                if (!ShvHookShouldDedupEvent(SHV_EVENT_EPT_WRITE, linearAddr, guestCr3))
+                    ShvHvPushEvent(SHV_EVENT_EPT_WRITE, guestRip, retAddr, guestPa, linearAddr);
             }
             else if (ShvHookTable[i].Type & SHV_HOOK_READ)
             {
                 // Write numa pagina read-restricted (r=0 w=0): reporta como READ
                 ShvHookTable[i].HitCount++;
-                ShvHvPushEvent(SHV_EVENT_EPT_READ, guestRip, retAddr, guestPa, linearAddr);
+                if (!ShvHookShouldDedupEvent(SHV_EVENT_EPT_READ, linearAddr, guestCr3))
+                    ShvHvPushEvent(SHV_EVENT_EPT_READ, guestRip, retAddr, guestPa, linearAddr);
             }
         }
     }
@@ -1556,7 +1609,8 @@ ShvVmxHandleEptViolation (
                 (ShvHookTable[i].Type & SHV_HOOK_READ))
             {
                 ShvHookTable[i].HitCount++;
-                ShvHvPushEvent(SHV_EVENT_EPT_READ, guestRip, retAddr, guestPa, linearAddr);
+                if (!ShvHookShouldDedupEvent(SHV_EVENT_EPT_READ, linearAddr, guestCr3))
+                    ShvHvPushEvent(SHV_EVENT_EPT_READ, guestRip, retAddr, guestPa, linearAddr);
             }
         }
     }

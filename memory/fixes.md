@@ -332,3 +332,93 @@ Instalado em `ShvPolicyHooksInit`/removido em `ShvPolicyHooksUninit`, do mesmo j
 **Fix:** novo helper `SHV_HOOK_PAGE_IN_RANGE(entryIdx, pg)` (shvvmxhv.c) centraliza o cálculo `pg >= PhysAddr && pg < PhysAddr + max(RangeSize,1)*0x1000`. `ShvVmxEptApplyHooks` agora itera `j = 0..RangeSize-1` aplicando a permissão em `PhysAddr + j*0x1000` pra cada página do range (hooks com shadow page continuam sempre de 1 página só, por construção — shadow é 1 PFN). `ShvVmxEptRearmHook` e os 3 pontos de matching em `ShvVmxHandleEptViolation` (EXEC/WRITE/READ) trocaram a comparação exata pelo novo helper, então agora reconhecem corretamente qualquer página dentro do range, não só a primeira. Driver recompilado sem erro; ainda não testado na VM.
 
 **Melhoria pedida em seguida (não é fix de bug, é feature):** (1) toggle no GUI (aba Eventos → EPT) pra ligar/desligar o filtro de call-site (`ShvLooksLikeCallSite`) sem precisar do WinDbg/`ed` — novo comando IOCTL `SHV_CMD_SET_STACK_FILTER` (shv_dbg.h/shv_client.h), nova função `ShvSetStackFilterEnabled` (shvvmxhv.c, só inverte `ShvStackWalkDebugNoFilter`), novo método `ShvClient::SetStackFilter`/`ShvBackend::SetStackFilter`, e um checkbox "Filtro call-site (stack)" em `tab_events.cpp` (só na sub-aba EPT, via novo parâmetro `showStackFilterToggle` em `RenderEventTable`). (2) `SHV_EVENT_STACK_FRAMES` subiu de 8 para 16 (shv_comm.h/shv_client.h) — adicionadas sub-leaves CPUID `EXT9_BASE`..`EXT12_BASE` (mesmo esquema de 2 frames por sub-leaf dos EXT5-8) pro ring buffer carregar as 8 frames extras; o range-check do handler CPUID em `shvvmxhv.c` (`subleaf >= EXT5_BASE && subleaf < ...`) só precisou do limite superior ajustado pra `EXT12_BASE`, porque o cálculo de `group`/`slot` já era genérico. Lado GUI (`tab_events.cpp`, painel de stack trace) já iterava via `SHV_EVENT_STACK_FRAMES`, então passou a mostrar 16 frames automaticamente sem mudança de código ali. Driver e GUI recompilados sem erro; ainda não testado na VM.
+
+---
+
+## 2026-11-12 — EPT Hook: evento/hit duplicado ou triplicado pro mesmo acesso real
+
+**Symptom:** usuário reportou que algumas leituras "diretas" (não via ReadProcessMemory)
+geravam 2 ou 3 eventos na aba Eventos->EPT pra uma única tentativa de leitura real.
+
+**Root cause:** `nt/shvos.c` (`SHV_CMD_HOOK_EPT`), nos dois ramos (kernel e usermode),
+criava **uma entrada na `ShvHookTable[]` POR PÁGINA** do range pedido (loop por
+`va`/`pfnArray[i]`), e cada uma dessas entradas recebia o `RangeSize` TOTAL do range
+inteiro (não 1). Como `SHV_HOOK_PAGE_IN_RANGE` já soma `RangeSize` páginas a partir do
+`PhysAddr` de CADA entrada pra decidir o que bate com a violação, pra um range de N>1
+páginas isso cria N entradas todas se sobrepondo: a entrada da página 0 "pensa" que cobre
+as páginas 0..N-1, a da página 1 TAMBÉM pensa que cobre as páginas 1..N, etc. Qualquer
+acesso numa página do meio do range batia em 2 (ou mais) entradas ao mesmo tempo, e o loop
+de `ShvVmxHandleEptViolation` em `shvvmxhv.c` loga um evento (e soma `HitCount`) POR
+ENTRADA que bate — gerando 2-3 eventos pra um único acesso real.
+
+**Fix:** os dois ramos de `SHV_CMD_HOOK_EPT` agora instalam **uma única entrada** na
+tabela (na primeira página física válida do range), com `RangeSize` = total de páginas.
+`ShvVmxEptApplyHooks`/`ShvVmxEptRearmHook`/`ShvVmxHandleEptViolation` (já corrigidos numa
+passada anterior) sabem varrer as N páginas de UMA entrada só via `SHV_HOOK_PAGE_IN_RANGE`
+— não precisava (e não devia) existir mais de uma entrada por hook instalado.
+
+**Nota/limitação ainda aberta:** essa correção resolve range multi-página (RangeSize
+resultando em >1 página, incluindo bytes que cruzam limite de página). Se o usuário ainda
+via duplicação com range pequeno (1-4 bytes) dentro de UMA página só, a causa é outra (ex.:
+hook antigo de um teste anterior não removido ainda na tabela, ou a ferramenta de teste
+fazendo mais de um acesso real por "tentativa") e precisa de mais investigação/repro.
+
+Driver recompilado (`MSBuild.exe shv.sln /p:Configuration="Windows NT" /p:Platform=x64`),
+sem erros, `shv.sys` assinado com sucesso.
+
+---
+
+## 2026-11-12 — EPT Hook: 1 leitura real gerando 1-3 eventos idênticos (mesmo core)
+
+**Symptom:** com o hook já restrito a 1 byte exato (ByteLen fix anterior), o usuário ainda
+via 1, 2 ou 3 eventos idênticos (mesmo VA/CR3) pra uma única leitura real (`F9` no
+`detect_shv.exe`, que lê só 1 byte). Confirmado que acontecia no MESMO core/CPU — descartando
+a hipótese de migração de thread entre cores com EPT per-CPU desincronizado.
+
+**Root cause provável:** o mecanismo de "abrir a página por 1 instrução" (restaura RWX
+completo, arma MTF, guest re-executa a instrução que faltou, MTF re-restringe) depende de
+que a PRÓXIMA instrução retirada depois do VM-entry seja exatamente a instrução re-tentada.
+Se houver uma INTERRUPÇÃO PENDENTE nesse instante, o processador pode entregar essa
+interrupção ANTES de re-executar a instrução do guest — o MTF então dispara depois da
+PRIMEIRA instrução do handler da interrupção (nada a ver com a leitura), e o handler de MTF
+re-restringe a página cedo demais. Quando a interrupção termina e a execução volta pro RIP
+original (que não avançou, `SkipRipAdvance=TRUE`), a leitura real finalmente tenta executar
+— mas a página já está restrita de novo, gerando OUTRA violação de EPT real pro MESMO
+acesso lógico, no MESMO core. Corrigir isso de verdade exigiria bloquear entrega de
+interrupção durante a janela de single-step (VMCS "interrupt-window exiting"), uma mudança
+maior fora do escopo desta correção.
+
+**Fix (mitigação pragmática):** dedup por janela de tempo curta (~50us, via
+`ShvReadSystemTime`) em `shvvmxhv.c`: novo `ShvHookShouldDedupEvent(Type, LinearAddr, Cr3)`
+compara contra o último evento EPT logado (globais `ShvLastEptEvent*`); se Tipo+VA+CR3
+forem iguais e dentro da janela, trata como retry do mesmo acesso e NÃO loga de novo
+(`HitCount` ainda soma, só o evento do ring buffer é suprimido). Aplicado nos 3 branches de
+`ShvVmxHandleEptViolation` (EXEC/WRITE/READ) antes de cada `ShvHvPushEvent`.
+
+**Nota:** isso é uma mitigação do SINTOMA (log duplicado), não elimina a violação EPT real
+extra que ainda ocorre por baixo dos panos (overhead minúsculo, sem efeito funcional).
+
+Driver recompilado (`MSBuild.exe shv.sln /p:Configuration="Windows NT" /p:Platform=x64`),
+sem erros, `shv.sys` assinado com sucesso.
+
+---
+
+## 2026-11-12 — GUI: checkbox "Ignorar Duplicados" na aba Eventos->EPT
+
+**Pedido:** o dedup por janela de tempo no kernel (fix anterior) não eliminou 100% os
+eventos duplicados/triplicados de uma mesma leitura real (causa raiz provável: corrida
+entre interrupção pendente e o MTF single-step, difícil de eliminar sem bloquear entrega
+de interrupção na VMCS). Usuário decidiu que não é um problema que afeta o uso real, e
+pediu um filtro do lado da GUI pra esconder as duplicatas da lista.
+
+**Fix:** `tab_events.cpp` (`RenderEventTable`): novo checkbox "Ignorar Duplicados" na
+barra de ferramentas da tabela de eventos. Quando ligado, cada linha é comparada contra
+TODAS as já renderizadas nesta mesma passada (não só a anterior) por uma assinatura
+(hash de Tipo+Value/RIP+ReturnAddr+Aux+CR3+LinearAddr — propositalmente SEM SeqNum/
+Timestamp/tickMs, que sempre diferem mesmo entre retries da mesma leitura real); a segunda
+ocorrência da mesma assinatura é pulada. Usa `std::unordered_set<uint64_t>` (não
+comparação O(n²) linha-a-linha) pra não travar com histórico grande (`kEventHistoryMax`
+= 20000).
+
+GUI (`usermode_gui.exe`) recompilada (`MSBuild.exe usermode_gui.slnx
+/p:Configuration=Debug /p:Platform=x64`), sem erros.

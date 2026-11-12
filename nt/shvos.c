@@ -302,8 +302,17 @@ ShvDispatchIoctl (
 
         if (req.Hook.Pid == 0)
         {
-            // Kernel: paginas nao-paginadas; itera direto por VA
+            // Kernel: paginas nao-paginadas; traduz cada pagina do range, mas
+            // instala UMA SO entrada na tabela (na PRIMEIRA pagina fisica valida)
+            // com RangeSize = numero de paginas. ShvVmxEptApplyHooks/RearmHook/
+            // HandleEptViolation (shvvmxhv.c) ja sabem varrer as N paginas de UMA
+            // entrada via SHV_HOOK_PAGE_IN_RANGE -- NAO criar uma entrada por
+            // pagina aqui, ou paginas do meio do range acabam cobertas por DUAS
+            // entradas sobrepostas (cada uma pensando que e o inicio de um range
+            // de N paginas), causando HitCount/evento DUPLICADO/TRIPLICADO para
+            // o mesmo acesso real (bug encontrado via teste do usuario).
             UINT64 va;
+            UINT64 basePa = 0;
             for (va = vaBase; va < vaEnd; va += PAGE_SIZE)
             {
                 PHYSICAL_ADDRESS pa;
@@ -311,12 +320,12 @@ ShvDispatchIoctl (
                 __except (EXCEPTION_EXECUTE_HANDLER) { pa.QuadPart = 0; }
                 if ((pa.QuadPart & ~0xFFFULL) != 0)
                 {
-                    // Primeira pagina guarda o VA exato pedido (com o offset dentro
-                    // da pagina), nao o VA arredondado para o inicio da pagina --
-                    // so pra exibicao na GUI, o match de EPT continua sendo por pagina.
-                    UINT64 displayVa = (va == vaBase) ? req.Hook.VirtAddr : va;
-                    ShvHookInstall(pa.QuadPart & ~0xFFFULL, req.Hook.HookType,
-                                   displayVa, 0, pageCountTotal, byteLen);
+                    if (basePa == 0)
+                    {
+                        basePa = pa.QuadPart & ~0xFFFULL;
+                        ShvHookInstall(basePa, req.Hook.HookType,
+                                       req.Hook.VirtAddr, 0, pageCountTotal, byteLen);
+                    }
                     hooked++;
                 }
             }
@@ -370,7 +379,11 @@ ShvDispatchIoctl (
                 break;
             }
 
-            // Itera PFNs e instala hook em cada pagina
+            // Itera PFNs so pra travar/contar; UMA SO entrada vai pra tabela
+            // (na primeira pagina) -- mesma razao do ramo kernel acima: uma
+            // entrada por pagina com RangeSize>1 faz paginas do meio do range
+            // casarem em DUAS entradas sobrepostas, duplicando/triplicando o
+            // evento/HitCount pro mesmo acesso real.
             pfnArray  = MmGetMdlPfnArray(mdl);
             pageCount = ADDRESS_AND_SIZE_TO_SPAN_PAGES(vaBase, regionBytes);
             for (i = 0; i < pageCount; i++)
@@ -378,16 +391,15 @@ ShvDispatchIoctl (
                 UINT64 gpa = (UINT64)pfnArray[i] << PAGE_SHIFT;
                 if (gpa != 0)
                 {
-                    // Primeira pagina guarda o VA exato pedido (com offset), nao o
-                    // VA arredondado para o inicio da pagina -- so pra exibicao.
-                    UINT64 displayVa = (i == 0) ? req.Hook.VirtAddr
-                                                 : vaBase + (UINT64)i * PAGE_SIZE;
-                    if (i == 0) firstPa = gpa;
-                    ShvHookInstall(gpa, req.Hook.HookType,
-                                   displayVa,
-                                   req.Hook.Pid,
-                                   pageCountTotal,
-                                   byteLen);
+                    if (firstPa == 0)
+                    {
+                        firstPa = gpa;
+                        ShvHookInstall(gpa, req.Hook.HookType,
+                                       req.Hook.VirtAddr,
+                                       req.Hook.Pid,
+                                       pageCountTotal,
+                                       byteLen);
+                    }
                     hooked++;
                 }
             }
