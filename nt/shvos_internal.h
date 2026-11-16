@@ -28,9 +28,14 @@ Environment:
 // Funcoes do hipervisor (definidas em shvvmxhv.c) usadas pelo lado NT.
 // Repetidas aqui (nao incluimos shv.h) para evitar conflito com ntifs.h.
 // ============================================================
+#ifndef SHV_HOOK_MAX_ENTRIES
+#define SHV_HOOK_MAX_ENTRIES 256
+#endif
+
 UINT32 ShvHookInstall(_In_ UINT64 PhysAddr, _In_ UINT8 HookType, _In_ UINT64 VirtAddr, _In_ UINT64 Pid, _In_ UINT64 RangeSize, _In_ UINT64 ByteLen);
 UINT32 ShvListEptHooks(_Out_writes_(MaxCount) VOID* OutBuffer, _In_ UINT32 MaxCount, _In_ UINT32 EntrySize);
 UINT32 ShvHookRemove(_In_ UINT64 PhysAddr);
+UINT32 ShvHookRemoveByPid(_In_ UINT64 Pid, _Out_writes_to_(MaxOut, return) UINT64* OutPhysAddrs, _In_ UINT32 MaxOut);
 VOID   ShvHookRemoveAll(VOID);
 // MDL helpers: mantem paginas user-mode travadas para o PA nao mudar durante o hook.
 // PMDL e definido por <ntifs.h> que todo .c NT inclui antes deste header.
@@ -89,6 +94,17 @@ NTSTATUS HpvHookFuncByVa(_In_ PVOID FuncVa, _In_ PVOID HookFunc, _Out_ PVOID* Or
 NTSTATUS HpvHookFuncByName(_In_ PCWSTR FuncName, _In_ PVOID HookFunc, _Out_ PVOID* OriginalFunc);
 NTSTATUS HpvUnhookFuncByVa(_In_ PVOID FuncVa);
 NTSTATUS HpvShadowPatchAddress(_In_reads_bytes_(Size) const VOID* Buffer, _In_ PVOID Address, _In_ SIZE_T Size);
+
+// nt/hpv_pattern.c -- busca de assinatura de bytes (pattern/signature scan),
+// usada pra achar funcoes NAO exportadas do ntoskrnl.exe (MmGetSystemRoutineAddress
+// so resolve exports). Mascara: 'x' = compara o byte, qualquer outro char = wildcard.
+UINT64 HpvFindPattern(_In_ UINT64 Base, _In_ SIZE_T Size, _In_ const UINT8* Pattern, _In_z_ const CHAR* Mask);
+BOOLEAN HpvFindNtoskrnlTextSection(_Out_ UINT64* Base, _Out_ SIZE_T* Size);
+BOOLEAN HpvFindNtoskrnlModule(_Out_ UINT64* Base, _Out_ SIZE_T* Size);
+
+// nt/shvos.c -- limpa MDL/EPT hooks de um PID que terminou (ver PspExitProcess
+// hook em hpv_policy_hooks.c).
+VOID ShvCleanupExitedProcess(_In_ UINT64 Pid);
 
 // nt/hpv_hooks_legacy.c -- SSDT + LSTAR, NAO usados atualmente em nenhum
 // caminho ativo (ver comentario no topo do arquivo). Mantidos pra estudo.

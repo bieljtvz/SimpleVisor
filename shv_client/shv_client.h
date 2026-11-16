@@ -114,6 +114,13 @@ Abstract:
 #define SHV_CMD_CLEAR_EVENTS        23
 #define SHV_CMD_LIST_EPT_HOOKS      24
 #define SHV_CMD_SET_STACK_FILTER    25
+#define SHV_CMD_LIST_PROCESS_MODULES 26
+#define SHV_CMD_LIST_PROCESS_THREADS 27
+#define SHV_CMD_LIST_PROCESS_MEMORY  28
+#define SHV_CMD_THREAD_SUSPEND       29
+#define SHV_CMD_THREAD_RESUME        30
+#define SHV_CMD_THREAD_GET_CONTEXT   31
+#define SHV_CMD_THREAD_GET_STACK     32
 
 // Status de resposta
 #define SHVD_STATUS_OK             0
@@ -122,6 +129,7 @@ Abstract:
 #define SHVD_STATUS_ERR_NOMEM      3
 #define SHVD_STATUS_ERR_INVALID    4
 #define SHVD_STATUS_ERR_ACCESS     5
+#define SHVD_STATUS_ERR_UNSUPPORTED 6
 
 // Tipos de EPT hook (bitmask)
 #define SHV_HOOK_EXEC              0x01
@@ -188,16 +196,32 @@ typedef struct {
 } SHV_NAMEFILTER_ARGS;
 
 typedef struct {
+    unsigned long long Pid;
+} SHV_LISTPROCMODULES_ARGS;
+
+typedef struct {
+    unsigned long long Tid;
+} SHV_THREADCTL_ARGS;
+
+typedef struct {
+    unsigned long long Pid;
+    unsigned long long StartAddr;
+} SHV_LISTPROCMEMORY_ARGS;
+
+typedef struct {
     unsigned int Command;
     union {
-        SHV_HOOK_ARGS        Hook;
-        SHV_UNHOOK_ARGS      Unhook;
-        SHV_TRANSLATE_ARGS   Translate;
-        SHV_READPHYS_ARGS    ReadPhys;
-        SHV_SHADOW_ARGS      Shadow;
-        SHV_PROCFILTER_ARGS  ProcFilter;
-        SHV_READVIRT_ARGS    ReadVirt;
-        SHV_NAMEFILTER_ARGS  NameFilter;
+        SHV_HOOK_ARGS            Hook;
+        SHV_UNHOOK_ARGS          Unhook;
+        SHV_TRANSLATE_ARGS       Translate;
+        SHV_READPHYS_ARGS        ReadPhys;
+        SHV_SHADOW_ARGS          Shadow;
+        SHV_PROCFILTER_ARGS      ProcFilter;
+        SHV_READVIRT_ARGS        ReadVirt;
+        SHV_NAMEFILTER_ARGS      NameFilter;
+        SHV_LISTPROCMODULES_ARGS ListProcModules;
+        SHV_THREADCTL_ARGS       ThreadCtl;
+        SHV_LISTPROCMEMORY_ARGS  ListProcMemory;
     };
 } SHV_REQUEST;
 
@@ -214,6 +238,36 @@ typedef struct {
     unsigned long long Size;
     char               Name[SHV_MOD_NAME_LEN];
 } SHV_MODULE_ENTRY;
+
+typedef struct {
+    unsigned long long Tid;
+    unsigned long long StartAddress;
+    unsigned long long Object;
+} SHV_THREAD_ENTRY;
+
+typedef struct {
+    unsigned long long Base;
+    unsigned long long Size;
+    unsigned int        Protect;
+    unsigned int        State;
+    unsigned int        Type;
+} SHV_MEMREGION_ENTRY;
+
+typedef struct {
+    unsigned long long Rip;
+    unsigned long long Rsp;
+    unsigned long long Rbp;
+} SHV_THREAD_CONTEXT;
+
+#define SHV_STACK_MAX_FRAMES 32
+
+typedef struct {
+    unsigned long long Rip;
+    unsigned long long Rsp;
+    unsigned long long Rbp;
+    unsigned int        FrameCount;
+    unsigned long long Frames[SHV_STACK_MAX_FRAMES];
+} SHV_THREAD_STACK;
 
 typedef struct {
     unsigned int       SyscallIndex;
@@ -256,9 +310,13 @@ typedef struct {
     unsigned int Count;
     union {
         unsigned long long    PhysAddr;
+        SHV_THREAD_CONTEXT    ThreadContext;
+        SHV_THREAD_STACK      ThreadStack;
         unsigned char         Data[SHV_MAX_READ_SIZE];
         SHV_PROC_ENTRY        Procs[SHV_MAX_READ_SIZE / sizeof(SHV_PROC_ENTRY)];
         SHV_MODULE_ENTRY      Modules[SHV_MAX_READ_SIZE / sizeof(SHV_MODULE_ENTRY)];
+        SHV_THREAD_ENTRY      Threads[SHV_MAX_READ_SIZE / sizeof(SHV_THREAD_ENTRY)];
+        SHV_MEMREGION_ENTRY   MemRegions[SHV_MAX_READ_SIZE / sizeof(SHV_MEMREGION_ENTRY)];
         SHV_HOOK_INFO         HookInfos[SHV_MAX_READ_SIZE / sizeof(SHV_HOOK_INFO)];
         SHV_PROC_FILTER_ENTRY Filters[SHV_MAX_READ_SIZE / sizeof(SHV_PROC_FILTER_ENTRY)];
         SHV_SHADOW_HOOK_INFO  ShadowHookInfos[SHV_MAX_READ_SIZE / sizeof(SHV_SHADOW_HOOK_INFO)];
@@ -357,8 +415,41 @@ public:
     // outCount: numero de entradas preenchidas.
     bool ListProcs(SHV_PROC_ENTRY* out, uint32_t maxCount, uint32_t* outCount);
 
-    // Lista modulos do processo pid. pid = 0: processo do chamador.
+    // Lista modulos do KERNEL (ntoskrnl.exe + drivers carregados), nao de um processo.
     bool ListModules(SHV_MODULE_ENTRY* out, uint32_t maxCount, uint32_t* outCount);
+
+    // Lista modulos (EXE+DLLs) do processo pid, via PEB lido pelo kernel
+    // (KeStackAttachProcess + PsGetProcessPeb) -- diferente de ListModules
+    // (kernel) e nao depende de CreateToolhelp32Snapshot/OpenProcess em
+    // usermode, entao funciona mesmo contra processos protegidos (PPL).
+    bool ListProcessModules(uint64_t pid, SHV_MODULE_ENTRY* out, uint32_t maxCount, uint32_t* outCount);
+
+    // Lista threads (tid+startaddr) do processo pid, via ZwQuerySystemInformation
+    // no kernel -- nao precisa de handle pro processo, funciona com PPL.
+    bool ListProcessThreads(uint64_t pid, SHV_THREAD_ENTRY* out, uint32_t maxCount, uint32_t* outCount);
+
+    // Lista regioes de memoria virtual do processo pid (equivalente a
+    // VirtualQueryEx), via ZwQueryVirtualMemory no kernel enquanto anexado ao
+    // processo (pseudo-handle, sem access check) -- funciona com PPL.
+    // startAddr: 0 = do inicio do address space; != 0 = continua a partir dali
+    // (usado pra paginar processos com mais regioes do que cabe num buffer so).
+    bool ListProcessMemory(uint64_t pid, SHV_MEMREGION_ENTRY* out, uint32_t maxCount,
+                           uint32_t* outCount, uint64_t startAddr = 0);
+
+    // Suspende/resume uma thread via handle aberto no kernel (ObOpenObjectByPointer
+    // + ZwSuspendThread/ZwResumeThread) -- funciona mesmo contra processos
+    // protegidos (PPL), diferente de OpenThread em usermode.
+    bool SuspendThread(uint64_t tid);
+    bool ResumeThread(uint64_t tid);
+
+    // Le Rip/Rsp/Rbp de uma thread (suspende, PsGetContextThread, resume) --
+    // usado pra sementear um stack walk sem precisar de handle usermode.
+    bool GetThreadContext(uint64_t tid, SHV_THREAD_CONTEXT* out);
+
+    // Rip/Rsp/Rbp + stack de KERNEL de uma thread via APC especial (mesma
+    // tecnica do Process Hacker) -- funciona mesmo contra processos
+    // protegidos (PPL), ao contrario de GetThreadContext (PsGetContextThread).
+    bool GetThreadStack(uint64_t tid, SHV_THREAD_STACK* out);
 
     // Lista syscall hooks instalados.
     bool ListSyscallHooks(SHV_HOOK_INFO* out, uint32_t maxCount, uint32_t* outCount);

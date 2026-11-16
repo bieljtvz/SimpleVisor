@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="usermode_gui/usermode_gui.vcxproj" />
+  <Project Path="usermode_gui/usermode_gui.vcxproj" Id="faaccfff-8d09-4d72-8c30-d18322b7350e" />
 </Solution>

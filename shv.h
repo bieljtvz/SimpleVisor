@@ -278,8 +278,16 @@ extern volatile UINT64 ShvEptHookPhysical;
 extern volatile UINT64 ShvEptHookHitCount;
 extern UINT8 ShvEptExecuteOnlySupported;
 
+// Numero maximo de entradas na tabela de hooks EPT (ShvHookTable, shvvmxhv.c).
+// Publicado aqui pra quem precisa dimensionar buffers de saida (ex.:
+// ShvHookRemoveByPid) sem depender do static interno do shvvmxhv.c.
+#ifndef SHV_HOOK_MAX_ENTRIES
+#define SHV_HOOK_MAX_ENTRIES 256
+#endif
+
 // Tabela de hooks EPT instalados via IOCTL (shvvmxhv.c)
 // Retornam SHVD_STATUS_* de shv_dbg.h
 UINT32 ShvHookInstall(_In_ UINT64 PhysAddr, _In_ UINT8 HookType, _In_ UINT64 VirtAddr, _In_ UINT64 Pid, _In_ UINT64 RangeSize, _In_ UINT64 ByteLen);
 UINT32 ShvHookRemove(_In_ UINT64 PhysAddr);
+UINT32 ShvHookRemoveByPid(_In_ UINT64 Pid, _Out_writes_to_(MaxOut, return) UINT64* OutPhysAddrs, _In_ UINT32 MaxOut);
 

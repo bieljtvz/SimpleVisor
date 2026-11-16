@@ -66,7 +66,7 @@ extern volatile UINT64 ShvReadVirtualMemoryHookHitCount;
 // Cada CPU aplica a tabela lazily no proximo VM-exit quando detecta
 // que sua copia local (VpData->EptHookVersion) esta desatualizada.
 //
-#define SHV_HOOK_MAX_ENTRIES    16
+#define SHV_HOOK_MAX_ENTRIES    256
 
 typedef struct _SHV_HOOK_ENTRY
 {
@@ -660,6 +660,53 @@ ShvHookRemove (
     }
 
     return SHVD_STATUS_ERR_NOTFOUND;
+}
+
+//
+// Remove TODOS os hooks EPT (tabela normal, nao-shadow) associados a um PID.
+// Usado pelo hook de PspExitProcess (hpv_policy_hooks.c) pra limpar
+// automaticamente os hooks/MDLs de um processo que esta terminando, evitando
+// o bugcheck PROCESS_HAS_LOCKED_PAGES (0xCB) quando o EPROCESS e destruido
+// com paginas ainda travadas por MmProbeAndLockPages (ver SHV_CMD_HOOK_EPT
+// em nt/shvos.c). Preenche OutPhysAddrs com o PhysAddr (pagina-base) de cada
+// hook removido -- o chamador usa isso pra achar e liberar o MDL
+// correspondente via ShvHookTakeMdl/MmUnlockPages (shvos.c mantem essa
+// tabela MDL<->PhysAddr separada, shvvmxhv.c nao sabe nada de MDL).
+// Retorna o numero de hooks removidos (<= MaxOut).
+//
+UINT32
+ShvHookRemoveByPid (
+    _In_ UINT64  Pid,
+    _Out_writes_to_(MaxOut, return) UINT64* OutPhysAddrs,
+    _In_ UINT32  MaxOut
+    )
+{
+    UINT32 i;
+    UINT32 count = 0;
+
+    if (Pid == 0)
+        return 0;
+
+    for (i = 0; i < SHV_HOOK_MAX_ENTRIES; i++)
+    {
+        if (ShvHookTable[i].PhysAddr != 0 &&
+            ShvHookTable[i].ShadowPhysAddr == 0 &&
+            ShvHookTable[i].Pid == Pid)
+        {
+            if (count < MaxOut)
+                OutPhysAddrs[count] = ShvHookTable[i].PhysAddr;
+            count++;
+
+            ShvHookTable[i].PhysAddr = 0;
+            ShvHookTable[i].Type     = 0;
+            ShvHookTable[i].HitCount = 0;
+        }
+    }
+
+    if (count != 0)
+        _InterlockedIncrement64((LONG64*)&ShvHookVersion);
+
+    return (count < MaxOut) ? count : MaxOut;
 }
 
 //

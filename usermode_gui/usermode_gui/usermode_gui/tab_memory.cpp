@@ -12,10 +12,12 @@ Abstract:
 --*/
 
 #include "tab_memory.h"
+#include "tab_disasm.h"
 #include "imgui/imgui.h"
 #include "imgui/imgui_hexview/imgui_hex.h"
 #include <stdio.h>
 #include <string.h>
+#include <vector>
 
 static const ImVec4 kColorOk   = { 0.20f, 0.90f, 0.40f, 1.0f };
 static const ImVec4 kColorErr  = { 1.00f, 0.30f, 0.20f, 1.0f };
@@ -188,10 +190,29 @@ void RenderTabMemory(ShvBackend& backend)
 
                 if (s_bufSize > 0)
                 {
+                    ImGui::Separator();
                     ImGui::Spacing();
                     ImVec2 hexSize(0.0f, 200.0f);
                     if (ImGui::BeginHexEditor("##hexview", &s_hexState, hexSize))
                         ImGui::EndHexEditor();
+                }
+
+                static bool s_showDisasm = false;
+                if (s_bufSize > 0)
+                {
+                    ImGui::Checkbox("Desmontar (Zydis)##rd", &s_showDisasm);
+                    if (s_showDisasm)
+                    {
+                        // PID so faz sentido simbolizar contra DLLs do processo
+                        // em leitura virtual; em fisica so resolve contra o kernel.
+                        uint64_t disasmPid = (s_mode == 1) ? strtoull(s_pidStr, nullptr, 10) : 0;
+
+                        backend.Lock();
+                        std::vector<SHV_MODULE_ENTRY> kernMods = backend.State().kernelModules;
+                        backend.Unlock();
+
+                        RenderDisasmView(s_buf, s_bufSize, s_baseAddr, disasmPid, kernMods, backend);
+                    }
                 }
             }
             ImGui::EndTabItem();

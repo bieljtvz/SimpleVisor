@@ -64,6 +64,22 @@ typedef NTSTATUS (NTAPI* PfnMmCopyVirtualMemory)(
 
 static PfnMmCopyVirtualMemory g_OrigMmCopyVirtualMemory = NULL;
 
+// PspExitProcess NAO e exportada -- MmGetSystemRoutineAddress nao resolve.
+// Achada por pattern scan (HpvFindPattern/HpvFindNtoskrnlTextSection,
+// nt/hpv_pattern.c) na secao .text do ntoskrnl.exe. Assinatura valida pra
+// uma build especifica do Windows -- pode mudar numa atualizacao (ver nota
+// em memory/fixes.md). Prototipo "classico" (Windows Internals/varios
+// writeups de RE) -- nao documentado oficialmente, pode nao bater em toda
+// build (motivo pelo qual o hook e NAO-FATAL se a assinatura nao for achada).
+typedef VOID (NTAPI* PfnPspExitProcess)(
+    _In_ BOOLEAN   LastThread,
+    _In_ PEPROCESS Process
+    );
+
+static PfnPspExitProcess g_OrigPspExitProcess = NULL;
+static UINT64            g_PspExitProcessVa   = 0; // cache p/ unhook (nao exportada,
+                                                     // nao da p/ re-resolver por nome)
+
 // ============================================================
 // Helpers internos
 // ============================================================
@@ -222,6 +238,38 @@ static NTSTATUS NTAPI HpvCopyVirtualMemoryHook(
 }
 
 // ============================================================
+// Hook: PspExitProcess
+// ============================================================
+// Disparado quando um processo esta sendo finalizado de verdade (qualquer
+// caminho -- NtTerminateProcess, ultima thread saindo, crash -- todos
+// convergem aqui antes do EPROCESS ser destruido). So nos interessa o
+// momento em que o processo ja NAO tem mais threads (LastThread==TRUE):
+// so entao limpa os EPT hooks/MDLs daquele PID (ShvCleanupExitedProcess,
+// shvos.c), evitando o bugcheck PROCESS_HAS_LOCKED_PAGES (0xCB) se o
+// usuario fechou o processo com um hook (aba Memoria->EPT Hook) ainda ativo
+// e sem desinstalar manualmente.
+static VOID NTAPI HpvExitProcessHook(
+    _In_ BOOLEAN   LastThread,
+    _In_ PEPROCESS Process
+    )
+{
+    if (LastThread && Process != NULL)
+    {
+        UINT64 pid = 0;
+        __try
+        {
+            pid = (UINT64)(ULONG_PTR)PsGetProcessId(Process);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        if (pid != 0)
+            ShvCleanupExitedProcess(pid);
+    }
+
+    g_OrigPspExitProcess(LastThread, Process);
+}
+
+// ============================================================
 // API publica
 // ============================================================
 NTSTATUS ShvPolicyHooksInit(VOID)
@@ -256,6 +304,59 @@ NTSTATUS ShvPolicyHooksInit(VOID)
         ShvLog("[POLICY] MmCopyVirtualMemory shadow hook OK (trampoline=%p)\n", origFunc);
     }
 
+    // PspExitProcess: nao exportada, precisa de pattern scan. Assinatura
+    // valida pra uma build especifica do Windows -- nao-fatal (igual
+    // MmCopyVirtualMemory) se nao achar ou se o hook falhar: so perde a
+    // limpeza automatica de MDL/EPT hook no exit do processo, o resto do
+    // driver continua funcionando normalmente.
+    {
+        UINT64 textBase = 0;
+        SIZE_T textSize  = 0;
+
+        //\x48\x89\x5C\x24\x00\x48\x89\x74\x24\x00\x57\x48\x83\xEC\x00\x48\x8B\xDA\x40\x8A\xF1 xxxx?xxxx?xxxx?xxxxxx
+
+        static const UINT8 kPspExitProcessPattern[] =
+            "\x48\x89\x5C\x24\x00\x48\x89\x74\x24\x00\x57\x48\x83\xEC\x00\x48\x8B\xDA\x40\x8A\xF1";
+        static const CHAR* kPspExitProcessMask = "xxxx?xxxx?xxxx?xxxxxx";
+
+        if (!HpvFindNtoskrnlModule(&textBase, &textSize))
+        {
+            ShvLog("[POLICY] PspExitProcess: nao achou o modulo ntoskrnl.exe (nao fatal)\n");
+        }
+        else
+        {
+            UINT64 foundVa;
+
+            ShvLog("[POLICY] PspExitProcess: textBase=%p textSize=0x%zX\n",
+                   (PVOID)(ULONG_PTR)textBase, textSize);
+
+            foundVa = HpvFindPattern(textBase, textSize,
+                                             kPspExitProcessPattern, kPspExitProcessMask);
+            if (foundVa == 0)
+            {
+                ShvLog("[POLICY] PspExitProcess: assinatura nao encontrada (build do Windows diferente?) -- nao fatal\n");
+            }
+            else
+            {
+                status = HpvHookFuncByVa((PVOID)(ULONG_PTR)foundVa,
+                                          HpvExitProcessHook,
+                                          &origFunc);
+                if (!NT_SUCCESS(status))
+                {
+                    ShvLog("[POLICY] HpvHookFuncByVa(PspExitProcess @ %p) falhou: 0x%08X (nao fatal)\n",
+                           (PVOID)(ULONG_PTR)foundVa, status);
+                }
+                else
+                {
+                    g_OrigPspExitProcess = (PfnPspExitProcess)origFunc;
+                    g_PspExitProcessVa   = foundVa;
+                    ShvLog("[POLICY] PspExitProcess shadow hook OK (va=%p, trampoline=%p)\n",
+                           (PVOID)(ULONG_PTR)foundVa, origFunc);
+                }
+            }
+        }
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -283,5 +384,16 @@ VOID ShvPolicyHooksUninit(VOID)
             HpvUnhookFuncByVa(funcVa);
         g_OrigMmCopyVirtualMemory = NULL;
         ShvLog("[POLICY] MmCopyVirtualMemory hook removido\n");
+    }
+
+    if (g_OrigPspExitProcess != NULL)
+    {
+        // Nao exportada -- nao da p/ re-resolver via MmGetSystemRoutineAddress
+        // como os outros dois, usa o VA cacheado em ShvPolicyHooksInit.
+        if (g_PspExitProcessVa != 0)
+            HpvUnhookFuncByVa((PVOID)(ULONG_PTR)g_PspExitProcessVa);
+        g_OrigPspExitProcess = NULL;
+        g_PspExitProcessVa   = 0;
+        ShvLog("[POLICY] PspExitProcess hook removido\n");
     }
 }

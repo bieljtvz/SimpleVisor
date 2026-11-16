@@ -275,7 +275,7 @@ exit    # encerra o monitor (não descarrega o hypervisor)
 
 | Limitação | Detalhe |
 |---|---|
-| Máx. 16 hooks simultâneos | `SHV_HOOK_MAX_ENTRIES` em shvvmxhv.c |
+| Máx. 256 hooks simultâneos | `SHV_HOOK_MAX_ENTRIES` em shvvmxhv.c |
 | Granularidade de hardware: 4 KB | EPT opera por página; filtro de sub-página é em software |
 | Write hook + CoW | Não funciona em páginas compartilhadas (DLLs) |
 | Read hook bloqueia execute | Apenas em CPUs sem execute-only EPT; o monitor avisa |

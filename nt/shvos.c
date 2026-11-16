@@ -31,6 +31,7 @@ Environment:
 #pragma warning(disable:4996)  // ExAllocatePoolWithTag deprecated em WDK recente
 
 #include "shvos_internal.h"
+#include "thread_utils.h"
 
 NTKERNELAPI
 _IRQL_requires_max_(APC_LEVEL)
@@ -92,7 +93,14 @@ volatile LONG   g_DriverUnloading = 0;
 // ============================================================
 
 //
-// ZwQuerySystemInformation -- nao importado automaticamente pelo ntifs.h
+// ZwQuerySystemInformation -- nao importado automaticamente pelo ntifs.h.
+// Resolvida DINAMICAMENTE (MmGetSystemRoutineAddress em DriverEntry, ver
+// HpvResolveOptionalApis) em vez de linkada estaticamente: um import
+// estatico nao resolvido pelo ntoskrnl.exe da build do Windows em uso
+// IMPEDE O DRIVER DE CARREGAR (STATUS_PROCEDURE_NOT_FOUND no "sc start",
+// sem nenhum log, porque o DriverEntry nunca chega a rodar). Resolvendo em
+// runtime, se a API nao existir nessa build o driver ainda carrega
+// normalmente -- so os comandos que dependem dela falham (logado).
 //
 typedef enum _SYSTEM_INFORMATION_CLASS_SHV
 {
@@ -100,13 +108,13 @@ typedef enum _SYSTEM_INFORMATION_CLASS_SHV
     SystemModuleInformation   = 11
 } SYSTEM_INFORMATION_CLASS_SHV;
 
-NTSTATUS
-ZwQuerySystemInformation (
+typedef NTSTATUS (*PFN_ZwQuerySystemInformation)(
     _In_      ULONG  SystemInformationClass,
     _Out_opt_ PVOID  SystemInformation,
     _In_      ULONG  SystemInformationLength,
     _Out_opt_ PULONG ReturnLength
     );
+static PFN_ZwQuerySystemInformation g_pZwQuerySystemInformation = NULL;
 
 typedef struct _SYSTEM_PROCESS_INFORMATION_SHV
 {
@@ -124,7 +132,45 @@ typedef struct _SYSTEM_PROCESS_INFORMATION_SHV
     ULONG          SessionId;
     // NOTA: em Vista+ o campo +104 e UniqueProcessKey, NAO PageDirectoryBase.
     // PageDirectoryBase foi removido de ZwQuerySystemInformation; usar EPROCESS+0x28.
+    ULONG_PTR      UniqueProcessKey;
+    SIZE_T         PeakVirtualSize;
+    SIZE_T         VirtualSize;
+    ULONG          PageFaultCount;
+    SIZE_T         PeakWorkingSetSize;
+    SIZE_T         WorkingSetSize;
+    SIZE_T         QuotaPeakPagedPoolUsage;
+    SIZE_T         QuotaPagedPoolUsage;
+    SIZE_T         QuotaPeakNonPagedPoolUsage;
+    SIZE_T         QuotaNonPagedPoolUsage;
+    SIZE_T         PagefileUsage;
+    SIZE_T         PeakPagefileUsage;
+    SIZE_T         PrivatePageCount;
+    LARGE_INTEGER  ReadOperationCount;
+    LARGE_INTEGER  WriteOperationCount;
+    LARGE_INTEGER  OtherOperationCount;
+    LARGE_INTEGER  ReadTransferCount;
+    LARGE_INTEGER  WriteTransferCount;
+    LARGE_INTEGER  OtherTransferCount;
+    // Threads[NumberOfThreads] (SYSTEM_THREAD_INFORMATION_SHV) comeca logo
+    // apos este struct -- por isso os campos acima (desde UniqueProcessKey)
+    // precisam bater exatamente com o layout real do SO, senao o offset do
+    // array de threads sai errado. Usado por SHV_CMD_LIST_PROCESS_THREADS.
 } SYSTEM_PROCESS_INFORMATION_SHV, *PSYSTEM_PROCESS_INFORMATION_SHV;
+
+typedef struct _SYSTEM_THREAD_INFORMATION_SHV
+{
+    LARGE_INTEGER KernelTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER CreateTime;
+    ULONG         WaitTime;
+    PVOID         StartAddress;
+    CLIENT_ID     ClientId;
+    KPRIORITY     Priority;
+    LONG          BasePriority;
+    ULONG         ContextSwitches;
+    ULONG         ThreadState;
+    ULONG         WaitReason;
+} SYSTEM_THREAD_INFORMATION_SHV, *PSYSTEM_THREAD_INFORMATION_SHV;
 
 // Offset de KPROCESS.DirectoryTableBase dentro de EPROCESS no x64 Win10.
 // EPROCESS comeca com KPROCESS; Pcb.DirectoryTableBase esta em +0x28.
@@ -146,6 +192,267 @@ typedef struct _SYSTEM_PROCESS_INFORMATION_SHV
 // no WinDbg: `dt nt!_EPROCESS UserDirectoryTableBase` (ou ache o offset via
 // `dt nt!_EPROCESS` inteiro) e ajuste esta constante.
 #define EPROCESS_USER_DIR_TABLE_BASE_OFFSET 0x388
+
+//
+// PEB / PEB_LDR_DATA / LDR_DATA_TABLE_ENTRY (usermode) -- layout x64 estavel
+// desde Windows Vista, usados so pelos campos do inicio (Ldr dentro do PEB,
+// InLoadOrderModuleList dentro do PEB_LDR_DATA, DllBase/SizeOfImage/
+// BaseDllName dentro do LDR_DATA_TABLE_ENTRY). Nao declarados nos headers
+// publicos da WDK (PsGetProcessPeb retorna PPEB opaco) -- usados por
+// SHV_CMD_LIST_PROCESS_MODULES pra enumerar os modulos (EXE+DLLs) de um
+// processo via kernel (lendo a propria PEB do processo, apos attach), em vez
+// de depender de handle usermode (CreateToolhelp32Snapshot/OpenProcess), que
+// falha contra processos protegidos (PPL).
+//
+typedef struct _HPV_LDR_DATA_TABLE_ENTRY_USER
+{
+    LIST_ENTRY     InLoadOrderLinks;
+    LIST_ENTRY     InMemoryOrderLinks;
+    LIST_ENTRY     InInitializationOrderLinks;
+    PVOID          DllBase;
+    PVOID          EntryPoint;
+    ULONG          SizeOfImage;
+    UNICODE_STRING FullDllName;
+    UNICODE_STRING BaseDllName;
+} HPV_LDR_DATA_TABLE_ENTRY_USER, *PHPV_LDR_DATA_TABLE_ENTRY_USER;
+
+typedef struct _HPV_PEB_LDR_DATA
+{
+    ULONG      Length;
+    BOOLEAN    Initialized;
+    UCHAR      Padding[3];
+    PVOID      SsHandle;
+    LIST_ENTRY InLoadOrderModuleList;
+    LIST_ENTRY InMemoryOrderModuleList;
+    LIST_ENTRY InInitializationOrderModuleList;
+} HPV_PEB_LDR_DATA, *PHPV_PEB_LDR_DATA;
+
+typedef struct _HPV_PEB
+{
+    BOOLEAN           InheritedAddressSpace;
+    BOOLEAN           ReadImageFileExecOptions;
+    BOOLEAN           BeingDebugged;
+    BOOLEAN           BitField;
+    UCHAR             Padding0[4];
+    PVOID             Mutant;
+    PVOID             ImageBaseAddress;
+    PHPV_PEB_LDR_DATA Ldr;
+} HPV_PEB, *PHPV_PEB;
+
+// PsGetProcessPeb -- exportada pelo ntoskrnl desde Vista, mas nao declarada
+// nos headers publicos da WDK (retorna PPEB opaco); retorno tratado aqui como
+// PVOID e convertido pra HPV_PEB* acima. Resolvida dinamicamente (mesmo
+// motivo de ZwQuerySystemInformation acima).
+typedef PVOID (*PFN_PsGetProcessPeb)(_In_ PEPROCESS Process);
+static PFN_PsGetProcessPeb g_pPsGetProcessPeb = NULL;
+
+//
+// Equivalentes 32-bit das structs acima, usados SO pra processos WOW64 (app
+// 32-bit rodando em Windows x64) -- a PEB NATIVA (64-bit, PsGetProcessPeb)
+// de um processo WOW64 tem Ldr vazio/nao-representativo; os modulos de
+// verdade (todas as DLLs 32-bit carregadas) ficam na PEB32, achada via
+// PsGetProcessWow64Process. Ponteiros aqui sao ULONG (32-bit) porque e como
+// o layout da PEB32 realmente e (WOW64 ainda roda no mesmo espaco de
+// enderecamento do processo, mapeado abaixo de 4GB, entao zero-extend de
+// ULONG pra UINT64/ponteiro da um endereco valido).
+//
+typedef struct _HPV_LIST_ENTRY32
+{
+    ULONG Flink;
+    ULONG Blink;
+} HPV_LIST_ENTRY32;
+
+typedef struct _HPV_UNICODE_STRING32
+{
+    USHORT Length;
+    USHORT MaximumLength;
+    ULONG  Buffer;
+} HPV_UNICODE_STRING32;
+
+typedef struct _HPV_LDR_DATA_TABLE_ENTRY32
+{
+    HPV_LIST_ENTRY32     InLoadOrderLinks;
+    HPV_LIST_ENTRY32     InMemoryOrderLinks;
+    HPV_LIST_ENTRY32     InInitializationOrderLinks;
+    ULONG                DllBase;
+    ULONG                EntryPoint;
+    ULONG                SizeOfImage;
+    HPV_UNICODE_STRING32 FullDllName;
+    HPV_UNICODE_STRING32 BaseDllName;
+} HPV_LDR_DATA_TABLE_ENTRY32, *PHPV_LDR_DATA_TABLE_ENTRY32;
+
+typedef struct _HPV_PEB_LDR_DATA32
+{
+    ULONG            Length;
+    UCHAR            Initialized;
+    UCHAR            Padding[3];
+    ULONG            SsHandle;
+    HPV_LIST_ENTRY32 InLoadOrderModuleList;
+    HPV_LIST_ENTRY32 InMemoryOrderModuleList;
+    HPV_LIST_ENTRY32 InInitializationOrderModuleList;
+} HPV_PEB_LDR_DATA32, *PHPV_PEB_LDR_DATA32;
+
+typedef struct _HPV_PEB32
+{
+    UCHAR InheritedAddressSpace;
+    UCHAR ReadImageFileExecOptions;
+    UCHAR BeingDebugged;
+    UCHAR BitField;
+    ULONG Mutant;
+    ULONG ImageBaseAddress;
+    ULONG Ldr;              // ponteiro (32-bit) pra HPV_PEB_LDR_DATA32
+} HPV_PEB32, *PHPV_PEB32;
+
+// PsGetProcessWow64Process -- exportada pelo ntoskrnl, retorna a PEB32 (NULL
+// se o processo for nativo x64, nao-NULL se for WOW64). Igual PsGetProcessPeb,
+// nao declarada nos headers publicos. Resolvida dinamicamente.
+typedef PVOID (*PFN_PsGetProcessWow64Process)(_In_ PEPROCESS Process);
+static PFN_PsGetProcessWow64Process g_pPsGetProcessWow64Process = NULL;
+
+//
+// ZwQueryVirtualMemory (e MEMORY_BASIC_INFORMATION/MemoryBasicInformation) JA
+// sao declaradas por ntifs.h, diferente das outras APIs hand-declared neste
+// arquivo. Usada por SHV_CMD_LIST_PROCESS_MEMORY com o pseudo-handle
+// HPV_CURRENT_PROCESS (-1) ENQUANTO anexado (KeStackAttachProcess) ao
+// processo alvo: pseudo-handle nao passa por nenhum access check de handle,
+// entao funciona mesmo contra processos protegidos (PPL) -- diferente de
+// VirtualQueryEx em usermode, que precisa de um HANDLE de verdade via
+// OpenProcess (negado pro PPL).
+//
+#define HPV_CURRENT_PROCESS ((HANDLE)(LONG_PTR)-1)
+
+//
+// ZwSuspendThread/ZwResumeThread e PsGetContextThread -- exportadas pelo
+// ntoskrnl (verificado via dumpbin /exports no .lib do WDK), mas nao
+// declaradas nos headers publicos (igual PsGetProcessPeb/PsGetProcessWow64Process
+// acima). Usadas por SHV_CMD_THREAD_SUSPEND/RESUME/GET_CONTEXT: o handle da
+// thread e aberto via ObOpenObjectByPointer(..., KernelMode, ...) a partir do
+// PETHREAD achado por PsLookupThreadByThreadId -- caminho kernel-mode, sem
+// handle usermode (OpenThread), entao funciona mesmo contra processos
+// protegidos (PPL). ZwTerminateThread NAO e exportada pro kernel (verificado
+// na mesma lista) -- terminar uma thread arbitraria fica pra depois (precisa
+// de outra tecnica, tipo APC). Resolvidas dinamicamente.
+//
+typedef NTSTATUS (*PFN_ZwSuspendThread)(
+    _In_      HANDLE ThreadHandle,
+    _Out_opt_ PULONG PreviousSuspendCount
+    );
+typedef NTSTATUS (*PFN_ZwResumeThread)(
+    _In_      HANDLE ThreadHandle,
+    _Out_opt_ PULONG PreviousSuspendCount
+    );
+typedef NTSTATUS (*PFN_PsGetContextThread)(
+    _In_    PETHREAD Thread,
+    _Inout_ PCONTEXT ThreadContext,
+    _In_    KPROCESSOR_MODE Mode
+    );
+static PFN_ZwSuspendThread    g_pZwSuspendThread    = NULL;
+static PFN_ZwResumeThread     g_pZwResumeThread     = NULL;
+static PFN_PsGetContextThread g_pPsGetContextThread = NULL;
+
+// PsSuspendProcess/PsResumeProcess -- unica alternativa de "freeze" que
+// sobrou depois de checar o .lib do WDK (nao existe PsSuspendThread/
+// PsResumeThread nem KeSuspendThread/KeResumeThread com esses nomes;
+// ZwSuspendThread/ZwResumeThread existem no .lib mas nao foram encontradas
+// na build real da VM de teste, ver [[fixes]]). Suspende/resume o PROCESSO
+// INTEIRO (todas as threads), nao so uma -- por isso so e usada como
+// fallback de ULTIMO RECURSO em GET_CONTEXT (congela por um instante curtinho
+// so pra ler o contexto de forma confiavel), nunca como substituto real de
+// SHV_CMD_THREAD_SUSPEND/RESUME (que suspenderiam uma thread so -- suspender
+// o processo inteiro ali seria um efeito colateral inesperado pro usuario).
+typedef NTSTATUS (*PFN_PsSuspendProcess)(_In_ PEPROCESS Process);
+typedef NTSTATUS (*PFN_PsResumeProcess)(_In_ PEPROCESS Process);
+static PFN_PsSuspendProcess g_pPsSuspendProcess = NULL;
+static PFN_PsResumeProcess  g_pPsResumeProcess  = NULL;
+
+//
+// PsSuspendThread/PsResumeThread (as funcoes INTERNAS de verdade, nao os
+// wrappers Zw*) -- nao exportadas por nome (confirmado: nao aparecem no
+// .lib do WDK como export, por isso MmGetSystemRoutineAddress nunca ia
+// achar), mas existem no binario e sao achaveis por pattern scan, igual
+// PspExitProcess em hpv_policy_hooks.c. Assinaturas fornecidas pelo usuario
+// (confirmadas via disassembly contra o ntoskrnl.exe real da VM de teste).
+// Tomam o PETHREAD diretamente (sem handle nenhum), por isso sao preferidas
+// sobre ZwSuspendThread/ZwResumeThread (que precisam de handle E nao foram
+// encontradas nessa build via MmGetSystemRoutineAddress -- ver [[fixes]]).
+//
+typedef NTSTATUS (*PFN_PsSuspendThread)(_In_ PETHREAD Thread, _Out_opt_ PULONG PreviousSuspendCount);
+typedef NTSTATUS (*PFN_PsResumeThread)(_In_ PETHREAD Thread, _Out_opt_ PULONG PreviousSuspendCount);
+static PFN_PsSuspendThread g_pPsSuspendThread = NULL;
+static PFN_PsResumeThread  g_pPsResumeThread  = NULL;
+
+static const UINT8 kPsSuspendThreadPattern[] =
+    "\x48\x89\x54\x24\x00\x48\x89\x4C\x24\x00\x53\x56\x57\x41\x56\x41\x57";
+static const CHAR* kPsSuspendThreadMask = "xxxx?xxxx?xxxxxxx";
+
+static const UINT8 kPsResumeThreadPattern[] =
+    "\x48\x89\x5C\x24\x00\x48\x89\x74\x24\x00\x57\x48\x83\xEC\x00\x48\x8B\xDA\x48\x8B\xF9\xE8\x00\x00\x00\x00\x65\x48\x8B\x14\x25";
+static const CHAR* kPsResumeThreadMask = "xxxx?xxxx?xxxx?xxxxxxx????xxxxx";
+
+//
+// Resolve as APIs por nome (nao garantidas em todo build do Windows) via
+// MmGetSystemRoutineAddress -- chamada uma vez em DriverEntry, loga cada
+// uma (ok ou "nao encontrada nesta build"). Ponteiro NULL = comando que
+// depende dela retorna SHVD_STATUS_ERR_UNSUPPORTED em vez de travar/crashar.
+// No final, tambem tenta achar PsSuspendThread/PsResumeThread por pattern
+// scan (nao-exportadas, nao resolviveis por nome).
+//
+static VOID
+HpvResolveOptionalApis (
+    VOID
+    )
+{
+    struct {
+        PCWSTR  Name;
+        PVOID*  Target;
+    } apis[] = {
+        { L"ZwQuerySystemInformation", (PVOID*)&g_pZwQuerySystemInformation },
+        { L"PsGetProcessPeb",          (PVOID*)&g_pPsGetProcessPeb          },
+        { L"PsGetProcessWow64Process", (PVOID*)&g_pPsGetProcessWow64Process },
+        { L"ZwSuspendThread",          (PVOID*)&g_pZwSuspendThread          },
+        { L"ZwResumeThread",           (PVOID*)&g_pZwResumeThread           },
+        { L"PsGetContextThread",       (PVOID*)&g_pPsGetContextThread       },
+        { L"PsSuspendProcess",         (PVOID*)&g_pPsSuspendProcess         },
+        { L"PsResumeProcess",          (PVOID*)&g_pPsResumeProcess          },
+    };
+    ULONG i;
+
+    for (i = 0; i < RTL_NUMBER_OF(apis); i++)
+    {
+        UNICODE_STRING name;
+        RtlInitUnicodeString(&name, apis[i].Name);
+        *apis[i].Target = MmGetSystemRoutineAddress(&name);
+
+        ShvLog("[SHV] API opcional %ws: %s\n", apis[i].Name,
+               *apis[i].Target ? "OK" : "NAO ENCONTRADA nesta build do Windows");
+    }
+
+    {
+        UINT64 modBase = 0;
+        SIZE_T modSize = 0;
+
+        if (!HpvFindNtoskrnlModule(&modBase, &modSize))
+        {
+            ShvLog("[SHV] PsSuspendThread/PsResumeThread: nao achou o modulo ntoskrnl.exe (pattern scan pulado)\n");
+        }
+        else
+        {
+            UINT64 va;
+
+            va = HpvFindPattern(modBase, modSize, kPsSuspendThreadPattern, kPsSuspendThreadMask);
+            g_pPsSuspendThread = (PFN_PsSuspendThread)(ULONG_PTR)va;
+            ShvLog("[SHV] API opcional PsSuspendThread (pattern scan): %s\n",
+                   va ? "OK" : "NAO ENCONTRADA nesta build do Windows");
+            if (va) ShvLog("[SHV]   PsSuspendThread va=%p\n", (PVOID)(ULONG_PTR)va);
+
+            va = HpvFindPattern(modBase, modSize, kPsResumeThreadPattern, kPsResumeThreadMask);
+            g_pPsResumeThread = (PFN_PsResumeThread)(ULONG_PTR)va;
+            ShvLog("[SHV] API opcional PsResumeThread (pattern scan): %s\n",
+                   va ? "OK" : "NAO ENCONTRADA nesta build do Windows");
+            if (va) ShvLog("[SHV]   PsResumeThread va=%p\n", (PVOID)(ULONG_PTR)va);
+        }
+    }
+}
 
 typedef struct _RTL_PROCESS_MODULE_INFORMATION
 {
@@ -218,6 +525,49 @@ VOID ShvHookReleaseMdls(VOID)
             g_MdlTable[i].FirstPa = 0;
         }
     }
+}
+
+//
+// Chamado pelo hook de PspExitProcess (hpv_policy_hooks.c) quando um processo
+// com EPT hook(s) ativo(s) esta terminando. Remove da tabela global (shvvmxhv.c)
+// todo hook pertencente a esse PID e libera o MDL/paginas travadas de cada um
+// (ShvHookTakeMdl + MmUnlockPages + IoFreeMdl) ANTES do EPROCESS ser destruido
+// -- sem isso, MmProbeAndLockPages (SHV_CMD_HOOK_EPT) deixa paginas travadas
+// quando o processo some sem passar por SHV_CMD_UNHOOK_EPT, causando o
+// bugcheck PROCESS_HAS_LOCKED_PAGES (0xCB).
+//
+VOID
+ShvCleanupExitedProcess (
+    _In_ UINT64 Pid
+    )
+{
+    UINT64 removedPhys[SHV_HOOK_MAX_ENTRIES];
+    UINT32 count, i;
+
+    if (Pid == 0)
+        return;
+
+    count = ShvHookRemoveByPid(Pid, removedPhys, SHV_HOOK_MAX_ENTRIES);
+    if (count == 0)
+        return;
+
+    for (i = 0; i < count; i++)
+    {
+        PMDL mdl = ShvHookTakeMdl(removedPhys[i]);
+        if (mdl != NULL)
+        {
+            MmUnlockPages(mdl);
+            IoFreeMdl(mdl);
+        }
+    }
+
+    // Garante que todo CPU para de tentar restringir essas paginas (mesma
+    // razao do force-sync em SHV_CMD_HOOK_EPT/UNHOOK_EPT -- ver fix "leitura
+    // nao capturada" em memory/fixes.md).
+    ShvOsForceAllCpuVmExit();
+
+    ShvLog("[POLICY] PspExitProcess: PID=%llu terminou com %u EPT hook(s) ativo(s) -- removidos/MDL liberado automaticamente\n",
+           Pid, count);
 }
 
 NTSTATUS
@@ -590,6 +940,12 @@ ShvDispatchIoctl (
         NTSTATUS qStatus = STATUS_UNSUCCESSFUL;
         UINT32   tries;
 
+        if (g_pZwQuerySystemInformation == NULL)
+        {
+            resp->Status = SHVD_STATUS_ERR_UNSUPPORTED;
+            break;
+        }
+
         for (tries = 0; tries < 4; tries++)
         {
             if (sysInfo) ExFreePoolWithTag(sysInfo, 'vhSP');
@@ -599,8 +955,8 @@ ShvDispatchIoctl (
                 resp->Status = SHVD_STATUS_ERR_NOMEM;
                 break;
             }
-            qStatus = ZwQuerySystemInformation(SystemProcessInformation,
-                                               sysInfo, bufSize, NULL);
+            qStatus = g_pZwQuerySystemInformation(SystemProcessInformation,
+                                                  sysInfo, bufSize, NULL);
             if (qStatus != STATUS_INFO_LENGTH_MISMATCH)
                 break;
             bufSize *= 2;
@@ -670,7 +1026,15 @@ ShvDispatchIoctl (
     case SHV_CMD_LIST_MODULES:
     {
         ULONG  bufSize = 0x20000;
-        PVOID  sysInfo = ExAllocatePoolWithTag(PagedPool, bufSize, 'vhSM');
+        PVOID  sysInfo;
+
+        if (g_pZwQuerySystemInformation == NULL)
+        {
+            resp->Status = SHVD_STATUS_ERR_UNSUPPORTED;
+            break;
+        }
+
+        sysInfo = ExAllocatePoolWithTag(PagedPool, bufSize, 'vhSM');
         if (sysInfo == NULL)
         {
             resp->Status = SHVD_STATUS_ERR_NOMEM;
@@ -678,8 +1042,8 @@ ShvDispatchIoctl (
         }
 
         {
-            NTSTATUS qStatus = ZwQuerySystemInformation(SystemModuleInformation,
-                                                        sysInfo, bufSize, NULL);
+            NTSTATUS qStatus = g_pZwQuerySystemInformation(SystemModuleInformation,
+                                                           sysInfo, bufSize, NULL);
             if (!NT_SUCCESS(qStatus))
             {
                 ExFreePoolWithTag(sysInfo, 'vhSM');
@@ -717,6 +1081,630 @@ ShvDispatchIoctl (
         }
 
         ExFreePoolWithTag(sysInfo, 'vhSM');
+        break;
+    }
+
+    case SHV_CMD_LIST_PROCESS_MODULES:
+    {
+        UINT64     pid = req.ListProcModules.Pid;
+        PEPROCESS  process;
+        KAPC_STATE apcState;
+
+        if (pid == 0)
+        {
+            resp->Status = SHVD_STATUS_ERR_INVALID;
+            break;
+        }
+
+        if (g_pPsGetProcessPeb == NULL || g_pPsGetProcessWow64Process == NULL)
+        {
+            resp->Status = SHVD_STATUS_ERR_UNSUPPORTED;
+            break;
+        }
+
+        if (!NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process)))
+        {
+            resp->Status = SHVD_STATUS_ERR_ACCESS;
+            break;
+        }
+
+        // Le a PEB/Ldr do PROPRIO processo alvo (kernel-mode, apos attach) em
+        // vez de abrir handle via usermode (CreateToolhelp32Snapshot/
+        // OpenProcess) -- funciona mesmo contra processos protegidos (PPL),
+        // que negam PROCESS_QUERY_INFORMATION pra chamadores usermode.
+        KeStackAttachProcess(process, &apcState);
+
+        __try
+        {
+            // Processo WOW64 (app 32-bit em Windows x64): a PEB NATIVA
+            // (PsGetProcessPeb) tem Ldr vazio/nao-representativo pros modulos
+            // de verdade -- as DLLs 32-bit de verdade estao na PEB32, achada
+            // via PsGetProcessWow64Process. Tenta esse caminho primeiro.
+            PVOID wow64Peb = g_pPsGetProcessWow64Process(process);
+
+            if (wow64Peb != NULL)
+            {
+                PHPV_PEB32 peb32 = (PHPV_PEB32)wow64Peb;
+
+                if (peb32->Ldr == 0)
+                {
+                    resp->Status = SHVD_STATUS_ERR_ACCESS;
+                }
+                else
+                {
+                    PHPV_PEB_LDR_DATA32 ldr32   = (PHPV_PEB_LDR_DATA32)(ULONG_PTR)peb32->Ldr;
+                    ULONG               headVa  = peb32->Ldr +
+                                                    (ULONG)FIELD_OFFSET(HPV_PEB_LDR_DATA32, InLoadOrderModuleList);
+                    ULONG               curVa   = ldr32->InLoadOrderModuleList.Flink;
+                    UINT32              count      = 0;
+                    UINT32              maxEntries = SHV_MAX_READ_SIZE / sizeof(SHV_MODULE_ENTRY);
+
+                    while (curVa != headVa && curVa != 0 && count < maxEntries)
+                    {
+                        PHPV_LDR_DATA_TABLE_ENTRY32 mod32 = (PHPV_LDR_DATA_TABLE_ENTRY32)(ULONG_PTR)curVa;
+                        PSHV_MODULE_ENTRY            me    = &resp->Modules[count];
+
+                        RtlZeroMemory(me, sizeof(*me));
+                        me->Base = (unsigned long long)mod32->DllBase;
+                        me->Size = (unsigned long long)mod32->SizeOfImage;
+
+                        if (mod32->BaseDllName.Buffer != 0 && mod32->BaseDllName.Length > 0)
+                        {
+                            PWCHAR nameBuf   = (PWCHAR)(ULONG_PTR)mod32->BaseDllName.Buffer;
+                            ULONG  nameChars = mod32->BaseDllName.Length / sizeof(WCHAR);
+                            ULONG  i;
+                            if (nameChars >= SHV_MOD_NAME_LEN) nameChars = SHV_MOD_NAME_LEN - 1;
+                            for (i = 0; i < nameChars; i++)
+                                me->Name[i] = (char)nameBuf[i];
+                        }
+
+                        count++;
+                        curVa = mod32->InLoadOrderLinks.Flink;
+                    }
+
+                    resp->Count  = count;
+                    resp->Status = SHVD_STATUS_OK;
+                }
+            }
+            else
+            {
+                // Processo nativo x64: PEB normal.
+                PHPV_PEB peb = (PHPV_PEB)g_pPsGetProcessPeb(process);
+
+                if (peb == NULL || peb->Ldr == NULL)
+                {
+                    resp->Status = SHVD_STATUS_ERR_ACCESS;
+                }
+                else
+                {
+                    PHPV_PEB_LDR_DATA ldr      = peb->Ldr;
+                    PLIST_ENTRY       listHead = &ldr->InLoadOrderModuleList;
+                    PLIST_ENTRY        entry;
+                    UINT32             count      = 0;
+                    UINT32             maxEntries = SHV_MAX_READ_SIZE / sizeof(SHV_MODULE_ENTRY);
+
+                    for (entry = listHead->Flink;
+                         entry != listHead && count < maxEntries;
+                         entry = entry->Flink)
+                    {
+                        PHPV_LDR_DATA_TABLE_ENTRY_USER mod =
+                            CONTAINING_RECORD(entry, HPV_LDR_DATA_TABLE_ENTRY_USER, InLoadOrderLinks);
+                        PSHV_MODULE_ENTRY me = &resp->Modules[count];
+
+                        RtlZeroMemory(me, sizeof(*me));
+                        me->Base = (unsigned long long)(ULONG_PTR)mod->DllBase;
+                        me->Size = (unsigned long long)mod->SizeOfImage;
+
+                        if (mod->BaseDllName.Buffer != NULL && mod->BaseDllName.Length > 0)
+                        {
+                            ULONG nameChars = mod->BaseDllName.Length / sizeof(WCHAR);
+                            ULONG i;
+                            if (nameChars >= SHV_MOD_NAME_LEN) nameChars = SHV_MOD_NAME_LEN - 1;
+                            for (i = 0; i < nameChars; i++)
+                                me->Name[i] = (char)mod->BaseDllName.Buffer[i];
+                        }
+
+                        count++;
+                    }
+
+                    resp->Count  = count;
+                    resp->Status = SHVD_STATUS_OK;
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            resp->Status = SHVD_STATUS_ERR_ACCESS;
+        }
+
+        KeUnstackDetachProcess(&apcState);
+        ObDereferenceObject(process);
+        break;
+    }
+
+    case SHV_CMD_LIST_PROCESS_THREADS:
+    {
+        UINT64   pid     = req.ProcFilter.Pid;
+        ULONG    bufSize = 0x80000;
+        PVOID    sysInfo = NULL;
+        NTSTATUS qStatus = STATUS_UNSUCCESSFUL;
+        UINT32   tries;
+
+        if (pid == 0)
+        {
+            resp->Status = SHVD_STATUS_ERR_INVALID;
+            break;
+        }
+
+        if (g_pZwQuerySystemInformation == NULL)
+        {
+            resp->Status = SHVD_STATUS_ERR_UNSUPPORTED;
+            break;
+        }
+
+        // Mesma tecnica de SHV_CMD_LIST_PROCS (ZwQuerySystemInformation),
+        // filtrando pelo PID -- nao precisa de handle pro processo, entao
+        // funciona mesmo contra processos protegidos (PPL). O array de
+        // threads (SYSTEM_THREAD_INFORMATION_SHV[NumberOfThreads]) vem logo
+        // depois de cada SYSTEM_PROCESS_INFORMATION_SHV na mesma alocacao.
+        for (tries = 0; tries < 4; tries++)
+        {
+            if (sysInfo) ExFreePoolWithTag(sysInfo, 'vhST');
+            sysInfo = ExAllocatePoolWithTag(PagedPool, bufSize, 'vhST');
+            if (sysInfo == NULL)
+            {
+                resp->Status = SHVD_STATUS_ERR_NOMEM;
+                break;
+            }
+            qStatus = g_pZwQuerySystemInformation(SystemProcessInformation,
+                                                  sysInfo, bufSize, NULL);
+            if (qStatus != STATUS_INFO_LENGTH_MISMATCH)
+                break;
+            bufSize *= 2;
+        }
+
+        if (sysInfo == NULL)
+            break;
+
+        if (!NT_SUCCESS(qStatus))
+        {
+            ExFreePoolWithTag(sysInfo, 'vhST');
+            resp->Status = SHVD_STATUS_ERR_ACCESS;
+            break;
+        }
+
+        {
+            PSYSTEM_PROCESS_INFORMATION_SHV entry =
+                (PSYSTEM_PROCESS_INFORMATION_SHV)sysInfo;
+            BOOLEAN found = FALSE;
+
+            for (;;)
+            {
+                if ((UINT64)(ULONG_PTR)entry->UniqueProcessId == pid)
+                {
+                    PSYSTEM_THREAD_INFORMATION_SHV threads =
+                        (PSYSTEM_THREAD_INFORMATION_SHV)
+                        ((PUCHAR)entry + sizeof(SYSTEM_PROCESS_INFORMATION_SHV));
+                    UINT32 count      = 0;
+                    UINT32 maxEntries = SHV_MAX_READ_SIZE / sizeof(SHV_THREAD_ENTRY);
+                    ULONG  i;
+
+                    for (i = 0; i < entry->NumberOfThreads && count < maxEntries; i++)
+                    {
+                        PSHV_THREAD_ENTRY te = &resp->Threads[count];
+                        te->Tid          = (unsigned long long)(ULONG_PTR)threads[i].ClientId.UniqueThread;
+                        te->StartAddress = (unsigned long long)(ULONG_PTR)threads[i].StartAddress;
+
+                        // Endereco do objeto PETHREAD no kernel, so pra
+                        // exibicao (igual coluna "Object" do Process Hacker)
+                        // -- SYSTEM_THREAD_INFORMATION nao traz o ponteiro
+                        // direto, resolve via PsLookupThreadByThreadId e
+                        // solta a referencia logo em seguida (so queremos o
+                        // valor do endereco, nao manter a thread referenciada).
+                        te->Object = 0;
+                        {
+                            PETHREAD teThread;
+                            if (NT_SUCCESS(PsLookupThreadByThreadId(
+                                    threads[i].ClientId.UniqueThread, &teThread)))
+                            {
+                                te->Object = (unsigned long long)(ULONG_PTR)teThread;
+                                ObDereferenceObject(teThread);
+                            }
+                        }
+
+                        count++;
+                    }
+
+                    resp->Count  = count;
+                    resp->Status = SHVD_STATUS_OK;
+                    found = TRUE;
+                    break;
+                }
+
+                if (entry->NextEntryOffset == 0)
+                    break;
+                entry = (PSYSTEM_PROCESS_INFORMATION_SHV)
+                        ((ULONG_PTR)entry + entry->NextEntryOffset);
+            }
+
+            if (!found)
+                resp->Status = SHVD_STATUS_ERR_NOTFOUND;
+        }
+
+        ExFreePoolWithTag(sysInfo, 'vhST');
+        break;
+    }
+
+    case SHV_CMD_LIST_PROCESS_MEMORY:
+    {
+        UINT64     pid       = req.ListProcMemory.Pid;
+        UINT64     startAddr = req.ListProcMemory.StartAddr;
+        PEPROCESS  process;
+        KAPC_STATE apcState;
+
+        if (pid == 0)
+        {
+            resp->Status = SHVD_STATUS_ERR_INVALID;
+            break;
+        }
+
+        if (!NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process)))
+        {
+            resp->Status = SHVD_STATUS_ERR_ACCESS;
+            break;
+        }
+
+        // Anexa no processo alvo e consulta com o pseudo-handle "processo
+        // atual" (-1) -- sem HANDLE de verdade, sem access check, funciona
+        // mesmo contra processos protegidos (PPL). Mesmo loop sequencial de
+        // VirtualQueryEx em usermode, so que de dentro do kernel.
+        KeStackAttachProcess(process, &apcState);
+
+        __try
+        {
+            MEMORY_BASIC_INFORMATION mbi;
+            UINT64 addr       = startAddr; // continuacao: GUI reenvia o Base+Size
+                                            // da ultima regiao recebida quando o
+                                            // buffer enche (ver ShvBackend::
+                                            // ListProcessMemory) -- o buffer do
+                                            // IOCTL (SHV_MAX_READ_SIZE) so cabe
+                                            // ~585 entradas de uma vez, bem menos
+                                            // que o total de VADs de processos
+                                            // "grandes" (ver [[fixes]]).
+            UINT32 count      = 0;
+            UINT32 maxEntries = SHV_MAX_READ_SIZE / sizeof(SHV_MEMREGION_ENTRY);
+
+            while (count < maxEntries)
+            {
+                SIZE_T   retLen  = 0;
+                NTSTATUS qStatus = ZwQueryVirtualMemory(
+                    HPV_CURRENT_PROCESS, (PVOID)(ULONG_PTR)addr, MemoryBasicInformation,
+                    &mbi, sizeof(mbi), &retLen);
+                if (!NT_SUCCESS(qStatus))
+                    break;
+
+                {
+                    PSHV_MEMREGION_ENTRY re = &resp->MemRegions[count];
+                    re->Base    = (unsigned long long)(ULONG_PTR)mbi.BaseAddress;
+                    re->Size    = (unsigned long long)mbi.RegionSize;
+                    re->Protect = mbi.Protect ? mbi.Protect : mbi.AllocationProtect;
+                    re->State   = mbi.State;
+                    re->Type    = mbi.Type;
+                    count++;
+                }
+
+                {
+                    UINT64 next = (UINT64)(ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
+                    if (next <= addr) break; // nao avancou -- evita loop infinito
+                    addr = next;
+                }
+            }
+
+            resp->Count  = count;
+            resp->Status = SHVD_STATUS_OK;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            resp->Status = SHVD_STATUS_ERR_ACCESS;
+        }
+
+        KeUnstackDetachProcess(&apcState);
+        ObDereferenceObject(process);
+        break;
+    }
+
+    case SHV_CMD_THREAD_SUSPEND:
+    case SHV_CMD_THREAD_RESUME:
+    {
+        UINT64   tid      = req.ThreadCtl.Tid;
+        PETHREAD thread   = NULL;
+        HANDLE   hThread  = NULL;
+        NTSTATUS tcStatus;
+
+        if (tid == 0)
+        {
+            resp->Status = SHVD_STATUS_ERR_INVALID;
+            break;
+        }
+
+        // Preferencia: PsSuspendThread/PsResumeThread achadas por pattern
+        // scan (pegam o PETHREAD direto, sem handle nenhum) -- so cai pro
+        // par Zw* (que precisa de handle, e nao foi encontrado nessa build
+        // via MmGetSystemRoutineAddress de qualquer forma, ver [[fixes]]) se
+        // o pattern scan nao achou.
+        if (g_pPsSuspendThread != NULL && g_pPsResumeThread != NULL)
+        {
+            tcStatus = PsLookupThreadByThreadId((HANDLE)(ULONG_PTR)tid, &thread);
+            if (!NT_SUCCESS(tcStatus))
+            {
+                resp->Status = SHVD_STATUS_ERR_ACCESS;
+                break;
+            }
+
+            tcStatus = (req.Command == SHV_CMD_THREAD_SUSPEND)
+                ? g_pPsSuspendThread(thread, NULL)
+                : g_pPsResumeThread(thread, NULL);
+
+            ObDereferenceObject(thread);
+            resp->Status = NT_SUCCESS(tcStatus) ? SHVD_STATUS_OK : SHVD_STATUS_ERR_ACCESS;
+            break;
+        }
+
+        if (g_pZwSuspendThread == NULL || g_pZwResumeThread == NULL)
+        {
+            resp->Status = SHVD_STATUS_ERR_UNSUPPORTED;
+            break;
+        }
+
+        tcStatus = PsLookupThreadByThreadId((HANDLE)(ULONG_PTR)tid, &thread);
+        if (!NT_SUCCESS(tcStatus))
+        {
+            resp->Status = SHVD_STATUS_ERR_ACCESS;
+            break;
+        }
+
+        // Handle kernel-mode (sem OpenThread usermode) -- funciona mesmo
+        // contra processos protegidos (PPL).
+        tcStatus = ObOpenObjectByPointer(thread, OBJ_KERNEL_HANDLE, NULL,
+                                         THREAD_SUSPEND_RESUME, NULL,
+                                         KernelMode, &hThread);
+        if (NT_SUCCESS(tcStatus))
+        {
+            tcStatus = (req.Command == SHV_CMD_THREAD_SUSPEND)
+                ? g_pZwSuspendThread(hThread, NULL)
+                : g_pZwResumeThread(hThread, NULL);
+            ZwClose(hThread);
+        }
+
+        ObDereferenceObject(thread);
+        resp->Status = NT_SUCCESS(tcStatus) ? SHVD_STATUS_OK : SHVD_STATUS_ERR_ACCESS;
+        break;
+    }
+
+    case SHV_CMD_THREAD_GET_CONTEXT:
+    {
+        UINT64    tid               = req.ThreadCtl.Tid;
+        PETHREAD  thread            = NULL;
+        HANDLE    hThread           = NULL;
+        PEPROCESS procSuspended     = NULL;
+        BOOLEAN   psThreadSuspended = FALSE;
+        BOOLEAN   canSuspend;
+        NTSTATUS  gcStatus;
+
+        if (tid == 0)
+        {
+            resp->Status = SHVD_STATUS_ERR_INVALID;
+            break;
+        }
+
+        // So PsGetContextThread e obrigatoria. As demais sao best-effort,
+        // em ordem de preferencia -- cada uma so "congela" o alvo com um
+        // efeito colateral maior (ou exigencia maior) que a anterior:
+        //   1) PsSuspendThread/PsResumeThread (pattern scan): so a thread
+        //      alvo, sem handle nenhum -- a melhor opcao quando achada.
+        //   2) ZwSuspendThread/ZwResumeThread: so a thread alvo, mas precisa
+        //      de handle (ObOpenObjectByPointer).
+        //   3) PsSuspendProcess/PsResumeProcess: o PROCESSO INTEIRO (todas
+        //      as threads) -- so usado aqui, por um instante curtinho, como
+        //      ultimo recurso pra ler o contexto de forma confiavel. NUNCA
+        //      usado pros comandos SHV_CMD_THREAD_SUSPEND/RESUME dedicados
+        //      (la seria um efeito colateral inesperado: o usuario pediu
+        //      suspender uma thread, nao o processo inteiro).
+        //   4) Nenhuma das tres: le sem congelar nada, em loop com retry
+        //      (PsGetContextThread so e seguro quando a thread NAO esta
+        //      rodando no instante exato da chamada -- ver [[fixes]]).
+        if (g_pPsGetContextThread == NULL)
+        {
+            resp->Status = SHVD_STATUS_ERR_UNSUPPORTED;
+            break;
+        }
+        canSuspend = (g_pZwSuspendThread != NULL && g_pZwResumeThread != NULL);
+
+        gcStatus = PsLookupThreadByThreadId((HANDLE)(ULONG_PTR)tid, &thread);
+        if (!NT_SUCCESS(gcStatus))
+        {
+            resp->Status = SHVD_STATUS_ERR_ACCESS;
+            break;
+        }
+
+        if (g_pPsSuspendThread != NULL && g_pPsResumeThread != NULL)
+        {
+            if (NT_SUCCESS(g_pPsSuspendThread(thread, NULL)))
+                psThreadSuspended = TRUE;
+            else
+                ShvLog("[SHV-IOCTL] GET_CONTEXT Tid=%llu: PsSuspendThread (pattern scan) falhou -- segue sem suspender\n", tid);
+        }
+        else if (canSuspend)
+        {
+            gcStatus = ObOpenObjectByPointer(thread, OBJ_KERNEL_HANDLE, NULL,
+                                             THREAD_SUSPEND_RESUME, NULL,
+                                             KernelMode, &hThread);
+            if (NT_SUCCESS(gcStatus))
+                g_pZwSuspendThread(hThread, NULL);
+            else
+            {
+                ShvLog("[SHV-IOCTL] GET_CONTEXT Tid=%llu: ObOpenObjectByPointer(THREAD_SUSPEND_RESUME) falhou 0x%08X -- segue sem suspender\n",
+                       tid, gcStatus);
+                hThread = NULL; // segue sem suspender
+            }
+        }
+
+        if (!psThreadSuspended && hThread == NULL &&
+            g_pPsSuspendProcess != NULL && g_pPsResumeProcess != NULL)
+        {
+            PEPROCESS owner = PsGetThreadProcess(thread);
+            if (NT_SUCCESS(g_pPsSuspendProcess(owner)))
+                procSuspended = owner;
+            else
+                ShvLog("[SHV-IOCTL] GET_CONTEXT Tid=%llu: PsSuspendProcess falhou -- segue sem congelar\n", tid);
+        }
+
+        // Anexa no processo DONO da thread antes de ler o contexto -- mesmo
+        // a thread kernel-stack/trap-frame sendo visivel independente do
+        // processo corrente, chamadas internas do PsGetContextThread (estado
+        // de FPU/XSAVE, validacoes ligadas ao KPROCESS atual) podem depender
+        // de estar no contexto certo. Sem isso, a funcao vinha falhando com
+        // STATUS_UNSUCCESSFUL mesmo com a thread/processo congelados.
+        {
+            PEPROCESS  owner = PsGetThreadProcess(thread);
+            KAPC_STATE apcState;
+            KeStackAttachProcess(owner, &apcState);
+
+        __try
+        {
+            CONTEXT ctx = { 0 };
+            UINT32  attempt;
+            // Thread suspensa via ZwSuspendThread (hThread != NULL): e
+            // sincrono de verdade, 1 tentativa basta. Processo congelado via
+            // PsSuspendProcess (procSuspended != NULL): a suspensao de cada
+            // thread normalmente e via APC, que so e entregue no proximo
+            // ponto de checagem -- PsGetContextThread falha com
+            // STATUS_UNSUCCESSFUL se pegar a thread ainda "Running" bem no
+            // instante logo depois do PsSuspendProcess retornar, entao da
+            // uns retries curtos tambem (bem menos que o caso sem suspensao
+            // nenhuma). Sem suspensao nenhuma: mais tentativas, mesma logica.
+            UINT32  maxAttempts = (psThreadSuspended || hThread != NULL) ? 1 : (procSuspended != NULL ? 8 : 20);
+
+            gcStatus = STATUS_UNSUCCESSFUL;
+            for (attempt = 0; attempt < maxAttempts; attempt++)
+            {
+                RtlZeroMemory(&ctx, sizeof(ctx));
+                ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+
+                // Mode aqui NAO escolhe "contexto de usermode vs kernel" --
+                // diz se o BUFFER DE SAIDA (&ctx) esta em memoria de usermode
+                // ou kernel, pra decidir se faz ProbeForWrite nele. ctx e
+                // local na pilha do KERNEL (deste driver), entao tem que ser
+                // KernelMode -- com UserMode, o probe falha pra qualquer
+                // endereco de kernel (era a causa do STATUS_ACCESS_VIOLATION
+                // visto antes). A funcao ainda devolve os registradores de
+                // USERMODE do alvo (o trap frame salvo), independente desse
+                // parametro.
+                gcStatus = g_pPsGetContextThread(thread, &ctx, KernelMode);
+                if (NT_SUCCESS(gcStatus))
+                    break;
+
+                if (!psThreadSuspended && hThread == NULL)
+                {
+                    LARGE_INTEGER delay;
+                    delay.QuadPart = -1000; // 100us, relativo (negativo)
+                    KeDelayExecutionThread(KernelMode, FALSE, &delay);
+                }
+            }
+
+            if (NT_SUCCESS(gcStatus))
+            {
+                resp->ThreadContext.Rip = ctx.Rip;
+                resp->ThreadContext.Rsp = ctx.Rsp;
+                resp->ThreadContext.Rbp = ctx.Rbp;
+                resp->Status = SHVD_STATUS_OK;
+            }
+            else
+            {
+                ShvLog("[SHV-IOCTL] GET_CONTEXT Tid=%llu: PsGetContextThread(KernelMode) falhou 0x%08X apos %u tentativa(s) (psThreadSuspended=%d, canSuspend=%d, suspendeu=%d, procSuspended=%d)\n",
+                       tid, gcStatus, maxAttempts, psThreadSuspended, canSuspend, hThread != NULL, procSuspended != NULL);
+                resp->Status = SHVD_STATUS_ERR_ACCESS;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            NTSTATUS excCode = GetExceptionCode();
+            ShvLog("[SHV-IOCTL] GET_CONTEXT Tid=%llu: excecao 0x%08X ao chamar PsGetContextThread (psThreadSuspended=%d, canSuspend=%d, suspendeu=%d, procSuspended=%d)\n",
+                   tid, excCode, psThreadSuspended, canSuspend, hThread != NULL, procSuspended != NULL);
+            resp->Status = SHVD_STATUS_ERR_ACCESS;
+        }
+
+            KeUnstackDetachProcess(&apcState);
+        }
+
+        if (psThreadSuspended)
+            g_pPsResumeThread(thread, NULL);
+
+        if (procSuspended != NULL)
+            g_pPsResumeProcess(procSuspended);
+
+        if (hThread != NULL)
+        {
+            g_pZwResumeThread(hThread, NULL);
+            ZwClose(hThread);
+        }
+        ObDereferenceObject(thread);
+        break;
+    }
+
+    case SHV_CMD_THREAD_GET_STACK:
+    {
+        UINT64   tid    = req.ThreadCtl.Tid;
+        PETHREAD thread = NULL;
+        HPV_THREAD_STACK_CAPTURE capture;
+        NTSTATUS gsStatus;
+
+        if (tid == 0)
+        {
+            resp->Status = SHVD_STATUS_ERR_INVALID;
+            break;
+        }
+
+        gsStatus = PsLookupThreadByThreadId((HANDLE)(ULONG_PTR)tid, &thread);
+        if (!NT_SUCCESS(gsStatus))
+        {
+            resp->Status = SHVD_STATUS_ERR_ACCESS;
+            break;
+        }
+
+        // APC especial de kernel (nt/thread_utils.c) -- roda no contexto da
+        // propria thread alvo, funciona mesmo contra processos protegidos
+        // (PPL), diferente de PsGetContextThread (ver [[fixes]]: achado via
+        // decompilacao do ntoskrnl.exe real, com a ajuda do usuario e do
+        // IDA Pro MCP, que PspGetContextThreadInternal falha com
+        // STATUS_UNSUCCESSFUL mesmo com a thread suspensa de verdade).
+        gsStatus = HpvCaptureThreadStack(thread, &capture);
+        ObDereferenceObject(thread);
+
+        if (!NT_SUCCESS(gsStatus))
+        {
+            ShvLog("[SHV-IOCTL] GET_STACK Tid=%llu: HpvCaptureThreadStack falhou 0x%08X\n",
+                   tid, gsStatus);
+            resp->Status = (gsStatus == STATUS_NOT_SUPPORTED)
+                ? SHVD_STATUS_ERR_UNSUPPORTED
+                : SHVD_STATUS_ERR_ACCESS;
+            break;
+        }
+
+        {
+            ULONG i;
+            ULONG frameCount = min(capture.FrameCount, SHV_STACK_MAX_FRAMES);
+
+            RtlZeroMemory(&resp->ThreadStack, sizeof(resp->ThreadStack));
+            resp->ThreadStack.Rip        = capture.Rip;
+            resp->ThreadStack.Rsp        = capture.Rsp;
+            resp->ThreadStack.Rbp        = capture.Rbp;
+            resp->ThreadStack.FrameCount = frameCount;
+            for (i = 0; i < frameCount; i++)
+                resp->ThreadStack.Frames[i] = capture.Frames[i];
+        }
+
+        resp->Status = SHVD_STATUS_OK;
         break;
     }
 
@@ -1574,6 +2562,15 @@ DriverEntry (
                                        OBJ_CASE_INSENSITIVE |
                                        OBJ_KERNEL_HANDLE);
     UNREFERENCED_PARAMETER(RegistryPath);
+
+    //
+    // Resolve APIs opcionais (nao garantidas em toda build do Windows) ANTES
+    // de mais nada -- se alguma faltar, o log abaixo diz exatamente qual,
+    // em vez do driver falhar silenciosamente no "sc start" (STATUS_
+    // PROCEDURE_NOT_FOUND) sem nenhum diagnostico.
+    //
+    HpvResolveOptionalApis();
+    HpvThreadUtilsResolveApis();
 
     //
     // Make the driver (and SHV itself) unloadable

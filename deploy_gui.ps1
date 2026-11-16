@@ -10,7 +10,7 @@
 #
 
 param(
-    [string]$TargetIP     = "192.168.0.102",
+    [string]$TargetIP     = "192.168.0.101",
     [string]$TargetUser   = "admin",
     [string]$TargetPass   = "@123",
     [string]$RemoteFolder = "C:\Users\admin\Desktop\hpv",

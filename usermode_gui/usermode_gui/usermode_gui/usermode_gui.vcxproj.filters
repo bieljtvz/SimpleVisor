@@ -37,6 +37,9 @@
     <ClCompile Include="tab_memory.cpp">
       <Filter>Fonte\Tabs</Filter>
     </ClCompile>
+    <ClCompile Include="tab_disasm.cpp">
+      <Filter>Fonte\Tabs</Filter>
+    </ClCompile>
     <ClCompile Include="tab_procs.cpp">
       <Filter>Fonte\Tabs</Filter>
     </ClCompile>
@@ -83,6 +86,9 @@
       <Filter>Cabecalhos</Filter>
     </ClInclude>
     <ClInclude Include="tab_memory.h">
+      <Filter>Cabecalhos</Filter>
+    </ClInclude>
+    <ClInclude Include="tab_disasm.h">
       <Filter>Cabecalhos</Filter>
     </ClInclude>
     <ClInclude Include="tab_procs.h">

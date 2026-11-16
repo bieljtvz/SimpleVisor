@@ -380,6 +380,129 @@ ShvBackend::CmdResult ShvBackend::ReadVirt(uint64_t va, uint32_t size,
     return { _ok, _st };
 }
 
+ShvBackend::CmdResult ShvBackend::ListProcessModules(uint64_t pid, std::vector<SHV_MODULE_ENTRY>& out)
+{
+    static SHV_MODULE_ENTRY buf[SHV_MAX_READ_SIZE / sizeof(SHV_MODULE_ENTRY)];
+    uint32_t n = 0;
+
+    Lock();
+    bool _ok = m_client.ListProcessModules(pid, buf, _countof(buf), &n);
+    uint32_t _st = m_client.LastStatus();
+    if (!_ok) PostStatus(true, "ListProcessModules falhou: %s", ShvClient::StatusString(_st));
+    Unlock();
+
+    if (_ok) out.assign(buf, buf + n);
+    else     out.clear();
+
+    return { _ok, _st };
+}
+
+ShvBackend::CmdResult ShvBackend::SuspendThread(uint64_t tid)
+{
+    Lock();
+    bool _ok = m_client.SuspendThread(tid);
+    uint32_t _st = m_client.LastStatus();
+    if (!_ok) PostStatus(true, "SuspendThread falhou: %s", ShvClient::StatusString(_st));
+    Unlock();
+    return { _ok, _st };
+}
+
+ShvBackend::CmdResult ShvBackend::ResumeThread(uint64_t tid)
+{
+    Lock();
+    bool _ok = m_client.ResumeThread(tid);
+    uint32_t _st = m_client.LastStatus();
+    if (!_ok) PostStatus(true, "ResumeThread falhou: %s", ShvClient::StatusString(_st));
+    Unlock();
+    return { _ok, _st };
+}
+
+ShvBackend::CmdResult ShvBackend::GetThreadContext(uint64_t tid, SHV_THREAD_CONTEXT* out)
+{
+    Lock();
+    bool _ok = m_client.GetThreadContext(tid, out);
+    uint32_t _st = m_client.LastStatus();
+    if (!_ok) PostStatus(true, "GetThreadContext falhou: %s", ShvClient::StatusString(_st));
+    Unlock();
+    return { _ok, _st };
+}
+
+ShvBackend::CmdResult ShvBackend::GetThreadStack(uint64_t tid, SHV_THREAD_STACK* out)
+{
+    Lock();
+    bool _ok = m_client.GetThreadStack(tid, out);
+    uint32_t _st = m_client.LastStatus();
+    if (!_ok) PostStatus(true, "GetThreadStack falhou: %s", ShvClient::StatusString(_st));
+    Unlock();
+    return { _ok, _st };
+}
+
+ShvBackend::CmdResult ShvBackend::ListProcessThreads(uint64_t pid, std::vector<SHV_THREAD_ENTRY>& out)
+{
+    static SHV_THREAD_ENTRY buf[SHV_MAX_READ_SIZE / sizeof(SHV_THREAD_ENTRY)];
+    uint32_t n = 0;
+
+    Lock();
+    bool _ok = m_client.ListProcessThreads(pid, buf, _countof(buf), &n);
+    uint32_t _st = m_client.LastStatus();
+    if (!_ok) PostStatus(true, "ListProcessThreads falhou: %s", ShvClient::StatusString(_st));
+    Unlock();
+
+    if (_ok) out.assign(buf, buf + n);
+    else     out.clear();
+
+    return { _ok, _st };
+}
+
+ShvBackend::CmdResult ShvBackend::ListProcessMemory(uint64_t pid, std::vector<SHV_MEMREGION_ENTRY>& out)
+{
+    // Pagina automaticamente: o buffer do IOCTL (SHV_MAX_READ_SIZE) so cabe
+    // ~585 regioes de uma vez (bem menos que o total de VADs de processos
+    // "grandes", ver [[fixes]]) -- reenvia o IOCTL com StartAddr = fim da
+    // ultima regiao recebida ate a lista acabar (chamada devolve menos que
+    // o buffer cheio = chegou ao fim do address space). Transparente pra
+    // quem chama: devolve a lista inteira de uma vez.
+    static SHV_MEMREGION_ENTRY buf[SHV_MAX_READ_SIZE / sizeof(SHV_MEMREGION_ENTRY)];
+    const uint32_t kPageCap = _countof(buf);
+    const uint32_t kMaxPages = 500; // seguranca contra loop infinito (~290k regioes)
+
+    bool     _ok = false;
+    uint32_t _st = SHVD_STATUS_OK;
+    uint64_t startAddr = 0;
+
+    out.clear();
+
+    for (uint32_t page = 0; page < kMaxPages; page++)
+    {
+        uint32_t n = 0;
+
+        Lock();
+        _ok = m_client.ListProcessMemory(pid, buf, kPageCap, &n, startAddr);
+        _st = m_client.LastStatus();
+        Unlock();
+
+        if (!_ok)
+        {
+            PostStatus(true, "ListProcessMemory falhou: %s", ShvClient::StatusString(_st));
+            out.clear();
+            break;
+        }
+
+        if (n == 0) break; // nada mais a devolver
+
+        out.insert(out.end(), buf, buf + n);
+
+        if (n < kPageCap) break; // buffer nao encheu -- chegou ao fim
+
+        const SHV_MEMREGION_ENTRY& last = out.back();
+        uint64_t next = last.Base + last.Size;
+        if (next <= startAddr) break; // nao avancou -- evita loop infinito
+        startAddr = next;
+    }
+
+    return { _ok, _st };
+}
+
 ShvBackend::CmdResult ShvBackend::Protect(uint64_t pid)
 {
     CMD_WRAP(m_client.Protect(pid),

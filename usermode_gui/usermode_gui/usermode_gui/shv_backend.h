@@ -122,6 +122,22 @@ public:
     CmdResult TranslateVa(uint64_t va, uint64_t pid, uint64_t* outPa);
     CmdResult ReadPhys(uint64_t pa, uint32_t size, void* buf, uint32_t* outCount);
     CmdResult ReadVirt(uint64_t va, uint32_t size, uint64_t pid, void* buf, uint32_t* outCount);
+    // Modulos (EXE+DLLs) do processo pid, lidos pelo kernel via PEB (funciona
+    // mesmo contra processos protegidos/PPL, ao contrario de Toolhelp32 em usermode).
+    CmdResult ListProcessModules(uint64_t pid, std::vector<SHV_MODULE_ENTRY>& out);
+    // Threads (tid+startaddr) e regioes de memoria de um processo, lidas pelo
+    // kernel (ZwQuerySystemInformation / ZwQueryVirtualMemory anexado) --
+    // funcionam mesmo contra processos protegidos (PPL).
+    CmdResult ListProcessThreads(uint64_t pid, std::vector<SHV_THREAD_ENTRY>& out);
+    CmdResult ListProcessMemory(uint64_t pid, std::vector<SHV_MEMREGION_ENTRY>& out);
+    // Suspende/resume uma thread via handle kernel-mode (funciona com PPL).
+    CmdResult SuspendThread(uint64_t tid);
+    CmdResult ResumeThread(uint64_t tid);
+    // Rip/Rsp/Rbp de uma thread (suspende, le contexto, resume) -- usado pra
+    // sementear um stack walk sem handle usermode.
+    CmdResult GetThreadContext(uint64_t tid, SHV_THREAD_CONTEXT* out);
+    // Stack de kernel via APC especial (funciona com PPL) -- ver ShvClient::GetThreadStack.
+    CmdResult GetThreadStack(uint64_t tid, SHV_THREAD_STACK* out);
     CmdResult Protect(uint64_t pid);
     CmdResult Unprotect(uint64_t pid);
     CmdResult Monitor(uint64_t pid);

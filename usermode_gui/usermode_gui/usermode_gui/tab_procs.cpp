@@ -176,10 +176,34 @@ typedef NTSTATUS(WINAPI* PNtQIT)(HANDLE, ULONG, PVOID, ULONG, PULONG);
 struct ThreadInfo {
     uint64_t tid;
     uint64_t startAddr;
+    uint64_t object; // endereco do PETHREAD no kernel (0 = desconhecido/fallback usermode)
 };
 
-static std::vector<ThreadInfo> FetchThreads(DWORD pid)
+// Lista threads via IOCTL (ShvBackend::ListProcessThreads -> kernel le a
+// lista de threads do processo via ZwQuerySystemInformation, sem precisar de
+// handle) primeiro; cai pro Toolhelp32+NtQueryInformationThread (usermode,
+// falha contra PPL) so se o backend nao estiver conectado ou nao retornar
+// nada.
+static std::vector<ThreadInfo> FetchThreads(DWORD pid, ShvBackend& backend)
 {
+    if (backend.IsConnected())
+    {
+        std::vector<SHV_THREAD_ENTRY> threads;
+        if (backend.ListProcessThreads(pid, threads).ok && !threads.empty())
+        {
+            std::vector<ThreadInfo> result;
+            for (const auto& st : threads)
+            {
+                ThreadInfo t = {};
+                t.tid       = st.Tid;
+                t.startAddr = st.StartAddress;
+                t.object    = st.Object;
+                result.push_back(t);
+            }
+            return result;
+        }
+    }
+
     static PNtQIT NtQIT = (PNtQIT)GetProcAddress(
         GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
 
@@ -219,18 +243,79 @@ struct StackFrame {
     char     symbol[256];
 };
 
-static std::vector<StackFrame> WalkThreadStack(DWORD pid, DWORD tid)
+// Fallback pra quando OpenProcess/OpenThread falham (processo protegido/PPL):
+// pega a stack de KERNEL da thread via backend.GetThreadStack -- APC especial
+// de kernel (ShvBackend::GetThreadStack -> SHV_CMD_THREAD_GET_STACK ->
+// nt/thread_utils.c), mesma tecnica usada pelo Process Hacker/KProcessHacker
+// pra funcionar contra processos protegidos. Tentamos antes `PsGetContextThread`
+// (ver historico em memory/fixes.md) mas ela tem logica propria que falha com
+// STATUS_UNSUCCESSFUL mesmo com a thread suspensa de verdade -- a APC especial
+// contorna isso de vez, sem precisar suspender nada.
+//
+// Os frames vem da pilha de KERNEL da thread (ela pode estar no meio de um
+// syscall) -- por isso resolvemos contra os modulos do KERNEL
+// (backend.State().kernelModules), nao contra os modulos do processo
+// (ao contrario do caminho classico abaixo, que mostra stack de usermode
+// com simbolos de verdade via dbghelp).
+static std::vector<StackFrame> WalkThreadStackViaApc(ShvBackend& backend, DWORD tid)
+{
+    std::vector<StackFrame> frames;
+
+    SHV_THREAD_STACK stack = {};
+    if (!backend.GetThreadStack(tid, &stack).ok) return frames;
+
+    std::vector<SHV_MODULE_ENTRY> kernMods;
+    backend.Lock();
+    kernMods = backend.State().kernelModules;
+    backend.Unlock();
+
+    auto resolve = [&](uint64_t addr, char* out, size_t outSize)
+    {
+        for (const auto& m : kernMods)
+        {
+            if (addr >= m.Base && addr < m.Base + m.Size)
+            {
+                snprintf(out, outSize, "%s+0x%llX", m.Name, (unsigned long long)(addr - m.Base));
+                return;
+            }
+        }
+        snprintf(out, outSize, "0x%016llX", (unsigned long long)addr);
+    };
+
+    StackFrame f0 = {};
+    f0.rip = stack.Rip;
+    f0.rsp = stack.Rsp;
+    resolve(f0.rip, f0.symbol, sizeof(f0.symbol));
+    frames.push_back(f0);
+
+    for (uint32_t i = 0; i < stack.FrameCount; i++)
+    {
+        StackFrame f = {};
+        f.rip = stack.Frames[i];
+        resolve(f.rip, f.symbol, sizeof(f.symbol));
+        frames.push_back(f);
+    }
+
+    return frames;
+}
+
+// Caminho classico (OpenProcess+OpenThread+GetThreadContext+StackWalk64 com
+// handles de verdade e enumeracao automatica de modulos do dbghelp): mostra
+// stack de USERMODE com simbolos de verdade, mas precisa de handle. Se
+// qualquer handle falhar (processo protegido/PPL nega
+// PROCESS_QUERY_INFORMATION/THREAD_GET_CONTEXT), cai pra WalkThreadStackViaApc.
+static std::vector<StackFrame> WalkThreadStack(DWORD pid, DWORD tid, ShvBackend& backend)
 {
     std::vector<StackFrame> frames;
 
     HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
                                 FALSE, pid);
-    if (!hProc) return frames;
+    if (!hProc) return WalkThreadStackViaApc(backend, tid);
 
     HANDLE hThread = OpenThread(
         THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
         FALSE, tid);
-    if (!hThread) { CloseHandle(hProc); return frames; }
+    if (!hThread) { CloseHandle(hProc); return WalkThreadStackViaApc(backend, tid); }
 
     SuspendThread(hThread);
     CONTEXT ctx = {};
@@ -238,7 +323,12 @@ static std::vector<StackFrame> WalkThreadStack(DWORD pid, DWORD tid)
     bool ctxOk = GetThreadContext(hThread, &ctx) != 0;
     ResumeThread(hThread);
 
-    if (!ctxOk) { CloseHandle(hThread); CloseHandle(hProc); return frames; }
+    if (!ctxOk)
+    {
+        CloseHandle(hThread);
+        CloseHandle(hProc);
+        return WalkThreadStackViaApc(backend, tid);
+    }
 
     SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
     SymInitialize(hProc, nullptr, TRUE);
@@ -353,9 +443,48 @@ static const char* TypeStr(DWORD type)
     }
 }
 
-static std::vector<MemRegion> FetchMemRegions(DWORD pid,
+// Preenche o nome do modulo dono de cada regiao (match por range) e devolve.
+static std::vector<MemRegion> TagRegionsWithModules(std::vector<MemRegion> regions,
+                                                      const std::vector<ModuleInfo>& mods)
+{
+    for (auto& r : regions)
+        for (const auto& m : mods)
+            if (r.base >= m.base && r.base < m.base + m.size)
+            {
+                snprintf(r.module, sizeof(r.module), "%s", m.name);
+                break;
+            }
+    return regions;
+}
+
+// Lista regioes de memoria via IOCTL (ShvBackend::ListProcessMemory -> kernel
+// anexa no processo e consulta com pseudo-handle, sem OpenProcess) primeiro;
+// cai pro VirtualQueryEx usermode (falha contra PPL, que nega
+// PROCESS_QUERY_INFORMATION) so se o backend nao estiver conectado ou nao
+// retornar nada.
+static std::vector<MemRegion> FetchMemRegions(DWORD pid, ShvBackend& backend,
                                                const std::vector<ModuleInfo>& mods)
 {
+    if (backend.IsConnected())
+    {
+        std::vector<SHV_MEMREGION_ENTRY> regions;
+        if (backend.ListProcessMemory(pid, regions).ok && !regions.empty())
+        {
+            std::vector<MemRegion> result;
+            for (const auto& sr : regions)
+            {
+                MemRegion r = {};
+                r.base    = sr.Base;
+                r.size    = sr.Size;
+                r.protect = sr.Protect;
+                r.state   = sr.State;
+                r.type    = sr.Type;
+                result.push_back(r);
+            }
+            return TagRegionsWithModules(std::move(result), mods);
+        }
+    }
+
     std::vector<MemRegion> result;
     HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
     if (!hProc) return result;
@@ -370,21 +499,13 @@ static std::vector<MemRegion> FetchMemRegions(DWORD pid,
         r.protect = mbi.Protect ? mbi.Protect : mbi.AllocationProtect;
         r.state   = mbi.State;
         r.type    = mbi.Type;
-        for (const auto& m : mods)
-        {
-            if (r.base >= m.base && r.base < m.base + m.size)
-            {
-                snprintf(r.module, sizeof(r.module), "%s", m.name);
-                break;
-            }
-        }
         result.push_back(r);
         uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
         if (next <= addr) break;
         addr = next;
     }
     CloseHandle(hProc);
-    return result;
+    return TagRegionsWithModules(std::move(result), mods);
 }
 
 static const ImVec4 kColorOk      = { 0.20f, 0.90f, 0.40f, 1.0f };
@@ -394,10 +515,39 @@ static const ImVec4 kColorDim     = { 0.55f, 0.55f, 0.55f, 1.0f };
 static const ImVec4 kColorProtect = { 1.00f, 0.60f, 0.00f, 1.0f };
 static const ImVec4 kColorMonitor = { 0.40f, 0.90f, 1.00f, 1.0f };
 
-// Usa CreateToolhelp32Snapshot para listar modulos de um PID usermode
-static std::vector<ModuleInfo> FetchModules(DWORD pid)
+// Lista modulos (EXE+DLLs) de um PID via IOCTL (ShvBackend::ListProcessModules
+// -> kernel le a PEB do processo alvo apos attach) em vez de
+// CreateToolhelp32Snapshot em usermode -- funciona mesmo contra processos
+// protegidos (PPL), que negam PROCESS_QUERY_INFORMATION pra um chamador
+// usermode comum (Toolhelp32 falhava silenciosamente pra esses, retornando
+// lista vazia). Fallback pra Toolhelp32 so se o backend nao estiver
+// conectado ou a chamada falhar, pra nao perder a funcionalidade nesse caso.
+static std::vector<ModuleInfo> FetchModules(DWORD pid, ShvBackend& backend)
 {
     std::vector<ModuleInfo> result;
+
+    if (backend.IsConnected())
+    {
+        std::vector<SHV_MODULE_ENTRY> mods;
+        if (backend.ListProcessModules(pid, mods).ok)
+        {
+            for (const auto& sm : mods)
+            {
+                ModuleInfo m = {};
+                m.base = sm.Base;
+                m.size = sm.Size;
+                // SHV_MODULE_ENTRY.Name vem do kernel como o BaseDllName
+                // (so nome, ja sem caminho) -- preenche name e path iguais.
+                snprintf(m.name, sizeof(m.name), "%s", sm.Name);
+                snprintf(m.path, sizeof(m.path), "%s", sm.Name);
+                result.push_back(m);
+            }
+            if (!result.empty()) return result;
+        }
+    }
+
+    // Fallback: Toolhelp32 em usermode (nao funciona contra PPL, mas serve
+    // de backup se o driver nao estiver conectado).
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
     if (snap == INVALID_HANDLE_VALUE) return result;
 
@@ -504,8 +654,8 @@ void RenderTabProcs(ShvBackend& backend)
                     s_selIdx     = i;
                     s_selPid     = p.Pid;
                     strncpy_s(s_selName, p.Name, _TRUNCATE);
-                    s_modules    = FetchModules((DWORD)p.Pid);
-                    s_threads    = FetchThreads((DWORD)p.Pid);
+                    s_modules    = FetchModules((DWORD)p.Pid, backend);
+                    s_threads    = FetchThreads((DWORD)p.Pid, backend);
                     s_memRegions.clear();
                     s_memLoaded  = false;
                     snprintf(s_pidInput, sizeof(s_pidInput), "%llu", p.Pid);
@@ -619,7 +769,7 @@ void RenderTabProcs(ShvBackend& backend)
             if (ImGui::BeginTabItem("Modules"))
             {
                 if (ImGui::Button("Recarregar"))
-                    s_modules = FetchModules((DWORD)s_selPid);
+                    s_modules = FetchModules((DWORD)s_selPid, backend);
                 ImGui::SameLine();
                 ImGui::TextDisabled("(%zu)", s_modules.size());
                 ImGui::Spacing();
@@ -689,7 +839,7 @@ void RenderTabProcs(ShvBackend& backend)
             if (ImGui::BeginTabItem("Threads"))
             {
                 if (ImGui::Button("Recarregar"))
-                    s_threads = FetchThreads((DWORD)s_selPid);
+                    s_threads = FetchThreads((DWORD)s_selPid, backend);
                 ImGui::SameLine();
                 ImGui::TextDisabled("(%zu)", s_threads.size());
                 ImGui::Spacing();
@@ -722,24 +872,42 @@ void RenderTabProcs(ShvBackend& backend)
                         {
                             if (ImGui::MenuItem("Suspend"))
                             {
-                                HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, (DWORD)s_ctxTid);
-                                if (h) { SuspendThread(h); CloseHandle(h); }
+                                // Tenta via kernel primeiro (funciona com PPL);
+                                // cai pro OpenThread usermode so se o backend
+                                // nao estiver conectado.
+                                bool done = backend.IsConnected() &&
+                                            backend.SuspendThread(s_ctxTid).ok;
+                                if (!done)
+                                {
+                                    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, (DWORD)s_ctxTid);
+                                    if (h) { SuspendThread(h); CloseHandle(h); }
+                                }
                             }
                             if (ImGui::MenuItem("Resume"))
                             {
-                                HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, (DWORD)s_ctxTid);
-                                if (h) { ResumeThread(h); CloseHandle(h); }
+                                bool done = backend.IsConnected() &&
+                                            backend.ResumeThread(s_ctxTid).ok;
+                                if (!done)
+                                {
+                                    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, (DWORD)s_ctxTid);
+                                    if (h) { ResumeThread(h); CloseHandle(h); }
+                                }
                             }
                             ImGui::Separator();
                             if (ImGui::MenuItem("Terminate"))
                             {
+                                // TODO: ZwTerminateThread nao e exportada pro
+                                // kernel -- terminar uma thread protegida/PPL
+                                // de dentro do driver fica pra depois (precisa
+                                // de outra tecnica, tipo APC). Por enquanto so
+                                // o caminho usermode de sempre.
                                 HANDLE h = OpenThread(THREAD_TERMINATE, FALSE, (DWORD)s_ctxTid);
                                 if (h) { TerminateThread(h, 0); CloseHandle(h); }
                             }
                             ImGui::Separator();
                             if (ImGui::MenuItem("View Stack"))
                             {
-                                s_stackFrames       = WalkThreadStack((DWORD)s_selPid, (DWORD)s_ctxTid);
+                                s_stackFrames       = WalkThreadStack((DWORD)s_selPid, (DWORD)s_ctxTid, backend);
                                 s_stackPopupPending = true;
                             }
                             ImGui::EndPopup();
@@ -753,7 +921,10 @@ void RenderTabProcs(ShvBackend& backend)
                         else
                             ImGui::TextDisabled("---");
                         ImGui::TableNextColumn();
-                        ImGui::TextDisabled("--- (futura impl.)");
+                        if (t.object)
+                            ImGui::Text("0x%016llX", t.object);
+                        else
+                            ImGui::TextDisabled("---");
                     }
                     ImGui::EndTable();
                 }
@@ -765,7 +936,7 @@ void RenderTabProcs(ShvBackend& backend)
             {
                 if (ImGui::Button("Carregar"))
                 {
-                    s_memRegions = FetchMemRegions((DWORD)s_selPid, s_modules);
+                    s_memRegions = FetchMemRegions((DWORD)s_selPid, backend, s_modules);
                     s_memLoaded  = true;
                 }
                 ImGui::SameLine();

@@ -373,6 +373,102 @@ bool ShvClient::ListModules(SHV_MODULE_ENTRY* out, uint32_t maxCount, uint32_t* 
     return true;
 }
 
+bool ShvClient::ListProcessModules(uint64_t pid, SHV_MODULE_ENTRY* out, uint32_t maxCount, uint32_t* outCount)
+{
+    if (!out || maxCount == 0 || pid == 0) return false;
+
+    SHV_REQUEST req = {};
+    req.Command             = SHV_CMD_LIST_PROCESS_MODULES;
+    req.ListProcModules.Pid = pid;
+
+    if (!Submit(req) || m_resp.Status != SHVD_STATUS_OK)
+        return false;
+
+    uint32_t n = m_resp.Count;
+    if (n > maxCount) n = maxCount;
+    memcpy(out, m_resp.Modules, n * sizeof(SHV_MODULE_ENTRY));
+    if (outCount) *outCount = n;
+    return true;
+}
+
+bool ShvClient::ListProcessThreads(uint64_t pid, SHV_THREAD_ENTRY* out, uint32_t maxCount, uint32_t* outCount)
+{
+    if (!out || maxCount == 0 || pid == 0) return false;
+
+    SHV_REQUEST req = {};
+    req.Command        = SHV_CMD_LIST_PROCESS_THREADS;
+    req.ProcFilter.Pid = pid;
+
+    if (!Submit(req) || m_resp.Status != SHVD_STATUS_OK)
+        return false;
+
+    uint32_t n = m_resp.Count;
+    if (n > maxCount) n = maxCount;
+    memcpy(out, m_resp.Threads, n * sizeof(SHV_THREAD_ENTRY));
+    if (outCount) *outCount = n;
+    return true;
+}
+
+bool ShvClient::ListProcessMemory(uint64_t pid, SHV_MEMREGION_ENTRY* out, uint32_t maxCount,
+                                  uint32_t* outCount, uint64_t startAddr)
+{
+    if (!out || maxCount == 0 || pid == 0) return false;
+
+    SHV_REQUEST req = {};
+    req.Command                 = SHV_CMD_LIST_PROCESS_MEMORY;
+    req.ListProcMemory.Pid       = pid;
+    req.ListProcMemory.StartAddr = startAddr;
+
+    if (!Submit(req) || m_resp.Status != SHVD_STATUS_OK)
+        return false;
+
+    uint32_t n = m_resp.Count;
+    if (n > maxCount) n = maxCount;
+    memcpy(out, m_resp.MemRegions, n * sizeof(SHV_MEMREGION_ENTRY));
+    if (outCount) *outCount = n;
+    return true;
+}
+
+bool ShvClient::SuspendThread(uint64_t tid)
+{
+    if (tid == 0) return false;
+    SHV_REQUEST req = {};
+    req.Command      = SHV_CMD_THREAD_SUSPEND;
+    req.ThreadCtl.Tid = tid;
+    return Submit(req) && m_resp.Status == SHVD_STATUS_OK;
+}
+
+bool ShvClient::ResumeThread(uint64_t tid)
+{
+    if (tid == 0) return false;
+    SHV_REQUEST req = {};
+    req.Command      = SHV_CMD_THREAD_RESUME;
+    req.ThreadCtl.Tid = tid;
+    return Submit(req) && m_resp.Status == SHVD_STATUS_OK;
+}
+
+bool ShvClient::GetThreadContext(uint64_t tid, SHV_THREAD_CONTEXT* out)
+{
+    if (tid == 0 || !out) return false;
+    SHV_REQUEST req = {};
+    req.Command      = SHV_CMD_THREAD_GET_CONTEXT;
+    req.ThreadCtl.Tid = tid;
+    if (!Submit(req) || m_resp.Status != SHVD_STATUS_OK) return false;
+    *out = m_resp.ThreadContext;
+    return true;
+}
+
+bool ShvClient::GetThreadStack(uint64_t tid, SHV_THREAD_STACK* out)
+{
+    if (tid == 0 || !out) return false;
+    SHV_REQUEST req = {};
+    req.Command       = SHV_CMD_THREAD_GET_STACK;
+    req.ThreadCtl.Tid = tid;
+    if (!Submit(req) || m_resp.Status != SHVD_STATUS_OK) return false;
+    *out = m_resp.ThreadStack;
+    return true;
+}
+
 bool ShvClient::ListSyscallHooks(SHV_HOOK_INFO* out, uint32_t maxCount, uint32_t* outCount)
 {
     if (!out || maxCount == 0) return false;
@@ -537,6 +633,7 @@ const char* ShvClient::StatusString(uint32_t status)
         case SHVD_STATUS_ERR_NOMEM:    return "ERR_NOMEM";
         case SHVD_STATUS_ERR_INVALID:  return "ERR_INVALID";
         case SHVD_STATUS_ERR_ACCESS:   return "ERR_ACCESS";
+        case SHVD_STATUS_ERR_UNSUPPORTED: return "ERR_UNSUPPORTED (API nao disponivel nesta build do Windows)";
         default:                       return "ERR_UNKNOWN";
     }
 }

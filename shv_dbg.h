@@ -62,6 +62,13 @@ Abstract:
 #define SHV_CMD_CLEAR_EVENTS       23  // limpa ring buffer de eventos
 #define SHV_CMD_LIST_EPT_HOOKS     24  // lista EPT hooks instalados
 #define SHV_CMD_SET_STACK_FILTER   25  // liga/desliga o filtro de call-site do stack walk (ProcFilter.Pid = 0/1)
+#define SHV_CMD_LIST_PROCESS_MODULES 26 // lista modulos (EXE+DLLs) de um processo via PEB (kernel-mode, funciona com PPL)
+#define SHV_CMD_LIST_PROCESS_THREADS 27 // lista threads (tid+startaddr) de um processo via ZwQuerySystemInformation (kernel-mode, funciona com PPL)
+#define SHV_CMD_LIST_PROCESS_MEMORY  28 // lista regioes de memoria (VAD) de um processo via ZwQueryVirtualMemory anexado (kernel-mode, funciona com PPL)
+#define SHV_CMD_THREAD_SUSPEND       29 // suspende uma thread via handle kernel-mode (funciona com PPL)
+#define SHV_CMD_THREAD_RESUME        30 // resume uma thread via handle kernel-mode (funciona com PPL)
+#define SHV_CMD_THREAD_GET_CONTEXT   31 // le Rip/Rsp/Rbp de uma thread via PsGetContextThread (funciona com PPL)
+#define SHV_CMD_THREAD_GET_STACK     32 // captura Rip/Rsp/Rbp + stack de kernel via APC especial (funciona com PPL, igual Process Hacker)
 
 //
 // Tipos de hook EPT (bitmask)
@@ -78,7 +85,8 @@ Abstract:
 #define SHVD_STATUS_ERR_NOTFOUND 2   // hook nao encontrado para remover
 #define SHVD_STATUS_ERR_NOMEM    3   // sem memoria para split de pagina
 #define SHVD_STATUS_ERR_INVALID  4   // parametros invalidos
-#define SHVD_STATUS_ERR_ACCESS   5   // acesso negado / pagina invalida
+#define SHVD_STATUS_ERR_ACCESS   5
+#define SHVD_STATUS_ERR_UNSUPPORTED 6 // API do kernel nao resolvida nesta build do Windows (ver ShvLog no DriverEntry)   // acesso negado / pagina invalida
 
 #define SHV_MAX_READ_SIZE       16384
 #define SHV_SHADOW_PATCH_MAX    32
@@ -146,6 +154,22 @@ typedef struct _SHV_REQUEST
         {
             char Name[SHV_PROC_NAME_LEN];
         } NameFilter;
+
+        struct
+        {
+            unsigned long long Pid;
+        } ListProcModules;
+
+        struct
+        {
+            unsigned long long Tid;
+        } ThreadCtl;
+
+        struct
+        {
+            unsigned long long Pid;
+            unsigned long long StartAddr; // continuacao de SHV_CMD_LIST_PROCESS_MEMORY (0 = do inicio)
+        } ListProcMemory;
     };
 } SHV_REQUEST, *PSHV_REQUEST;
 
@@ -186,6 +210,58 @@ typedef struct _SHV_MODULE_ENTRY
     unsigned long long Size;
     char               Name[SHV_MOD_NAME_LEN];
 } SHV_MODULE_ENTRY, *PSHV_MODULE_ENTRY;
+
+//
+// Entrada de lista de threads de um processo (retornada por
+// SHV_CMD_LIST_PROCESS_THREADS).
+//
+typedef struct _SHV_THREAD_ENTRY
+{
+    unsigned long long Tid;
+    unsigned long long StartAddress;
+    unsigned long long Object;  // endereco do PETHREAD no kernel (so exibicao, igual coluna "Object" do Process Hacker)
+} SHV_THREAD_ENTRY, *PSHV_THREAD_ENTRY;
+
+//
+// Entrada de regiao de memoria virtual de um processo (retornada por
+// SHV_CMD_LIST_PROCESS_MEMORY) -- equivalente a MEMORY_BASIC_INFORMATION.
+//
+typedef struct _SHV_MEMREGION_ENTRY
+{
+    unsigned long long Base;
+    unsigned long long Size;
+    unsigned int       Protect;
+    unsigned int       State;
+    unsigned int       Type;
+} SHV_MEMREGION_ENTRY, *PSHV_MEMREGION_ENTRY;
+
+//
+// Registradores de uma thread (retornado por SHV_CMD_THREAD_GET_CONTEXT) --
+// so o minimo pra stack walk (RIP/RSP/RBP), nao o CONTEXT inteiro.
+//
+typedef struct _SHV_THREAD_CONTEXT
+{
+    unsigned long long Rip;
+    unsigned long long Rsp;
+    unsigned long long Rbp;
+} SHV_THREAD_CONTEXT, *PSHV_THREAD_CONTEXT;
+
+//
+// Stack de KERNEL de uma thread, capturada via APC especial (retornada por
+// SHV_CMD_THREAD_GET_STACK) -- igual tecnica do Process Hacker/KProcessHacker,
+// funciona mesmo com processos protegidos (PPL). Frames sao enderecos de
+// retorno dentro do KERNEL (ntoskrnl.exe + drivers), nao de usermode.
+//
+#define SHV_STACK_MAX_FRAMES 32
+
+typedef struct _SHV_THREAD_STACK
+{
+    unsigned long long Rip;
+    unsigned long long Rsp;
+    unsigned long long Rbp;
+    unsigned int        FrameCount;
+    unsigned long long Frames[SHV_STACK_MAX_FRAMES];
+} SHV_THREAD_STACK, *PSHV_THREAD_STACK;
 
 //
 // Informacao de um EPT hook instalado (retornada por SHV_CMD_LIST_EPT_HOOKS).
@@ -241,9 +317,13 @@ typedef struct _SHV_RESPONSE
     union
     {
         unsigned long long  PhysAddr;            // Translate
+        SHV_THREAD_CONTEXT  ThreadContext;        // SHV_CMD_THREAD_GET_CONTEXT
+        SHV_THREAD_STACK    ThreadStack;          // SHV_CMD_THREAD_GET_STACK
         unsigned char       Data[SHV_MAX_READ_SIZE]; // ReadPhys / ReadVirt
         SHV_PROC_ENTRY      Procs[SHV_MAX_READ_SIZE / sizeof(SHV_PROC_ENTRY)];
         SHV_MODULE_ENTRY    Modules[SHV_MAX_READ_SIZE / sizeof(SHV_MODULE_ENTRY)];
+        SHV_THREAD_ENTRY    Threads[SHV_MAX_READ_SIZE / sizeof(SHV_THREAD_ENTRY)];
+        SHV_MEMREGION_ENTRY MemRegions[SHV_MAX_READ_SIZE / sizeof(SHV_MEMREGION_ENTRY)];
         SHV_PROC_FILTER_ENTRY Filters[SHV_MAX_READ_SIZE / sizeof(SHV_PROC_FILTER_ENTRY)];
         SHV_EPT_HOOK_INFO    EptHookInfos[SHV_MAX_READ_SIZE / sizeof(SHV_EPT_HOOK_INFO)];
         SHV_HOOK_INFO        HookInfos[SHV_MAX_READ_SIZE / sizeof(SHV_HOOK_INFO)];

@@ -4,6 +4,405 @@ Histórico de bugs resolvidos: o que quebrava, a causa raiz e a correção aplic
 
 ---
 
+## 2026-11-13 — View Stack de processo protegido: APC especial de kernel (técnica do Process Hacker) em vez de PsGetContextThread
+
+**Contexto:** mesmo com todos os fixes anteriores (Mode=KernelMode, retry, PsSuspendProcess,
+PsSuspendThread via pattern scan), `GET_CONTEXT` continuava falhando com `STATUS_UNSUCCESSFUL`
+pra threads de processos protegidos especificamente — e o usuário notou que o **Process
+Hacker** consegue ver a stack dessas threads, inclusive com frames de módulos do kernel.
+
+**Investigação (decompilação do `ntoskrnl.exe` real via IDA Pro MCP, com ajuda do usuário):**
+- `PsGetContextThread` → thunk pra `PspGetContextThreadInternal`.
+- Pra thread diferente da chamadora, essa função enfileira uma **APC especial de kernel**
+  própria (`PspGetSetContextSpecialApc`) via `KeInsertQueueApc` e espera um gate — se
+  `KeInsertQueueApc` devolver `FALSE`, a função devolve exatamente `STATUS_UNSUCCESSFUL`
+  (`0xC0000001`), batendo com o erro observado.
+- Dentro de `KeInsertQueueApc`: falha quando o bit `ApcQueueable` (bit 14, máscara `0x4000`)
+  do campo `MiscFlags` do `_KTHREAD` (offset 0x74) está zerado — não é uma checagem de PP/PPL
+  explícita, mas o efeito prático acabou correlacionando com threads de processo protegido
+  nos testes.
+- Checado o código-fonte do **KProcessHacker** (`thread.c`, função
+  `KphCaptureStackBackTraceThread`): eles **não usam `PsGetContextThread`/`PsSetContextThread`
+  em nenhum momento** — implementam a própria APC especial de kernel (`KeInitializeApc` +
+  `KeInsertQueueApc` com rotina própria), que roda no contexto da thread alvo e usa
+  `RtlWalkFrameChain` pra desenrolar a pilha diretamente. É assim que o Process Hacker
+  consegue ver stack de processo protegido — e explica por que os frames mostrados por ele são
+  de **módulos do kernel** (é a pilha de kernel da thread, não a de usermode).
+
+**Fix:** implementado o mesmo mecanismo, extraído pra arquivos próprios `nt/thread_utils.h`/
+`.c` (pedido do usuário, pra não bagunçar `shvos.c`):
+- `HpvCaptureThreadStack(PETHREAD, PHPV_THREAD_STACK_CAPTURE)`: `KeInitializeApc` +
+  `KeInsertQueueApc` com rotina própria (`HpvCaptureStackKernelRoutine`) que roda DENTRO do
+  contexto da thread alvo (é assim que entrega de APC de kernel funciona) e ali chama
+  `RtlCaptureContext`/`RtlWalkFrameChain` pra pegar Rip/Rsp/Rbp + até 32 endereços de retorno
+  da pilha de KERNEL da thread naquele instante. `KeInitializeApc`/`KeInsertQueueApc`/
+  `KeWaitForSingleObject`/`RtlWalkFrameChain` resolvidas dinamicamente (mesmo padrão/motivo das
+  outras APIs não-documentadas desta sessão — nenhuma delas tem prototype nos headers desta
+  WDK, apesar de exportadas) via `HpvThreadUtilsResolveApis()`, chamada no `DriverEntry` junto
+  com `HpvResolveOptionalApis()`.
+- Novo comando `SHV_CMD_THREAD_GET_STACK` (32) em `nt/shvos.c`: `PsLookupThreadByThreadId` +
+  `HpvCaptureThreadStack`, devolve `SHV_THREAD_STACK{Rip,Rsp,Rbp,FrameCount,Frames[32]}`.
+- `tab_procs.cpp`: `WalkThreadStackKernel` (a tentativa anterior via `PsGetContextThread`+
+  `StackWalk64` com hProcess falso) foi **substituída** por `WalkThreadStackViaApc` — chama
+  `backend.GetThreadStack` e resolve cada endereço contra `backend.State().kernelModules`
+  (módulo+offset do KERNEL, igual o Process Hacker mostra), sem StackWalk64/dbghelp nenhum
+  (não precisa, já vem a lista de frames pronta do kernel via `RtlWalkFrameChain`). Continua
+  sendo o fallback quando `OpenProcess`/`OpenThread`/`GetThreadContext` usermode falham (PPL);
+  o caminho clássico (stack de usermode com símbolos via dbghelp) continua tentado primeiro
+  quando possível.
+
+Driver e GUI recompilados limpos. Ainda não testado em execução real contra processo protegido.
+
+---
+
+## 2026-11-13 — PsSuspendThread/PsResumeThread encontradas por pattern scan (não exportadas por nome)
+
+**Contexto:** confirmado que `ZwSuspendThread`/`ZwResumeThread` (que existem no `.lib` do WDK)
+não são encontradas via `MmGetSystemRoutineAddress` na build real da VM, e `PsSuspendThread`/
+`PsResumeThread`/`KeSuspendThread`/`KeResumeThread` nem aparecem no `.lib` como export — ou
+seja, a função INTERNA de verdade que suspende/resume uma thread existe no binário, só não é
+exportada por nome. Usuário forneceu as assinaturas de bytes (via disassembly do `ntoskrnl.exe`
+real da VM) pra achar as duas por pattern scan, igual já é feito pra `PspExitProcess` em
+`hpv_policy_hooks.c`.
+
+**Implementação:** `nt/shvos.c`, dentro de `HpvResolveOptionalApis` (mesmo lugar que resolve as
+APIs por nome): depois do loop de `MmGetSystemRoutineAddress`, chama
+`HpvFindNtoskrnlModule`+`HpvFindPattern` (funções já existentes em `nt/hpv_pattern.c`, usadas
+pra `PspExitProcess`) com as assinaturas fornecidas, setando `g_pPsSuspendThread`/
+`g_pPsResumeThread` (novos ponteiros de função, tomam `PETHREAD` direto — sem handle nenhum,
+diferente dos wrappers `Zw*`). **Diferente de `PspExitProcess`**: aqui não tem hook nenhum
+instalado (não é interceptação) — o VA achado vira ponteiro de função chamado diretamente pelo
+driver, pra suspender/resumir uma thread arbitrária de verdade.
+
+Atualizada a ordem de preferência em `SHV_CMD_THREAD_SUSPEND`/`RESUME` e `GET_CONTEXT`:
+1. `PsSuspendThread`/`PsResumeThread` (pattern scan) — melhor opção, sem handle.
+2. `ZwSuspendThread`/`ZwResumeThread` (nome) — precisa de handle via `ObOpenObjectByPointer`.
+3. (só em `GET_CONTEXT`) `PsSuspendProcess`/`PsResumeProcess` — processo inteiro, último
+   recurso.
+4. Nenhuma das três — lê sem congelar, com retry.
+
+Com isso, `SHV_CMD_THREAD_SUSPEND`/`RESUME` devem sair de `ERR_UNSUPPORTED` nessa build (se as
+assinaturas baterem) — e deixam de depender do fallback usermode (`OpenThread`) pra funcionar
+até com processos protegidos (PPL).
+
+Driver recompilado limpo. Ainda não confirmado em execução real se as assinaturas batem.
+
+---
+
+## 2026-11-13 — Processos→Memory limitado a 585 regiões (buffer fixo do IOCTL)
+
+**Symptom:** aba Processos→Memory nunca mostrava mais que 585 regiões, mesmo em processos com
+mais VADs que isso.
+
+**Root cause:** `585 = SHV_MAX_READ_SIZE / sizeof(SHV_MEMREGION_ENTRY)` (16384 / 28 bytes) —
+`SHV_CMD_LIST_PROCESS_MEMORY` enchia o buffer de resposta do IOCTL (compartilhado por todos os
+comandos de lista) numa única chamada e simplesmente parava aí, sem nenhum mecanismo de
+continuação. Não dava pra só aumentar `SHV_MAX_READ_SIZE` porque ele é usado por `SHV_RESPONSE`
+inteira (afetaria o tamanho do buffer de TODOS os comandos, não só esse).
+
+**Fix:** paginação. Novo campo `req.ListProcMemory.StartAddr` no protocolo (0 = do início do
+address space); `nt/shvos.c` agora começa o loop de `ZwQueryVirtualMemory` a partir desse
+endereço em vez de sempre `0`. `ShvBackend::ListProcessMemory` (GUI) virou um loop transparente:
+reenvia o IOCTL com `StartAddr = Base+Size` da última região recebida sempre que o buffer vem
+cheio (`n == kPageCap`), concatenando tudo, até uma página vir incompleta (chegou ao fim do
+address space) ou vazia — quem chama (`tab_procs.cpp`) continua recebendo a lista inteira de
+uma vez, sem saber que foi paginada por baixo dos panos. Limite de segurança de 500 páginas
+(~290 mil regiões) contra loop infinito.
+
+Driver e GUI recompilados limpos.
+
+---
+
+## 2026-11-13 — GET_CONTEXT: PsGetContextThread falhava com STATUS_ACCESS_VIOLATION sem suspensão
+
+**Contexto:** continuação do fix de suspend/resume ausentes nessa build (`ZwSuspendThread`/
+`ZwResumeThread` não exportados, `PsGetContextThread` sim). Mesmo não exigindo mais
+suspend/resume pra `GET_CONTEXT`, o comando ainda falhava.
+
+**Symptom:** log mostrou `PsGetContextThread(UserMode) falhou 0xC0000005`
+(`STATUS_ACCESS_VIOLATION`) — retornado pela própria função como valor de retorno, não uma
+exceção pega pelo `__except`.
+
+**Root cause:** sem conseguir suspender a thread primeiro, ler o contexto dela enquanto pode
+estar rodando no exato momento da chamada é uma corrida genuína (não é erro de permissão) —
+`PsGetContextThread` precisa que a thread não esteja em execução naquele instante pra capturar
+o trap frame de usermode com segurança.
+
+**Fix:** quando não foi possível suspender (`hThread == NULL`), `PsGetContextThread` agora é
+tentada em loop (até 20x, com `KeDelayExecutionThread` de 100us entre tentativas) em vez de
+desistir na primeira falha — a maioria das threads passa a maior parte do tempo bloqueada
+esperando (I/O, mensagem, mutex), então algumas tentativas tendem a pegar uma janela segura.
+Quando a suspensão funciona (`hThread != NULL`), continua só 1 tentativa (já seguro por
+definição). Log detalhado (`NTSTATUS`/código de exceção, `canSuspend`, se suspendeu de
+verdade) adicionado pra facilitar diagnóstico se ainda falhar.
+
+Driver recompilado limpo.
+
+**Update (mesmo dia):** usuário perguntou se existe alguma forma de suspender uma thread de
+verdade nessa build. Checagem (`dumpbin /exports`) confirmou: **não existe** `PsSuspendThread`/
+`PsResumeThread` nem `KeSuspendThread`/`KeResumeThread` exportados pelo kernel — só
+`PsSuspendProcess`/`PsResumeProcess` (suspende/resume o **processo inteiro**, mecanismo usado
+pelo "freeze" de apps UWP do Windows). Adicionado como terceira opção em `GET_CONTEXT`: se não
+dá pra suspender só a thread (`ZwSuspendThread` ausente), tenta `PsSuspendProcess` no processo
+dono da thread por um instante curtinho (1 tentativa de leitura basta, sem precisar do retry),
+resume logo depois. **Importante**: isso NUNCA é usado pros comandos dedicados
+`SHV_CMD_THREAD_SUSPEND`/`RESUME` — suspender o processo inteiro ali seria um efeito colateral
+inesperado (usuário pediu suspender uma thread, não o processo todo); esses dois continuam
+`ERR_UNSUPPORTED` nessa build, com o fallback usermode (`OpenThread`) do GUI cobrindo processos
+não-protegidos.
+
+Driver recompilado limpo.
+
+**Update 2 (mesmo dia) — causa real encontrada:** usuário questionou se `Mode = UserMode` em
+`g_pPsGetContextThread(thread, &ctx, UserMode)` estava certo. **Não estava — essa era a causa
+real do `STATUS_ACCESS_VIOLATION`**, não corrida de suspensão. O parâmetro `Mode` de
+`PsGetContextThread` não escolhe "pega contexto de usermode ou kernel" (a função sempre devolve
+os registradores de usermode do alvo, independente desse parâmetro) — ele diz se o **buffer de
+saída** (`&ctx`) está em memória de usermode ou kernel, pra decidir se faz `ProbeForWrite` nele
+antes de escrever. `ctx` é uma variável local na pilha do **kernel** (deste driver), então o
+modo certo é `KernelMode`; com `UserMode`, o probe falha pra qualquer endereço de kernel —
+batendo exatamente com o `ACCESS_VIOLATION` visto, 100% das vezes, independente de a thread
+estar parada ou não (por isso nem o retry nem o freeze do processo resolviam: o parâmetro
+errado fazia falhar sempre, não só às vezes). Corrigido: `Mode = KernelMode`.
+
+Driver recompilado limpo.
+
+**Update 3 (mesmo dia):** mesmo com `Mode=KernelMode` corrigido, `GET_CONTEXT` ainda falhava —
+dessa vez com `0xC0000001` (`STATUS_UNSUCCESSFUL`) **mesmo com `procSuspended=1`** (processo
+congelado) e só 1 tentativa (o código tratava "processo congelado" como garantia de sucesso
+imediato, igual thread suspensa via `ZwSuspendThread`). Causa provável: `PsSuspendProcess`
+normalmente suspende cada thread via APC, que só é entregue no próximo ponto de checagem da
+thread -- `PsGetContextThread` falha com `STATUS_UNSUCCESSFUL` se pegar a thread ainda
+"Running" bem no instante logo após `PsSuspendProcess` retornar (a suspensão via APC não é tão
+imediata/síncrona quanto `ZwSuspendThread` de uma thread específica). Fix: quando o processo
+foi congelado (`procSuspended != NULL`), agora tenta até 8x com delay curto entre tentativas
+(em vez de 1 tentativa só) -- só quando é `ZwSuspendThread` de verdade (`hThread != NULL`,
+síncrono) que continua sendo 1 tentativa. Caso sem suspensão nenhuma continua em até 20
+tentativas. Log corrigido pra dizer "KernelMode" (texto antigo ainda dizia "UserMode" por
+engano, mesmo já passando `KernelMode` desde o fix anterior).
+
+Driver recompilado limpo.
+
+**Update 4 (mesmo dia):** mesmo com retries e congelamento de processo, `GET_CONTEXT`
+continuava falhando com `STATUS_UNSUCCESSFUL`. Usuário sugeriu que talvez faltasse estar
+anexado (`KeStackAttachProcess`) no processo dono da thread antes de chamar
+`PsGetContextThread` -- todos os outros handlers que lidam com memória/PEB de um processo já
+fazem isso, mas `GET_CONTEXT` não fazia. Fix: `KeStackAttachProcess(PsGetThreadProcess(thread),
+&apcState)` adicionado envolvendo todo o loop de retry + chamada de `PsGetContextThread`,
+`KeUnstackDetachProcess` depois do `__except`. Driver recompilado limpo.
+
+---
+
+## 2026-11-13 — `sc start hpv` falhava com "procedimento não encontrado" (import estático de API não garantida)
+
+**Symptom:** depois dos fixes de WOW64/Threads/Memory/Suspend-Resume, `sc start hpv` passou a
+retornar "Não foi possível encontrar o procedimento especificado" (`STATUS_PROCEDURE_NOT_FOUND`)
+— o driver nem chegava a carregar, então nenhum log aparecia.
+
+**Root cause:** `shvos.c` importava **estaticamente** (linkadas direto no PE, resolvidas pelo
+loader do Windows no carregamento) seis funções do `ntoskrnl` que não têm prototype público na
+WDK (`ZwQuerySystemInformation`, `PsGetProcessPeb`, `PsGetProcessWow64Process`,
+`ZwSuspendThread`, `ZwResumeThread`, `PsGetContextThread`) — hand-declaradas e confirmadas como
+exportadas via `dumpbin /exports` no `ntoskrnl.lib` do **WDK** (build 10.0.28000.0), mas isso
+não garante que a build real do Windows rodando na VM exporte exatamente as mesmas com o mesmo
+nome. Se UMA faltar, o PE loader recusa carregar o driver inteiro (import estático não resolvido
+= `STATUS_PROCEDURE_NOT_FOUND`), e como isso acontece ANTES do `DriverEntry` rodar, nenhum log
+do driver aparece — diagnóstico às cegas.
+
+**Fix:** as seis funções agora são resolvidas **dinamicamente** via `MmGetSystemRoutineAddress`
+em `HpvResolveOptionalApis()` (chamada logo no início do `DriverEntry`, antes de tudo), cada uma
+logada individualmente em `C:\ShvL.txt` ("OK" ou "NAO ENCONTRADA nesta build do Windows"). Os
+ponteiros (`g_pZwQuerySystemInformation`, `g_pPsGetProcessPeb`, etc.) substituem as chamadas
+diretas em todos os handlers que dependiam delas; cada handler agora checa `if (ponteiro ==
+NULL)` no início e devolve o novo status `SHVD_STATUS_ERR_UNSUPPORTED` (em vez de
+`ERR_ACCESS`, que seria enganoso — o problema não é permissão, é a API não existir nessa build)
+em vez de travar o carregamento do driver inteiro. Confirmado via `dumpbin /imports` no
+`shv.sys` final que nenhuma das seis aparece mais como import estático de `ntoskrnl.exe`.
+
+**Lição**: qualquer API de kernel não documentada/hand-declarada daqui pra frente deve ser
+resolvida via `MmGetSystemRoutineAddress` (runtime) em vez de prototype+link estático — um
+import estático que falhe impede o driver de carregar por completo, sem log nenhum, e só
+funções já comprovadamente estáveis desde sempre (como as já existentes antes desta sessão:
+`PsLookupProcessByProcessId`, `ObOpenObjectByPointer`, etc., todas declaradas oficialmente em
+`ntifs.h`) são seguras pra importar estaticamente.
+
+Driver e GUI recompilados limpos (rebuild completo).
+
+**Update (mesmo dia, depois do deploy):** confirmado na VM real — `ZwSuspendThread`/
+`ZwResumeThread` **NÃO** foram encontradas nessa build (apesar de aparecerem no `.lib` do WDK
+usado aqui), mas `PsGetContextThread` foi encontrada normalmente. Isso quebrava
+`SHV_CMD_THREAD_GET_CONTEXT` sem necessidade, porque o handler original exigia as três
+(`g_pZwSuspendThread == NULL || g_pZwResumeThread == NULL || g_pPsGetContextThread == NULL` →
+`ERR_UNSUPPORTED`), mesmo `PsGetContextThread` sendo a única estritamente necessária. Fix:
+`GET_CONTEXT` agora só exige `PsGetContextThread`; suspende/resume em volta da leitura é
+**best-effort** (`canSuspend = g_pZwSuspendThread && g_pZwResumeThread`), se não disponível lê
+o contexto sem congelar a thread (pode ficar levemente impreciso se ela estiver rodando
+naquele instante, mas ainda útil pra stack walk na maioria dos casos). **Suspend/Resume como
+comandos próprios continuam `ERR_UNSUPPORTED` nessa build** (GUI já cai pro `OpenThread`
+usermode como fallback — funciona pra processos não-protegidos, só não pra PPL nessa VM
+específica).
+
+---
+
+## 2026-11-13 — Suspend/Resume/View Stack de thread também via kernel (Terminate adiado)
+
+**Pedido:** completar a aba Processos→Threads com suspend/resume/terminate/view-stack via
+kernel (mesma motivação de PPL dos fixes anteriores). Terminate explicitamente adiado pelo
+usuário.
+
+**Investigação (`dumpbin /exports` no `ntoskrnl.lib` do WDK):**
+- `ZwSuspendThread`, `ZwResumeThread`, `PsGetContextThread`, `PsSetContextThread`,
+  `PsThreadType` — **exportados**, mas sem prototype em nenhum header da WDK (hand-declared,
+  mesmo padrão já usado pra `PsGetProcessPeb`).
+- `ZwTerminateThread` — **NÃO exportado** pro kernel (só existe como entrypoint usermode via
+  ntdll/syscall). Terminar uma thread arbitrária de dentro do driver exige outra técnica (ex.:
+  enfileirar uma APC kernel que chame `PsTerminateSystemThread` quando rodar no contexto da
+  própria thread alvo) — fica pra uma sessão futura.
+
+**Implementação:**
+- `SHV_CMD_THREAD_SUSPEND`/`RESUME` (29/30): `PsLookupThreadByThreadId` → handle kernel-mode
+  via `ObOpenObjectByPointer(..., KernelMode, ...)` (sem `OpenThread` usermode, sem access
+  check de ACL) → `ZwSuspendThread`/`ZwResumeThread`.
+- `SHV_CMD_THREAD_GET_CONTEXT` (31): suspende, `PsGetContextThread(thread, &ctx, UserMode)`
+  (so `CONTEXT_CONTROL|CONTEXT_INTEGER` — o suficiente pra `Rip`/`Rsp`/`Rbp`), resume. Response
+  novo `SHV_THREAD_CONTEXT{Rip,Rsp,Rbp}`.
+- `tab_procs.cpp`: menu Suspend/Resume tenta `backend.SuspendThread`/`ResumeThread` (IOCTL)
+  primeiro, cai pro `OpenThread` usermode antigo só se o backend não estiver conectado.
+- **View Stack**: `WalkThreadStack` (caminho clássico `OpenProcess`+`OpenThread`+
+  `GetThreadContext`+`StackWalk64`) agora cai pra `WalkThreadStackKernel` quando qualquer
+  handle falha (PPL). O fallback usa `backend.GetThreadContext` pra semear
+  `Rip`/`Rsp`/`Rbp`, um **handle FALSO** só como chave interna do `dbghelp` (nunca usado pra
+  acessar o processo de verdade), módulos carregados manualmente via `SymLoadModule64` +
+  `backend.ListProcessModules` (em vez da enumeração automática do `SymInitialize`, que
+  precisaria de handle real), e leitura de memória via `backend.ReadVirt` no lugar de
+  `ReadProcessMemory` (callback customizado `ReadMemoryViaBackend` passado pro `StackWalk64`).
+
+**Limitação conhecida:** o `CONTEXT` do fallback só tem `Rip`/`Rsp`/`Rbp` preenchidos (resto
+zerado) — o desenrolamento via `.pdata`/`.xdata` (`RtlVirtualUnwind`, usado internamente pelo
+`StackWalk64` em x64) normalmente não depende do valor anterior dos outros registradores
+não-voláteis pra computar a cadeia de `Rip`, mas pode degradar em frames que dependam deles.
+
+Driver e GUI recompilados limpos (rebuild completo). Ainda não testado em execução real.
+
+---
+
+## 2026-11-13 — Threads e Memory (aba Processos) também via kernel (mesmo problema de PPL)
+
+**Pedido:** estender pra Threads e Memory da aba Processos o mesmo tratamento já feito pra
+Modules — listar via kernel em vez de API usermode, pra funcionar com processos protegidos.
+
+**Implementação:**
+- `SHV_CMD_LIST_PROCESS_THREADS` (27): `ZwQuerySystemInformation(SystemProcessInformation)`
+  no kernel, filtra pelo PID, devolve `{Tid, StartAddress}` de cada thread. Precisou expandir
+  `SYSTEM_PROCESS_INFORMATION_SHV` (também usada por `SHV_CMD_LIST_PROCS`) com os campos reais
+  que faltavam entre `SessionId` e o array de threads — sem isso o cálculo
+  `entry + sizeof(struct)` pra achar o array de threads saía no offset errado (a struct
+  antiga só ia até `SessionId`, suficiente pros campos que `LIST_PROCS` lê por nome, mas não
+  pro tamanho real da entrada).
+- `SHV_CMD_LIST_PROCESS_MEMORY` (28): `KeStackAttachProcess` + `ZwQueryVirtualMemory` com
+  pseudo-handle `(HANDLE)-1` ("processo atual" = o processo anexado) — sem handle de verdade,
+  sem access check, funciona com PPL. Diferente de `PsGetProcessPeb`/`ZwQuerySystemInformation`,
+  `ZwQueryVirtualMemory` **já vem declarada em `ntifs.h`** — tentei redeclarar do mesmo jeito
+  que as outras e deu erro de compilação (`C4028`: parâmetro 3 diferente da declaração,
+  `C4273`: linkage de DLL inconsistente), porque `MemoryInformationClass` é
+  `MEMORY_INFORMATION_CLASS` (enum), não `ULONG` cru. Corrigido usando a declaração/struct já
+  existentes do WDK (`MEMORY_BASIC_INFORMATION`, enum `MemoryBasicInformation`) em vez de
+  redeclarar.
+- `tab_procs.cpp`: `FetchThreads`/`FetchMemRegions` agora tentam `backend.ListProcessThreads`/
+  `ListProcessMemory` primeiro, com fallback pro código usermode antigo (Toolhelp32/
+  `VirtualQueryEx`) só se o backend não estiver conectado ou o IOCTL não retornar nada.
+
+Driver e GUI recompilados limpos (rebuild completo). Ainda não testado em execução real.
+
+---
+
+## 2026-11-13 — Aba Processos→Modules ainda usava Toolhelp32 (IOCTL só estava no desmontador)
+
+**Symptom:** depois de implementar `SHV_CMD_LIST_PROCESS_MODULES` + fix WOW64, usuário
+reportou "ainda o mesmo problema" — processos sem módulos continuavam sem módulos.
+
+**Root cause:** o IOCTL só tinha sido ligado em `tab_disasm.cpp` (usado dentro de
+Memória→Leitura→Desmontar). A aba **Processos→Modules** (`tab_procs.cpp`, `FetchModules`)
+tem sua PRÓPRIA listagem de módulos, independente, que ainda chamava
+`CreateToolhelp32Snapshot` puro em usermode — nunca tinha sido tocada, então continuava
+falhando pros mesmos processos protegidos/PPL de sempre.
+
+**Fix:** `tab_procs.cpp` (`FetchModules`) agora recebe `ShvBackend&` e tenta
+`backend.ListProcessModules(pid, ...)` (IOCTL) primeiro; só cai pro Toolhelp32 antigo se o
+backend não estiver conectado ou a chamada via IOCTL não retornar nada (fallback, não
+substituição — mantém funcionando se o driver não estiver carregado). As duas chamadas de
+`FetchModules` (seleção de processo na lista e refresh da sub-aba "Modules") foram
+atualizadas pra passar `backend`.
+
+**Lição**: havia DUAS listagens de módulo de processo na GUI (desmontador e aba Processos),
+que pareciam a mesma feature mas eram código totalmente separado — ao portar pro IOCTL,
+esquecer de procurar TODOS os usos de Toolhelp32/módulos antes de declarar terminado.
+
+Driver recompilado limpo. Ainda não testado em execução real.
+
+---
+
+## 2026-11-13 — SHV_CMD_LIST_PROCESS_MODULES: processos WOW64 (32-bit) não mostravam módulos
+
+**Symptom:** depois de implementar `SHV_CMD_LIST_PROCESS_MODULES` (lista módulos de um
+processo lendo a PEB via kernel, pra funcionar com processos protegidos/PPL), alguns
+processos continuavam sem mostrar módulo nenhum na aba Memória→Leitura→Desmontar.
+
+**Root cause:** o handler só lia a PEB **nativa** (64-bit) do processo via `PsGetProcessPeb`.
+Para um processo **WOW64** (app 32-bit rodando em Windows x64 — bem comum), a PEB nativa tem
+`Ldr` vazio ou não-representativo; a lista de verdade dos módulos 32-bit carregados fica na
+**PEB32**, uma estrutura separada só alcançável via `PsGetProcessWow64Process`.
+
+**Fix:** `nt/shvos.c` agora chama `PsGetProcessWow64Process(process)` primeiro; se não-NULL
+(processo é WOW64), percorre a PEB32/`PEB_LDR_DATA32`/`LDR_DATA_TABLE_ENTRY32` (structs novas
+`HPV_PEB32`/`HPV_PEB_LDR_DATA32`/`HPV_LDR_DATA_TABLE_ENTRY32`/`HPV_LIST_ENTRY32`/
+`HPV_UNICODE_STRING32` em `nt/shvos.c`, campos como `ULONG` em vez de ponteiro de 64-bit,
+zero-extendidos pra endereço válido já que WOW64 roda abaixo de 4GB no mesmo address space);
+se NULL (processo nativo x64), cai no caminho antigo (PEB/`PEB_LDR_DATA`/`LDR_DATA_TABLE_ENTRY`
+normais). Ambos os caminhos continuam dentro do mesmo `__try/__except` já existente.
+
+**Limitação conhecida que PERMANECE** (não é bug, é esperado): processos "minimal"/sem PEB de
+verdade (System, Registry, Secure System, Memory Compression) continuam sem módulos —
+`PsGetProcessPeb` retorna NULL ou `Ldr` vazio pra eles, não há nada pra ler.
+
+Driver recompilado (`MSBuild.exe shv.sln /p:Configuration="Windows NT" /p:Platform=x64
+/t:Rebuild`), sem erros/avisos. Ainda não testado em execução real contra um app 32-bit de
+verdade.
+
+---
+
+## 2026-11-13 — HpvFindPattern (PspExitProcess) restrito à .text, deveria varrer o módulo inteiro
+
+**Symptom:** usuário suspeitava que a assinatura de `PspExitProcess` (confirmada correta por
+ele) não estava sendo encontrada; hipótese inicial era a troca de `strlen(Mask)` por
+`HpvMaskLength(Mask)` em `HpvFindPattern`.
+
+**Investigação:** revisão de `nt/hpv_pattern.c` mostrou que `HpvMaskLength` é funcionalmente
+idêntica a `strlen` (conta bytes até `'\0'`), e toda a lógica de `HpvFindPattern`/
+`HpvPatternCompareAt` (bounds check, avanço de ponteiros, comparação por máscara) está
+correta — não é a causa. A máscara `"xxxx?xxxx?xxxx?xxxxxx"` (21 chars) bate com o tamanho do
+`kPspExitProcessPattern` (21 bytes), confirmando que não há mismatch de tamanho.
+
+**Root cause (real):** `HpvFindNtoskrnlTextSection` restringe a busca à seção `.text` do
+`ntoskrnl.exe`. Se a assinatura estiver em outra seção, ou se o parsing de seções não achar o
+range certo na build atual, `HpvFindPattern` nunca vai encontrar a assinatura mesmo estando
+correta.
+
+**Fix:** extraído o lookup de `DllBase`/`SizeOfImage` via `PsLoadedModuleList` para uma função
+interna compartilhada `HpvFindNtoskrnlModuleBase` (`nt/hpv_pattern.c`). Nova função pública
+`HpvFindNtoskrnlModule(Base, Size)` devolve o módulo `ntoskrnl.exe` inteiro (sem parsing de PE,
+sem restringir a `.text`), declarada em `nt/shvos_internal.h`. `ShvPolicyHooksInit`
+(`nt/hpv_policy_hooks.c`) agora chama `HpvFindNtoskrnlModule` em vez de
+`HpvFindNtoskrnlTextSection` antes do `HpvFindPattern` de `PspExitProcess`.
+`HpvFindNtoskrnlTextSection` continua existindo (ainda restrita a `.text`) pra quem precisar
+dela no futuro.
+
+Driver recompilado (`MSBuild.exe shv.sln /p:Configuration="Windows NT" /p:Platform=x64`), sem
+erros/avisos, `shv.sys` assinado com sucesso. Ainda não testado em execução real (carregar o
+driver e confirmar que a assinatura é encontrada).
+
+---
+
 ## 2026-11-12 — EPT Hook: VA exibido na GUI sempre virava o início da página
 
 **Symptom:** usuário instalou um EPT hook em `0x40009` (dentro da página `0x40000`); a coluna
@@ -422,3 +821,102 @@ comparação O(n²) linha-a-linha) pra não travar com histórico grande (`kEven
 
 GUI (`usermode_gui.exe`) recompilada (`MSBuild.exe usermode_gui.slnx
 /p:Configuration=Debug /p:Platform=x64`), sem erros.
+
+---
+
+## 2026-11-12 — nt/hpv_pattern.c: utilitário de pattern/signature scan
+
+**Pedido:** adicionar um `find_pattern` genérico (baseado num snippet clássico de
+`data_compare`/`find_pattern` usado em RE) como utilitário no projeto, pra permitir achar
+funções do `ntoskrnl.exe` que NÃO são exportadas (`MmGetSystemRoutineAddress` só resolve
+exports) — motivação: planejar hookar `PspExitProcess` (não exportada) futuramente, pra
+desfazer automaticamente MDLs/EPT hooks de um processo quando ele termina, sem usar
+`PsSetCreateProcessNotifyRoutineEx`.
+
+**Implementação:** novo arquivo `nt/hpv_pattern.c` (adicionado em `shv.vcxproj`, mesma
+condição `Configuration=='NT'` dos outros arquivos de `nt/`), com:
+- `HpvPatternCompareAt` (static): compara um offset contra `Pattern`/`Mask`, onde `Mask[i]
+  == 'x'` significa "compara este byte" e qualquer outro caractere é wildcard — mesma
+  convenção clássica do snippet original (`bmask`/`szmask`), adaptada pra C puro (sem
+  `bool`/`uintptr_t`, usa `BOOLEAN`/`UINT64`/`UINT8`).
+- `HpvMaskLength` (static): tamanho da máscara sem depender de `strlen` do CRT (pode não
+  linkar em driver de kernel).
+- `HpvFindPattern(Base, Size, Pattern, Mask)` (pública, declarada em `shvos_internal.h`):
+  varre `[Base, Base+Size)` e retorna o endereço do primeiro offset que bate com a
+  assinatura inteira, ou 0 se não achar.
+
+**Nota importante (ainda NÃO implementada):** ainda falta a parte de localizar a *base* e
+o *tamanho da seção `.text`* do `ntoskrnl.exe` carregado pra passar como `Base`/`Size` —
+isso normalmente vem de `PsLoadedModuleList`/`MmGetSystemRoutineAddress` (pra achar a base
+pelo nome do módulo) + parsing do PE (`IMAGE_NT_HEADERS`/seção `.text`) pra achar o
+tamanho. `HpvFindPattern` em si só faz a busca linear — quem chama ainda precisa fornecer
+`Base`/`Size` corretos.
+
+Driver recompilado (`MSBuild.exe shv.sln /p:Configuration="Windows NT" /p:Platform=x64`),
+sem erros, `shv.sys` assinado com sucesso.
+
+---
+
+## 2026-11-12 — Hook em PspExitProcess: limpa MDL/EPT hook automaticamente no exit do processo
+
+**Pedido:** em vez de `PsSetCreateProcessNotifyRoutineEx`, usar o mesmo mecanismo de shadow
+hook (split-page EPT) já usado em `NtOpenProcess`/`MmCopyVirtualMemory`, mas em
+`PspExitProcess` (não exportada), pra resolver o BSOD `PROCESS_HAS_LOCKED_PAGES` (0xCB)
+quando um processo com EPT Hook de usermode ativo é fechado sem desinstalar o hook
+primeiro (ver fix anterior "BSOD ao fechar processo com hook EPT").
+
+**Implementação (4 peças novas):**
+1. `nt/hpv_pattern.c`: `HpvFindNtoskrnlTextSection(Base, Size)` — acha a base do
+   `ntoskrnl.exe` via `RtlPcToFileHeader` (ancorado num export estável, `NtOpenProcess`,
+   resolvido via `MmGetSystemRoutineAddress`) e faz parsing manual do PE
+   (`IMAGE_DOS_HEADER`/`IMAGE_NT_HEADERS`/`IMAGE_SECTION_HEADER` via `<ntimage.h>`) pra
+   achar a seção `.text` — é o range que `HpvFindPattern` varre.
+2. `shvvmxhv.c`: `ShvHookRemoveByPid(Pid, OutPhysAddrs, MaxOut)` — nova função que remove
+   da `ShvHookTable[]` global todo hook normal (não-shadow) de um PID, devolvendo os
+   `PhysAddr` removidos (pra quem chama achar o MDL correspondente). Declarada em
+   `shv.h`/`shvos_internal.h`; `SHV_HOOK_MAX_ENTRIES` (antes só local em `shvvmxhv.c`)
+   também foi publicado em `shv.h`/`shvos_internal.h` (guardado com `#ifndef`) pra
+   dimensionar o buffer de saída sem duplicar o número mágico.
+3. `nt/shvos.c`: `ShvCleanupExitedProcess(Pid)` — chama `ShvHookRemoveByPid`, e pra cada
+   `PhysAddr` devolvido usa `ShvHookTakeMdl`/`MmUnlockPages`/`IoFreeMdl` (a mesma tabela de
+   MDLs já usada pelo `SHV_CMD_UNHOOK_EPT` manual) + `ShvOsForceAllCpuVmExit()`.
+4. `nt/hpv_policy_hooks.c`: hook de `HpvExitProcessHook(LastThread, Process)` em
+   `PspExitProcess` — quando `LastThread==TRUE`, chama `ShvCleanupExitedProcess(pid)` ANTES
+   de repassar pro original. Resolvido em `ShvPolicyHooksInit` via
+   `HpvFindNtoskrnlTextSection` + `HpvFindPattern` com a assinatura
+   `\x48\x89\x5C\x24\x00\x48\x89\x74\x24\x00\x57\x48\x83\xEC\x00\x48\x8B\xDA\x40\x8A\xF1`
+   (`xxxx?xxxx?xxxx?xxxxxx`) fornecida pelo usuário, depois `HpvHookFuncByVa` (mesmo
+   split-page EPT de `NtOpenProcess`). **Não-fatal** se a seção `.text` ou a assinatura não
+   for encontrada (builds diferentes do Windows podem ter bytes diferentes) — só perde a
+   limpeza automática, resto do driver segue normal. VA encontrado é cacheado
+   (`g_PspExitProcessVa`) porque, sendo não-exportada, não dá pra re-resolver no
+   `ShvPolicyHooksUninit` via `MmGetSystemRoutineAddress` como os outros dois hooks.
+
+**Limitação conhecida (avisada ao usuário antes de implementar):** assinatura de bytes é
+frágil entre builds do Windows — pode parar de bater numa atualização futura. Se isso
+acontecer, o hook simplesmente não instala (log não-fatal), sem quebrar o resto do driver.
+
+Driver recompilado (`MSBuild.exe shv.sln /p:Configuration="Windows NT" /p:Platform=x64`),
+sem erros, `shv.sys` assinado com sucesso.
+
+---
+
+## 2026-11-12 — HpvFindNtoskrnlTextSection: RtlPcToFileHeader nao achava a base corretamente
+
+**Symptom:** a assinatura de PspExitProcess estava correta (confirmada pelo usuario), mas
+HpvFindPattern nao achava nada -- suspeita apontada: problema em HpvFindNtoskrnlTextSection
+(a busca nao estava rodando no range certo).
+
+**Fix (sugestao do usuario):** troquei a forma de achar a base do ntoskrnl.exe. Antes usava
+RtlPcToFileHeader(anyExport, &base) ancorado num export generico (NtOpenProcess) -- trocado
+por um walk direto em PsLoadedModuleList (dado exportado, lista duplamente encadeada dos
+modulos carregados), comparando BaseDllName com "ntoskrnl.exe" via RtlEqualUnicodeString,
+usando DllBase/SizeOfImage da entrada encontrada. Nova struct local
+HPV_LDR_DATA_TABLE_ENTRY (layout estavel desde Vista/7, so os campos iniciais usados:
+InLoadOrderLinks/DllBase/SizeOfImage/BaseDllName). Mantido o parsing de PE pra achar a
+secao .text especifica, com fallback pra varrer o modulo inteiro (DllBase..DllBase+SizeOfImage)
+se a secao .text nao for encontrada no cabecalho, em vez de simplesmente falhar.
+
+Driver recompilado (MSBuild.exe shv.sln /p:Configuration="Windows NT" /p:Platform=x64),
+sem erros, shv.sys assinado com sucesso. Ainda nao confirmado pelo usuario se agora acha
+a assinatura.

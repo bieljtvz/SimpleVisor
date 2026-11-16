@@ -1,5 +1,8 @@
 # SimpleVisor Project Memory
 
+## Regras fixas (ler antes de qualquer tarefa)
+- [ia_prompt.md](ia_prompt.md) — em qual arquivo documentar cada tipo de mudança (fix, arquitetura, build/deploy, problema em aberto, feedback) ao fim de cada prompt
+
 ## Arquitetura e estado atual
 - [Arquitetura completa do projeto](project_architecture.md) — arquivos, globals, fluxo EPT, ring buffer, hook types, MDL locking, protocolo CPUID, restrições
 - [Build e deploy](project_build_deploy.md) — compilar shv.sys/GUI, deploy para VM 192.168.0.102, serviço `hpv`, reboot quando stop falhar
