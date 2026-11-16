@@ -176,6 +176,13 @@ typedef struct _SYSTEM_THREAD_INFORMATION_SHV
 // EPROCESS comeca com KPROCESS; Pcb.DirectoryTableBase esta em +0x28.
 #define EPROCESS_DIR_TABLE_BASE_OFFSET 0x28
 
+// CR3 do processo System, usado como HOST_CR3 da VMCS (ver ShvOsGetSystemCr3
+// em shv.h) -- cacheado na primeira chamada; PsInitialSystemProcess e
+// exportada pelo ntoskrnl e declarada publicamente (ntddk.h), diferente das
+// outras APIs hand-declared neste arquivo.
+NTKERNELAPI PEPROCESS PsInitialSystemProcess;
+static UINT64 g_SystemCr3 = 0;
+
 // Offset de EPROCESS.UserDirectoryTableBase -- o CR3 usado em ring-3 quando
 // KPTI/KVA-shadow (mitigacao Meltdown) esta ativo; DIFERENTE do CR3 "kernel"
 // acima (ver [[feedback_cr3_filter_broke_usermode]] na memoria do projeto:
@@ -2323,6 +2330,21 @@ ShvOsGetPhysicalAddress (
     return MmGetPhysicalAddress(BaseAddress).QuadPart;
 }
 
+UINT64
+ShvOsGetSystemCr3 (
+    VOID
+    )
+{
+    // Cacheado -- DirectoryTableBase do processo System nao muda durante a
+    // vida do SO, entao so precisa ler uma vez (ver comentario completo em
+    // shv.h, ShvOsGetSystemCr3).
+    if (g_SystemCr3 == 0)
+    {
+        g_SystemCr3 = *(UINT64*)((UINT8*)PsInitialSystemProcess + EPROCESS_DIR_TABLE_BASE_OFFSET);
+    }
+    return g_SystemCr3;
+}
+
 UINT8
 ShvOsIsAddressValid (
     _In_ PVOID Va
@@ -2486,8 +2508,11 @@ DriverUnload (
     //
     InterlockedExchange(&g_DriverUnloading, 1);
 
-    // Remove symbolic link to block new device opens
-    IoDeleteSymbolicLink(&symLink);
+    // Remove symbolic link to block new device opens -- so existe se
+    // DriverEntry conseguiu criar o device (DriverObject valido e
+    // IoCreateDevice/IoCreateSymbolicLink deram certo).
+    if (g_ShvDeviceObject != NULL)
+        IoDeleteSymbolicLink(&symLink);
 
     //
     // Uninit process filters (ObRegisterCallbacks) -- waits for in-flight callbacks
@@ -2570,8 +2595,20 @@ DriverEntry (
         RTL_CONSTANT_OBJECT_ATTRIBUTES(&callbackName,
                                        OBJ_CASE_INSENSITIVE |
                                        OBJ_KERNEL_HANDLE);
+    BOOLEAN haveDevice = FALSE; // DriverObject valido E IoCreateDevice/IoCreateSymbolicLink deram certo
+
     UNREFERENCED_PARAMETER(RegistryPath);
 
+    //
+    // Verificacao simples dos ponteiros recebidos -- nao rejeita a carga
+    // (o driver continua funcionando sem a parte que dependeria do ponteiro
+    // nulo), so evita dereferenciar o que nao pode ser usado:
+    //   - RegistryPath: nao e usado por este driver de qualquer forma
+    //     (UNREFERENCED_PARAMETER acima) -- NULL aqui nao muda nada.
+    //   - DriverObject: usado por DriverUnload/MajorFunction[]/IoCreateDevice
+    //     mais abaixo -- se for NULL, pula so essa parte (sem interface
+    //     IOCTL nem DriverUnload automatico nessa carga), mas o resto
+    //     (ShvLoad do hipervisor, hooks de politica, etc.) continua normal.
     //
     // Resolve APIs opcionais (nao garantidas em toda build do Windows) ANTES
     // de mais nada -- se alguma faltar, o log abaixo diz exatamente qual,
@@ -2581,35 +2618,49 @@ DriverEntry (
     HpvResolveOptionalApis();
     HpvThreadUtilsResolveApis();
 
-    //
-    // Make the driver (and SHV itself) unloadable
-    //
-    DriverObject->DriverUnload                         = DriverUnload;
-    DriverObject->MajorFunction[IRP_MJ_CREATE]         = ShvDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_CLOSE]          = ShvDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = ShvDispatchIoctl;
-
-    //
-    // Create device object para o IOCTL interface
-    //
-    status = IoCreateDevice(DriverObject,
-                            0,
-                            &devName,
-                            FILE_DEVICE_UNKNOWN,
-                            FILE_DEVICE_SECURE_OPEN,
-                            FALSE,
-                            &g_ShvDeviceObject);
-    if (!NT_SUCCESS(status))
+    if (DriverObject != NULL)
     {
-        return status;
+        //
+        // Make the driver (and SHV itself) unloadable
+        //
+        DriverObject->DriverUnload                         = DriverUnload;
+        DriverObject->MajorFunction[IRP_MJ_CREATE]         = ShvDispatchPassthrough;
+        DriverObject->MajorFunction[IRP_MJ_CLOSE]          = ShvDispatchPassthrough;
+        DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = ShvDispatchIoctl;
+
+        //
+        // Create device object para o IOCTL interface
+        //
+        status = IoCreateDevice(DriverObject,
+                                0,
+                                &devName,
+                                FILE_DEVICE_UNKNOWN,
+                                FILE_DEVICE_SECURE_OPEN,
+                                FALSE,
+                                &g_ShvDeviceObject);
+        if (NT_SUCCESS(status))
+        {
+            status = IoCreateSymbolicLink(&symLink, &devName);
+            if (NT_SUCCESS(status))
+            {
+                haveDevice = TRUE;
+            }
+            else
+            {
+                ShvLog("[SHV] IoCreateSymbolicLink falhou: 0x%08X -- seguindo sem interface IOCTL\n", status);
+                IoDeleteDevice(g_ShvDeviceObject);
+                g_ShvDeviceObject = NULL;
+            }
+        }
+        else
+        {
+            ShvLog("[SHV] IoCreateDevice falhou: 0x%08X -- seguindo sem interface IOCTL\n", status);
+        }
     }
-
-    status = IoCreateSymbolicLink(&symLink, &devName);
-    if (!NT_SUCCESS(status))
+    else
     {
-        IoDeleteDevice(g_ShvDeviceObject);
-        g_ShvDeviceObject = NULL;
-        return status;
+        ShvLog("[SHV] DriverObject NULL -- pulando DriverUnload/MajorFunction[]/IoCreateDevice "
+               "(sem interface IOCTL nem unload automatico nessa carga)\n");
     }
 
     //
@@ -2640,9 +2691,12 @@ DriverEntry (
     //
     if (g_PowerCallbackRegistration == NULL)
     {
-        IoDeleteSymbolicLink(&symLink);
-        IoDeleteDevice(g_ShvDeviceObject);
-        g_ShvDeviceObject = NULL;
+        if (haveDevice)
+        {
+            IoDeleteSymbolicLink(&symLink);
+            IoDeleteDevice(g_ShvDeviceObject);
+            g_ShvDeviceObject = NULL;
+        }
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -2659,9 +2713,12 @@ DriverEntry (
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "[SHV] HpvTrampolinePoolInit falhou: 0x%08X\n", status);
         ExUnregisterCallback(g_PowerCallbackRegistration);
-        IoDeleteSymbolicLink(&symLink);
-        IoDeleteDevice(g_ShvDeviceObject);
-        g_ShvDeviceObject = NULL;
+        if (haveDevice)
+        {
+            IoDeleteSymbolicLink(&symLink);
+            IoDeleteDevice(g_ShvDeviceObject);
+            g_ShvDeviceObject = NULL;
+        }
         return status;
     }
     ShvLog("[SHV] Trampoline pool OK: %p\n", g_TrampolinePool);
@@ -2683,9 +2740,12 @@ DriverEntry (
         // o Beep hijack falhasse (ver memory/allocations.md).
         HpvTrampolinePoolFree();
         ExUnregisterCallback(g_PowerCallbackRegistration);
-        IoDeleteSymbolicLink(&symLink);
-        IoDeleteDevice(g_ShvDeviceObject);
-        g_ShvDeviceObject = NULL;
+        if (haveDevice)
+        {
+            IoDeleteSymbolicLink(&symLink);
+            IoDeleteDevice(g_ShvDeviceObject);
+            g_ShvDeviceObject = NULL;
+        }
         return status;
     }
     ShvLog("[SHV] Beep hijack OK\n");
@@ -2709,9 +2769,12 @@ DriverEntry (
         HpvTrampolinePoolFree();
         ShvBeepHijackTeardown();
         ExUnregisterCallback(g_PowerCallbackRegistration);
-        IoDeleteSymbolicLink(&symLink);
-        IoDeleteDevice(g_ShvDeviceObject);
-        g_ShvDeviceObject = NULL;
+        if (haveDevice)
+        {
+            IoDeleteSymbolicLink(&symLink);
+            IoDeleteDevice(g_ShvDeviceObject);
+            g_ShvDeviceObject = NULL;
+        }
         return status;
     }
     ShvLog("[SHV] Hipervisor VMX carregado OK\n");

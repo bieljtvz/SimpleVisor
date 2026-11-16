@@ -52,7 +52,6 @@ VOID   ShvVmxClearRestoreTables(VOID);
 extern UINT8 ShvEptExecuteOnlySupported;
 extern UINT64 ShvOriginalLstar;
 extern UINT64 ShvDirectMapBase;    // obsoleto, ver ShvPaRanges
-extern UINT64 ShvSystemCr3;
 extern volatile UINT64 ShvSyscallHookVa;
 
 // Tabela de regioes do direct physical map (shvvmxhv.c) -- layout precisa

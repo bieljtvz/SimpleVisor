@@ -57,7 +57,14 @@ ShvLoad (
     // the PML4 of the system process, which is what this driver entrypoint
     // should be executing in.
     //
-    callbackContext.Cr3 = __readcr3();
+    // NAO usar __readcr3() aqui: DriverEntry/ShvLoad podem rodar no contexto
+    // de um processo diferente do System (ex.: carregamento fora do caminho
+    // padrao do loader) -- __readcr3() capturaria o CR3 desse outro
+    // processo, e se ele sair logo depois, HOST_CR3 na VMCS fica apontando
+    // pra tabelas de pagina ja liberadas: proximo VM-exit = page fault em
+    // VMX root = triple fault silencioso em todas as CPUs. ShvOsGetSystemCr3
+    // devolve o CR3 do processo System (estavel pela vida inteira do SO).
+    callbackContext.Cr3 = ShvOsGetSystemCr3();
     callbackContext.FailureStatus = SHV_STATUS_SUCCESS;
     callbackContext.FailedCpu = -1;
     callbackContext.InitCount = 0;

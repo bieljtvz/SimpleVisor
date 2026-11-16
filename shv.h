@@ -214,6 +214,28 @@ ShvOsGetPhysicalAddress (
     );
 
 //
+// CR3 "estavel" pra usar como HOST_CR3 da VMCS -- NAO pode ser so
+// __readcr3() na hora de ShvLoad(): DriverEntry roda no contexto do
+// processo/thread que chamou (normalmente System, mas nao garantido -- um
+// carregamento manual/fora do caminho padrao do loader pode rodar
+// DriverEntry no contexto de OUTRO processo). Se __readcr3() capturar o CR3
+// desse outro processo e ele sair pouco depois, as tabelas de pagina dele
+// sao liberadas -- o proximo VM-exit usa um HOST_CR3 morto, causa page
+// fault em VMX root, e vira triple fault silencioso em todas as CPUs (sem
+// BSOD, sem WinDbg conseguir quebrar).
+//
+// NT: devolve o CR3 do processo System (PsInitialSystemProcess), estavel
+// pela vida inteira do SO, cacheado apos a primeira chamada.
+// UEFI: __readcr3() (comportamento de sempre -- nao ha o problema de
+// processos sendo criados/destruidos nessa fase, so um unico espaco de
+// enderecamento o tempo todo).
+//
+UINT64
+ShvOsGetSystemCr3 (
+    VOID
+    );
+
+//
 // Wrapper para MmCopyMemory com MM_COPY_MEMORY_PHYSICAL -- documentada pela
 // Microsoft como segura em IRQL <= DISPATCH_LEVEL (ao contrario da variante
 // MM_COPY_MEMORY_VIRTUAL, que exige PASSIVE_LEVEL). Copia os bytes

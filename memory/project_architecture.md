@@ -196,6 +196,19 @@ Tabela MDL: `g_MdlTable[SHV_MDL_TABLE_MAX]` em shvos.c.
 
 ---
 
+## HOST_CR3 da VMCS (`ShvOsGetSystemCr3`)
+
+`shv.c` (`ShvLoad()`, compartilhado NT/UEFI) usa `ShvOsGetSystemCr3()` (não `__readcr3()`
+direto) pra obter o CR3 que vira `HOST_CR3` da VMCS (via `vpData->SystemDirectoryTableBase`,
+`shvvmx.c:725`). No NT, devolve o CR3 do processo System (`PsInitialSystemProcess`), estável
+pra sempre, cacheado — `__readcr3()` sozinho capturaria o CR3 de QUALQUER processo em cujo
+contexto `DriverEntry` estivesse rodando, e se esse processo saísse logo depois, `HOST_CR3`
+ficaria morto → triple fault silencioso no próximo VM-exit (ver [[fixes]]). No UEFI,
+`ShvOsGetSystemCr3()` continua `__readcr3()` direto (sem esse problema nessa fase). **Não
+confundir** com `ShvCaptureSpecialRegisters` (`shvvp.c`), que lê `__readcr3()` por CPU pra
+`GUEST_CR3` — esse é intencional e correto, representa o processo/thread rodando naquela CPU
+no momento do `VMLAUNCH`.
+
 ## RESTRIÇÕES CONHECIDAS
 
 - **KPTI (KVA Shadow)**: código assume KPTI desativado na VM de teste. Com KPTI, CR3 user ≠ CR3 kernel.

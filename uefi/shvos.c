@@ -23,6 +23,7 @@ Environment:
 //
 // Basic UEFI Libraries
 //
+#include <intrin.h>
 #include <Uefi.h>
 #include <Library/UefiLib.h>
 #include <Library/DebugLib.h>
@@ -285,6 +286,21 @@ ShvOsGetPhysicalAddress (
     // UEFI runs with paging disabled
     //
     return (UINT64)BaseAddress;
+}
+
+UINT64
+ShvOsGetSystemCr3 (
+    VOID
+    )
+{
+    //
+    // Fase UEFI: um unico espaco de enderecamento o tempo todo (sem
+    // processos sendo criados/destruidos como no Windows) -- o problema
+    // descrito em shv.h (HOST_CR3 apontando pra tabelas de pagina de um
+    // processo que ja saiu) nao existe aqui. __readcr3() direto continua
+    // correto.
+    //
+    return __readcr3();
 }
 
 INT32

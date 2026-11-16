@@ -4,6 +4,84 @@ Histórico de bugs resolvidos: o que quebrava, a causa raiz e a correção aplic
 
 ---
 
+## 2026-11-16 — HOST_CR3 capturado via __readcr3() podia apontar pra processo errado (triple fault silencioso)
+
+**Contexto:** continuação da pesquisa sobre `DriverEntry` fora do caminho padrão do loader —
+usuário trouxe um relato externo (apontando pra este projeto) descrevendo um bug real: `shv.c`
+(`ShvLoad()`) fazia `callbackContext.Cr3 = __readcr3();` assumindo que `DriverEntry`/`ShvLoad`
+sempre rodam no contexto do processo **System**. Esse valor vira `HOST_CR3` da VMCS
+(`shvvmx.c:725`, `vpData->SystemDirectoryTableBase`).
+
+**Problema:** se `DriverEntry` rodar no contexto de OUTRO processo (ex.: carregamento fora do
+caminho normal do I/O Manager), `__readcr3()` captura o CR3 **desse outro processo**. Quando
+esse processo termina, as tabelas de página dele são liberadas — o próximo VM-exit usa um
+`HOST_CR3` morto, dá page fault em VMX root, e vira **triple fault silencioso em todas as
+CPUs** (sem BSOD, WinDbg não consegue nem quebrar). O mesmo `__readcr3()` era re-executado toda
+vez que `ShvLoad()` rodava, inclusive a partir de `PowerCallback` (resume de sleep) — mesmo
+risco ali.
+
+**Fix:** nova função OS-specific `ShvOsGetSystemCr3()` (declarada em `shv.h`, ao lado das
+outras `ShvOs*`):
+- **NT** (`nt/shvos.c`): devolve o CR3 real do processo System
+  (`*(UINT64*)((UINT8*)PsInitialSystemProcess + EPROCESS_DIR_TABLE_BASE_OFFSET)`,
+  `PsInitialSystemProcess` é exportada e documentada em `ntddk.h`, ao contrário das outras APIs
+  hand-declared neste projeto) — estável pela vida inteira do SO, cacheado em `g_SystemCr3`
+  após a primeira chamada.
+- **UEFI** (`uefi/shvos.c`): continua `__readcr3()` direto — nessa fase não existe o problema
+  (espaço de endereçamento único, sem processos sendo criados/destruídos), então o
+  comportamento de sempre já está correto ali.
+- `shv.c` (`ShvLoad()`, compartilhado NT/UEFI) trocado pra chamar `ShvOsGetSystemCr3()` em vez
+  de `__readcr3()` direto. Como `PowerCallback` só chama `ShvLoad()` de novo, o fix cobre os
+  dois lugares automaticamente.
+- Removida a declaração morta `extern UINT64 ShvSystemCr3;` (`nt/shvos_internal.h`) — nunca
+  tinha definição em lugar nenhum, leftover de uma tentativa anterior incompleta.
+
+**Importante — `ShvCaptureSpecialRegisters` (`shvvp.c:56`) NÃO foi mexido**: aquele
+`__readcr3()` alimenta `GUEST_CR3` (não `HOST_CR3`), e ali o comportamento correto É ler o CR3
+ao vivo de cada CPU (representa o processo/thread que estava rodando naquela CPU no momento do
+`VMLAUNCH`, pra o guest retomar exatamente de onde parou) — trocar esse quebraria a entrada em
+VMX non-root.
+
+Build NT recompilado limpo (rebuild completo). Build UEFI não pôde ser validado nesta máquina
+(falta o toolset v141/VS2017, limitação do ambiente, não relacionada à mudança) — revisão visual
+confirma que segue o mesmo padrão das outras funções `ShvOs*` já existentes em `uefi/shvos.c`.
+
+---
+
+## 2026-11-16 — DriverEntry: checagem de NULL em DriverObject/RegistryPath
+
+**Contexto:** pesquisa (não implementação) sobre problemas ao iniciar o driver fora do
+caminho padrão do I/O Manager levantou vários pontos de atrito; usuário pediu pra corrigir só
+os dois mais simples: `DriverObject` e `RegistryPath` sendo usados sem checagem de NULL.
+
+**Fix (versão 1):** `DriverEntry` validava `DriverObject == NULL || RegistryPath == NULL` logo
+no início e devolvia `STATUS_INVALID_PARAMETER` se qualquer um fosse NULL.
+
+**Fix (versão 2, pedido do usuário):** em vez de recusar a carga inteira, o driver agora
+**degrada graciosamente**: `RegistryPath` nunca foi usado mesmo (`UNREFERENCED_PARAMETER`),
+então NULL nele não muda nada — a checagem foi removida. `DriverObject` é usado por
+`DriverUnload`/`MajorFunction[]`/`IoCreateDevice`/`IoCreateSymbolicLink` — se for NULL, só essa
+parte é pulada (`if (DriverObject != NULL) { ... } else { ShvLog(...) }`), via uma flag
+`haveDevice` que os caminhos de erro seguintes (`g_PowerCallbackRegistration` falha,
+`HpvTrampolinePoolInit` falha, `ShvBeepHijackSetup` falha, `ShvLoad` falha) agora checam antes
+de chamar `IoDeleteSymbolicLink`/`IoDeleteDevice` (senão tentariam desfazer um device que nunca
+existiu). O resto do `DriverEntry` (`HpvResolveOptionalApis`, trampoline pool, Beep hijack,
+`ShvLoad` do hipervisor, `ShvHooksInit`, `ShvPolicyHooksInit`) roda normalmente mesmo sem
+`DriverObject` — só fica sem interface IOCTL (nenhum device/symlink criado) e sem
+`DriverUnload` automático nessa carga (consequência inerente: sem `DriverObject` real não tem
+como o I/O Manager chamar `DriverUnload` de qualquer jeito). `DriverUnload` em si também
+ganhou guarda (`if (g_ShvDeviceObject != NULL)`) antes do `IoDeleteSymbolicLink`, pro caso de
+`IoCreateDevice` ter falhado mas a carga ter continuado mesmo assim.
+
+**Nota:** isso cobre só os dois parâmetros de `DriverEntry` — não resolve os outros pontos
+levantados na pesquisa (objeto `DriverObject` precisar ser um objeto real do Object Manager
+quando não-NULL, `.pdata`/relocations precisarem estar resolvidos antes de `DriverEntry`
+rodar, `ShvLoad()` não ser reentrante, etc.), que ficam de fora por enquanto.
+
+Driver recompilado limpo.
+
+---
+
 ## 2026-11-16 — Auditoria de alocações: 3 vazamentos encontrados e corrigidos
 
 **Pedido:** listar toda alocação de memória de vida longa do driver (não as transientes de
