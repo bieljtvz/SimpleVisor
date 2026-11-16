@@ -90,6 +90,7 @@ VOID     ShvFlushHooksAllCpus(VOID);
 UINT32   ShvInstrLen(_In_ const UINT8* p);
 NTSTATUS HpvTrampolinePoolInit(VOID);
 VOID     HpvTrampolinePoolFree(VOID);
+VOID     HpvShadowPagesReleaseAll(VOID);
 NTSTATUS HpvHookFuncByVa(_In_ PVOID FuncVa, _In_ PVOID HookFunc, _Out_ PVOID* OriginalFunc);
 NTSTATUS HpvHookFuncByName(_In_ PCWSTR FuncName, _In_ PVOID HookFunc, _Out_ PVOID* OriginalFunc);
 NTSTATUS HpvUnhookFuncByVa(_In_ PVOID FuncVa);

@@ -4,6 +4,35 @@ Histórico de bugs resolvidos: o que quebrava, a causa raiz e a correção aplic
 
 ---
 
+## 2026-11-16 — Auditoria de alocações: 3 vazamentos encontrados e corrigidos
+
+**Pedido:** listar toda alocação de memória de vida longa do driver (não as transientes de
+IOCTL) e corrigir o que precisasse. Lista completa em [[allocations]].
+
+**Vazamentos encontrados e corrigidos:**
+1. **Trampoline pool em erro de `DriverEntry`**: se `ShvBeepHijackSetup()` ou `ShvLoad()`
+   falhasse DEPOIS de `HpvTrampolinePoolInit()` ter sucesso, os 4KB nunca eram liberados antes
+   do `return`. Fix: `HpvTrampolinePoolFree()` adicionado nos dois caminhos de erro (seguro
+   liberar direto ali, sem a ordenação pós-VMXOFF, já que EPT nunca chegou a rodar nesse
+   ponto).
+2. **Shadow page órfã quando `g_SyscallHooks` enche**: `HpvHookFuncByVa` alocava shadow
+   page/trampolim ANTES de reservar entrada em `g_SyscallHooks[32]`; se não sobrasse vaga,
+   seguia em frente como se tivesse dado certo, sem jeito de desfazer depois (`HpvUnhookFuncByVa`
+   procura por `FuncVa` nessa tabela). Fix: desfaz tudo (libera/decrementa shadow, recua
+   `g_TrampolineUsed`) e devolve `STATUS_INSUFFICIENT_RESOURCES` em vez de sucesso fantasma.
+3. **`DriverUnload` nunca varria `g_ShadowPages[]`**: só desfazia os 3 hooks automáticos
+   (`ShvPolicyHooksUninit`); um shadow patch manual (`SHV_CMD_HOOK_SHADOW`, aba "Shadow Patch")
+   que o usuário não desinstalasse antes do unload vazava os 4KB até reboot. Fix: nova
+   `HpvShadowPagesReleaseAll()` (`nt/hpv_hooks.c`), chamada em `DriverUnload` logo depois de
+   `ShvUnload()` (VMXOFF) — libera qualquer shadow page que sobrar, dos dois caminhos
+   (automático ou manual).
+
+Driver recompilado limpo (rebuild completo). Ainda não testado em execução real (precisa
+forçar os caminhos de erro de `DriverEntry` e/ou deixar um shadow patch manual sem
+desinstalar antes do unload).
+
+---
+
 ## 2026-11-13 — View Stack de processo protegido: APC especial de kernel (técnica do Process Hacker) em vez de PsGetContextThread
 
 **Contexto:** mesmo com todos os fixes anteriores (Mode=KernelMode, retry, PsSuspendProcess,

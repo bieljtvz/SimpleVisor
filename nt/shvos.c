@@ -2527,6 +2527,15 @@ DriverUnload (
     ShvUnload();
 
     //
+    // Libera TODAS as shadow pages ainda ativas (incluindo patches manuais
+    // via SHV_CMD_HOOK_SHADOW que o usuario nao desinstalou antes do
+    // unload) -- precisa ser DEPOIS de ShvUnload() pelo mesmo motivo do
+    // trampoline pool abaixo (ver comentario em HpvShadowPagesReleaseAll).
+    //
+    ShvLog("[SHV] Liberando shadow pages orfas...\n");
+    HpvShadowPagesReleaseAll();
+
+    //
     // Free trampoline pool AFTER VMXOFF: EPT is gone, shadow pages cannot
     // execute, so no CPU can jump into the trampoline any more.
     //
@@ -2668,6 +2677,11 @@ DriverEntry (
         ShvLog("[SHV] ShvBeepHijackSetup FALHOU: 0x%08X\n", status);
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "[SHV] ShvBeepHijackSetup falhou: 0x%08X\n", status);
+        // VMX/EPT nunca chegaram a rodar neste ponto, entao e seguro liberar
+        // direto (sem a ordenacao pos-VMXOFF exigida no DriverUnload) --
+        // sem isso, os 4KB do trampoline pool vazavam ate reboot sempre que
+        // o Beep hijack falhasse (ver memory/allocations.md).
+        HpvTrampolinePoolFree();
         ExUnregisterCallback(g_PowerCallbackRegistration);
         IoDeleteSymbolicLink(&symLink);
         IoDeleteDevice(g_ShvDeviceObject);
@@ -2689,6 +2703,10 @@ DriverEntry (
     if (!NT_SUCCESS(status))
     {
         ShvLog("[SHV] ShvLoad FALHOU: 0x%08X\n", status);
+        // ShvLoad falhou antes de VMLAUNCH ter sucesso em qualquer CPU (ou
+        // desfez tudo ao detectar falha) -- nenhuma CPU chegou a rodar com
+        // EPT ativo, entao e seguro liberar o trampoline pool direto aqui.
+        HpvTrampolinePoolFree();
         ShvBeepHijackTeardown();
         ExUnregisterCallback(g_PowerCallbackRegistration);
         IoDeleteSymbolicLink(&symLink);

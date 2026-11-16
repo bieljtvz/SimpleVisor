@@ -147,6 +147,40 @@ HpvTrampolinePoolFree (
 }
 
 //
+// HpvShadowPagesReleaseAll -- libera TODAS as shadow pages ainda ativas em
+// g_ShadowPages[], independente de terem sido instaladas via HpvHookFuncByVa
+// (hooks automaticos de politica) ou via SHV_CMD_HOOK_SHADOW manual (aba
+// "Shadow Patch" da GUI). Chamada em DriverUnload, DEPOIS de ShvUnload()
+// (VMXOFF) -- mesma razao do HpvTrampolinePoolFree logo abaixo: com o EPT
+// desligado, nenhuma CPU pode mais executar a shadow page, entao e seguro
+// liberar a memoria fisica.
+//
+// Sem isso, um shadow patch manual que o usuario nao desinstalou via
+// SHV_CMD_UNHOOK_SHADOW antes do driver descarregar vazava os 4KB contiguos
+// pra sempre (ate reboot) -- ShvPolicyHooksUninit so sabe desfazer os 3
+// hooks automaticos (NtOpenProcess/MmCopyVirtualMemory/PspExitProcess),
+// nunca varria a tabela inteira (ver memory/allocations.md).
+//
+VOID
+HpvShadowPagesReleaseAll (
+    VOID
+    )
+{
+    UINT32 i;
+
+    for (i = 0; i < SHV_SHADOW_MAX; i++)
+    {
+        if (g_ShadowPages[i].ShadowVa != NULL)
+        {
+            ShvLog("[SHV-HOOK] DriverUnload: liberando shadow page orfa GPA=%016llX (slot %u)\n",
+                   g_ShadowPages[i].Gpa, i);
+            MmFreeContiguousMemory(g_ShadowPages[i].ShadowVa);
+            RtlZeroMemory(&g_ShadowPages[i], sizeof(SHV_SHADOW_PAGE_RECORD));
+        }
+    }
+}
+
+//
 // HpvShadowPatchAddress -- write Buffer into the shadow page at the same
 // offset as Address within its 4KB physical page.
 // Returns STATUS_NOT_FOUND if no shadow page has been installed for that GPA.
@@ -384,19 +418,49 @@ HpvHookFuncByVa (
     }
 
     // Record in g_SyscallHooks
-    for (i = 0; i < SHV_SYSCALL_HOOK_MAX; i++)
     {
-        if (!g_SyscallHooks[i].InUse)
+        BOOLEAN recorded = FALSE;
+
+        for (i = 0; i < SHV_SYSCALL_HOOK_MAX; i++)
         {
-            g_SyscallHooks[i].SyscallIndex  = 0;
-            g_SyscallHooks[i].DisplacedSize = displaced;
-            g_SyscallHooks[i].HookFunc      = HookFunc;
-            g_SyscallHooks[i].Trampoline    = trampoline;
-            g_SyscallHooks[i].FuncGpa       = gpa;
-            g_SyscallHooks[i].FuncVa        = FuncVa;
-            g_SyscallHooks[i].InUse         = 1;
-            g_SyscallHooks[i].IsInlinePatch  = 0;
-            break;
+            if (!g_SyscallHooks[i].InUse)
+            {
+                g_SyscallHooks[i].SyscallIndex  = 0;
+                g_SyscallHooks[i].DisplacedSize = displaced;
+                g_SyscallHooks[i].HookFunc      = HookFunc;
+                g_SyscallHooks[i].Trampoline    = trampoline;
+                g_SyscallHooks[i].FuncGpa       = gpa;
+                g_SyscallHooks[i].FuncVa        = FuncVa;
+                g_SyscallHooks[i].InUse         = 1;
+                g_SyscallHooks[i].IsInlinePatch  = 0;
+                recorded = TRUE;
+                break;
+            }
+        }
+
+        if (!recorded)
+        {
+            // g_SyscallHooks cheio (SHV_SYSCALL_HOOK_MAX hooks ja ativos) --
+            // sem uma entrada aqui, HpvUnhookFuncByVa NUNCA acharia esse
+            // hook pra desfazer (procura por FuncVa em g_SyscallHooks), e a
+            // shadow page/slot de trampolim ficariam presos ate o driver
+            // descarregar -- desfaz tudo em vez de prosseguir (ver
+            // memory/allocations.md).
+            g_TrampolineUsed--;
+            if (newShadow)
+            {
+                ShvHookRemoveShadow(gpa);
+                ShvOsForceAllCpuVmExit();
+                MmFreeContiguousMemory(g_ShadowPages[slot].ShadowVa);
+                RtlZeroMemory(&g_ShadowPages[slot], sizeof(SHV_SHADOW_PAGE_RECORD));
+            }
+            else
+            {
+                g_ShadowPages[slot].RefCount--;
+            }
+            ShvLog("[SHV-HOOK] HpvHookFuncByVa: g_SyscallHooks cheio (max=%u), hook NAO instalado -- FuncVa=%p\n",
+                   SHV_SYSCALL_HOOK_MAX, FuncVa);
+            return STATUS_INSUFFICIENT_RESOURCES;
         }
     }
 

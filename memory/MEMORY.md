@@ -11,6 +11,9 @@
 - [READ hook só dispara via ReadProcessMemory](project_ept_read_hook_issue.md) — acesso direto usermode não gera eventos; hipótese: execute-only EPT não suportado (fix: usar x=0 para READ hooks); verificar ShvEptExecuteOnlySupported via WinDbg
 - [EFER SCE mode desativado, EPT hook é o caminho](project_ept_hook_over_efer_sce.md) — monitoramento de syscall via EFER.SCE=0+#UD foi desativado; caminho atual é EPT execute hook em KiSystemCall64
 
+## Alocações de memória
+- [allocations.md](allocations.md) — todo alloc de vida longa (trampoline pool, shadow pages, MDL, per-vCPU) com onde libera e vazamentos corrigidos (2026-11-16)
+
 ## Fixes detalhados
 - [fixes.md](fixes.md) — histórico de bugs resolvidos (o que quebrou, causa raiz, correção). Atualizar sempre que resolver algo.
 - [feedback_fixes_log.md](feedback_fixes_log.md) — regra: sempre atualizar fixes.md ao resolver um bug (pedido do usuário)
