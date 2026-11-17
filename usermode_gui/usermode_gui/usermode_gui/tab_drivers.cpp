@@ -12,17 +12,69 @@ Abstract:
 --*/
 
 #include "tab_drivers.h"
+#include "tab_memory.h"
 #include "imgui/imgui.h"
 #include <psapi.h>
+#include <shellapi.h>
 #include <stdio.h>
 #include <string.h>
 #include <vector>
 #include <string>
 
 #pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "shell32.lib")
 
 static const ImVec4 kColorDim  = { 0.55f, 0.55f, 0.55f, 1.0f };
 static const ImVec4 kColorHead = { 0.40f, 0.80f, 1.00f, 1.0f };
+
+// Dump bruto e sequencial da memoria virtual do driver (base..base+size),
+// lida em pedacos via ReadVirt com pid=0 -- memoria de KERNEL e mapeada
+// igual no espaco de enderecamento de qualquer processo, nao precisa de um
+// PID especifico (diferente de modulos usermode). Sem reconstrucao de PE
+// (diferente de DumpPeFromMemory em tab_procs.cpp) pois o objetivo aqui e
+// um dump bruto da memoria pra analise, nao um binario executavel valido.
+static void DumpDriverMemory(ShvBackend& backend, uint64_t base, uint64_t size,
+                              const char* name)
+{
+    if (size == 0) size = 0x10000; // tamanho desconhecido (driver so na lista
+                                     // do psapi, sem correspondencia no hypervisor) --
+                                     // ainda tenta um dump de 64KB a partir da base.
+
+    char exeDir[MAX_PATH] = "";
+    GetModuleFileNameA(NULL, exeDir, sizeof(exeDir));
+    char* sl = strrchr(exeDir, '\\');
+    if (sl) *(sl + 1) = '\0';
+
+    char outDir[MAX_PATH];
+    snprintf(outDir, sizeof(outDir), "%sdrivers_dump", exeDir);
+    CreateDirectoryA(outDir, nullptr);
+
+    char safeName[128];
+    size_t i;
+    for (i = 0; i < sizeof(safeName) - 1 && name[i] != '\0'; i++)
+        safeName[i] = (name[i] == '\\' || name[i] == '/' || name[i] == ':') ? '_' : name[i];
+    safeName[i] = '\0';
+
+    char fpath[MAX_PATH];
+    snprintf(fpath, sizeof(fpath), "%s\\dump_%s.bin", outDir, safeName[0] ? safeName : "driver");
+
+    FILE* fp = nullptr;
+    fopen_s(&fp, fpath, "wb");
+    if (!fp) return;
+
+    static uint8_t chunk[SHV_MAX_READ_SIZE];
+    uint64_t off = 0;
+    while (off < size)
+    {
+        uint32_t sz  = (uint32_t)min(size - off, (uint64_t)SHV_MAX_READ_SIZE);
+        uint32_t got = 0;
+        backend.ReadVirt(base + off, sz, /*pid=*/0, chunk, &got);
+        if (got == 0) break;
+        fwrite(chunk, 1, got, fp);
+        off += got;
+    }
+    fclose(fp);
+}
 
 struct DriverInfo {
     uint64_t    base;
@@ -217,20 +269,19 @@ void RenderTabDrivers(ShvBackend& backend)
         ImGui::Separator();
         ImGui::Spacing();
 
-        // Botoes de acao do hypervisor
-        ImGui::TextUnformatted("EPT Hook na base do driver:");
+        // Acoes rapidas sobre o driver selecionado
+        if (ImGui::Button("Explorer File##dv") && d.path[0])
+        {
+            char arg[MAX_PATH + 12];
+            snprintf(arg, sizeof(arg), "/select,\"%s\"", d.path);
+            ShellExecuteA(nullptr, "open", "explorer.exe", arg, nullptr, SW_SHOW);
+        }
         ImGui::SameLine();
-
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.35f, 0.15f, 1.0f));
-        if (ImGui::Button("Exec Hook##dv"))
-            backend.HookEpt(d.base, SHV_HOOK_EXEC, 1, 0);
+        if (ImGui::Button("View Memory##dv"))
+            TabMemoryNavigateTo(d.base, /*pid=*/0);
         ImGui::SameLine();
-        if (ImGui::Button("Write Hook##dv"))
-            backend.HookEpt(d.base, SHV_HOOK_WRITE, 1, 0);
-        ImGui::SameLine();
-        if (ImGui::Button("Remover Hook##dv"))
-            backend.UnhookEpt(d.base);
-        ImGui::PopStyleColor();
+        if (ImGui::Button("Dump Virtual Memory##dv"))
+            DumpDriverMemory(backend, d.base, d.size, d.name[0] ? d.name : "driver");
 
         ImGui::Spacing();
         if (ImGui::Button("Copiar Base"))

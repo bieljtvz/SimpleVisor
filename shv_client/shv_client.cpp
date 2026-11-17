@@ -252,6 +252,30 @@ bool ShvClient::ListEptHooks(SHV_EPT_HOOK_INFO* out, uint32_t maxCount, uint32_t
     return true;
 }
 
+bool ShvClient::ListRegistryEvents(SHV_REGISTRY_EVENT* out, uint32_t maxCount, uint32_t* outCount)
+{
+    if (!out || maxCount == 0) return false;
+
+    SHV_REQUEST req = {};
+    req.Command = SHV_CMD_LIST_REGISTRY_EVENTS;
+
+    if (!Submit(req) || m_resp.Status != SHVD_STATUS_OK)
+        return false;
+
+    uint32_t n = m_resp.Count;
+    if (n > maxCount) n = maxCount;
+    memcpy(out, m_resp.RegEvents, n * sizeof(SHV_REGISTRY_EVENT));
+    if (outCount) *outCount = n;
+    return true;
+}
+
+bool ShvClient::ClearRegistryEvents()
+{
+    SHV_REQUEST req = {};
+    req.Command = SHV_CMD_CLEAR_REGISTRY_EVENTS;
+    return Submit(req) && m_resp.Status == SHVD_STATUS_OK;
+}
+
 // ============================================================
 // Comandos IOCTL
 // ============================================================
@@ -356,12 +380,14 @@ bool ShvClient::ListProcs(SHV_PROC_ENTRY* out, uint32_t maxCount, uint32_t* outC
     return true;
 }
 
-bool ShvClient::ListModules(SHV_MODULE_ENTRY* out, uint32_t maxCount, uint32_t* outCount)
+bool ShvClient::ListModules(SHV_MODULE_ENTRY* out, uint32_t maxCount, uint32_t* outCount,
+                             uint64_t startIndex)
 {
     if (!out || maxCount == 0) return false;
 
     SHV_REQUEST req = {};
-    req.Command = SHV_CMD_LIST_MODULES;
+    req.Command               = SHV_CMD_LIST_MODULES;
+    req.ListModules.StartIndex = startIndex;
 
     if (!Submit(req) || m_resp.Status != SHVD_STATUS_OK)
         return false;

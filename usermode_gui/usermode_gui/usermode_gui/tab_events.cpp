@@ -18,6 +18,7 @@ Abstract:
 #include "shv_config.h"
 #include "imgui/imgui.h"
 #include <stdio.h>
+#include <string.h>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -615,6 +616,110 @@ static void RenderEventTable(ShvBackend& backend,
     }
 }
 
+// ── Syscalls: eventos de acesso a registro de processos MONITORADOS ─────────
+// (ZwOpenKey/ZwOpenKeyEx/ZwCreateKey/ZwQueryKey, via shadow hook em
+// nt/hpv_registry_hooks.c -- ver SHV_CMD_LIST_REGISTRY_EVENTS).
+
+static const char* RegOpName(unsigned char op)
+{
+    switch (op)
+    {
+        case SHV_REGOP_OPENKEY:   return "OpenKey";
+        case SHV_REGOP_OPENKEYEX: return "OpenKeyEx";
+        case SHV_REGOP_CREATEKEY: return "CreateKey";
+        case SHV_REGOP_QUERYKEY:  return "QueryKey";
+        default:                  return "?";
+    }
+}
+
+static void RenderRegistryEventsTable(ShvBackend& backend)
+{
+    static char     s_pathFilter[128] = "";
+    static uint64_t s_lastSeenSeq     = 0;
+    static bool     s_autoScroll      = true;
+
+    ImGui::Checkbox("Auto-scroll p/ novos##reg", &s_autoScroll);
+    ImGui::SameLine(0, 12);
+    ImGui::SetNextItemWidth(260);
+    ImGui::InputText("Filtro caminho##reg", s_pathFilter, sizeof(s_pathFilter));
+    ImGui::SameLine(0, 12);
+    if (ImGui::Button("Limpar##reg"))
+        backend.ClearRegistryEvents();
+
+    backend.Lock();
+    size_t hist = backend.State().registryEvents.size();
+    backend.Unlock();
+    ImGui::SameLine(0, 20);
+    ImGui::TextDisabled("Historico: %zu", hist);
+
+    ImGui::Spacing();
+
+    if (ImGui::BeginTable("reg_tbl", 6,
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+            ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
+            ImGuiTableFlags_SizingFixedFit,
+            ImVec2(0.0f, ImGui::GetContentRegionAvail().y)))
+    {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Seq",     ImGuiTableColumnFlags_WidthFixed, 60);
+        ImGui::TableSetupColumn("PID",     ImGuiTableColumnFlags_WidthFixed, 70);
+        ImGui::TableSetupColumn("Processo",ImGuiTableColumnFlags_WidthFixed, 140);
+        ImGui::TableSetupColumn("Operacao",ImGuiTableColumnFlags_WidthFixed, 90);
+        ImGui::TableSetupColumn("Status",  ImGuiTableColumnFlags_WidthFixed, 110);
+        ImGui::TableSetupColumn("Caminho da chave", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+
+        bool useFilter = (s_pathFilter[0] != '\0');
+
+        backend.Lock();
+        const auto& evs = backend.State().registryEvents;
+        for (const auto& e : evs)
+        {
+            if (useFilter && !strstr(e.KeyPath, s_pathFilter))
+                continue;
+
+            ImGui::TableNextRow();
+            ImGui::PushID((int)(e.SeqNum & 0x7FFFFFFF));
+
+            ImGui::TableNextColumn();
+            ImGui::Text("%llu", (unsigned long long)e.SeqNum);
+
+            ImGui::TableNextColumn();
+            ImGui::Text("%llu", (unsigned long long)e.Pid);
+
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(e.ProcessName[0] ? e.ProcessName : "?");
+
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(RegOpName(e.Operation));
+
+            ImGui::TableNextColumn();
+            if (e.Status == 0)
+                ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.4f, 1.0f), "0x%08X", (unsigned int)e.Status);
+            else
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.1f, 1.0f), "0x%08X", (unsigned int)e.Status);
+
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(e.KeyPath[0] ? e.KeyPath : "---");
+
+            ImGui::PopID();
+        }
+
+        if (s_autoScroll)
+        {
+            uint64_t newestSeq = evs.empty() ? 0 : evs.back().SeqNum;
+            if (newestSeq != s_lastSeenSeq)
+            {
+                ImGui::SetScrollHereY(1.0f);
+                s_lastSeenSeq = newestSeq;
+            }
+        }
+
+        backend.Unlock();
+        ImGui::EndTable();
+    }
+}
+
 // ── Ponto de entrada ─────────────────────────────────────────────────────────
 
 void RenderTabEvents(ShvBackend& backend)
@@ -677,9 +782,11 @@ void RenderTabEvents(ShvBackend& backend)
     }
 
     // ── Syscalls ──────────────────────────────────────────────────────────────
+    // Monitoramento de acesso a registro (ZwOpenKey/ZwOpenKeyEx/ZwCreateKey/
+    // ZwQueryKey) dos processos MONITORADOS -- ver nt/hpv_registry_hooks.c.
     if (ImGui::BeginTabItem("Syscalls"))
     {
-        RenderPlaceholder("Monitoramento de Syscalls - futura implementacao");
+        RenderRegistryEventsTable(backend);
         ImGui::EndTabItem();
     }
 

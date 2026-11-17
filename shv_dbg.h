@@ -69,6 +69,8 @@ Abstract:
 #define SHV_CMD_THREAD_RESUME        30 // resume uma thread via handle kernel-mode (funciona com PPL)
 #define SHV_CMD_THREAD_GET_CONTEXT   31 // le Rip/Rsp/Rbp de uma thread via PsGetContextThread (funciona com PPL)
 #define SHV_CMD_THREAD_GET_STACK     32 // captura Rip/Rsp/Rbp + stack de kernel via APC especial (funciona com PPL, igual Process Hacker)
+#define SHV_CMD_LIST_REGISTRY_EVENTS 33 // lista eventos de acesso a registro (ZwOpenKey/ZwOpenKeyEx/ZwCreateKey/ZwQueryKey) de processos monitorados
+#define SHV_CMD_CLEAR_REGISTRY_EVENTS 34 // limpa o ring buffer de eventos de registro
 
 //
 // Tipos de hook EPT (bitmask)
@@ -92,6 +94,15 @@ Abstract:
 #define SHV_SHADOW_PATCH_MAX    32
 #define SHV_PROC_NAME_LEN       64
 #define SHV_MOD_NAME_LEN        128
+#define SHV_REG_PATH_LEN        260
+
+//
+// Tipo de operacao de registro monitorada (ver SHV_REGISTRY_EVENT abaixo).
+//
+#define SHV_REGOP_OPENKEY    1
+#define SHV_REGOP_OPENKEYEX  2
+#define SHV_REGOP_CREATEKEY  3
+#define SHV_REGOP_QUERYKEY   4
 
 #pragma pack(push, 1)
 
@@ -170,6 +181,11 @@ typedef struct _SHV_REQUEST
             unsigned long long Pid;
             unsigned long long StartAddr; // continuacao de SHV_CMD_LIST_PROCESS_MEMORY (0 = do inicio)
         } ListProcMemory;
+
+        struct
+        {
+            unsigned long long StartIndex; // continuacao de SHV_CMD_LIST_MODULES (0 = do inicio)
+        } ListModules;
     };
 } SHV_REQUEST, *PSHV_REQUEST;
 
@@ -264,6 +280,25 @@ typedef struct _SHV_THREAD_STACK
 } SHV_THREAD_STACK, *PSHV_THREAD_STACK;
 
 //
+// Evento de acesso a registro de um processo MONITORADO (retornado por
+// SHV_CMD_LIST_REGISTRY_EVENTS) -- gerado pelos shadow hooks de ZwOpenKey/
+// ZwOpenKeyEx/ZwCreateKey/ZwQueryKey em nt/hpv_registry_hooks.c. KeyPath e
+// convertido de UNICODE_STRING (wide) pra ANSI por truncamento simples
+// (suficiente pra exibicao -- a esmagadora maioria dos nomes de chave do
+// registro e ASCII puro).
+//
+typedef struct _SHV_REGISTRY_EVENT
+{
+    unsigned long long SeqNum;        // monotonico, usado pelo cliente pra nao duplicar ao fazer poll
+    unsigned long long Pid;
+    char               ProcessName[SHV_PROC_NAME_LEN];
+    unsigned char      Operation;      // SHV_REGOP_*
+    unsigned int       DesiredAccess;  // so para OpenKey/OpenKeyEx/CreateKey
+    long               Status;         // NTSTATUS retornado pela chamada original
+    char               KeyPath[SHV_REG_PATH_LEN];
+} SHV_REGISTRY_EVENT, *PSHV_REGISTRY_EVENT;
+
+//
 // Informacao de um EPT hook instalado (retornada por SHV_CMD_LIST_EPT_HOOKS).
 //
 typedef struct _SHV_EPT_HOOK_INFO
@@ -328,6 +363,7 @@ typedef struct _SHV_RESPONSE
         SHV_EPT_HOOK_INFO    EptHookInfos[SHV_MAX_READ_SIZE / sizeof(SHV_EPT_HOOK_INFO)];
         SHV_HOOK_INFO        HookInfos[SHV_MAX_READ_SIZE / sizeof(SHV_HOOK_INFO)];
         SHV_SHADOW_HOOK_INFO ShadowHookInfos[SHV_MAX_READ_SIZE / sizeof(SHV_SHADOW_HOOK_INFO)];
+        SHV_REGISTRY_EVENT   RegEvents[SHV_MAX_READ_SIZE / sizeof(SHV_REGISTRY_EVENT)];
     };
 } SHV_RESPONSE, *PSHV_RESPONSE;
 

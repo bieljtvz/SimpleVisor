@@ -215,3 +215,48 @@ no momento do `VMLAUNCH`.
 - **Execute-only EPT**: READ hooks usam r=0,w=0,x=1; requer suporte na CPU.
 - **SHV_HOOK_MAX_ENTRIES = 256** (era 16 até 2026-11-16, aumentado a pedido do usuário): máximo de hooks EPT simultâneos. `ShvHookTable[256]` em `shvvmxhv.c` — array estático simples (56 bytes/entrada, ~14KB total), sem bitmask/contador de tamanho fixo amarrado a esse número (`ShvHookVersion` é só um `UINT64` incremental). Os três `#define` (um em `shv.h`, um em `nt/shvos_internal.h`, um sem guard em `shvvmxhv.c`) precisam ser trocados juntos se mudar de novo. `SHV_RESPONSE.EptHookInfos[]` (buffer do IOCTL `SHV_CMD_LIST_EPT_HOOKS`) comporta até `SHV_MAX_READ_SIZE/sizeof(SHV_EPT_HOOK_INFO)` ≈ 292 entradas — então ainda dá folga acima de 256 nessa listagem.
 - **Ring buffer = 256**: overwrite silencioso de eventos antigos.
+
+## Monitoramento de registro (ZwOpenKey/ZwOpenKeyEx/ZwCreateKey/ZwQueryKey)
+
+**Módulo**: `nt/hpv_registry_hooks.c` — shadow hook (EPT split-page, mesmo motor de
+`nt/hpv_hooks.c`, via `HpvHookFuncByName`) nas 4 variantes **Zw\*** (não Nt\*: um driver
+chamando a API de registro do kernel passa pelas `Zw*`, que são as exportadas nesta WDK — `Nt*`
+correspondentes não são). Instalado/removido dentro de `ShvPolicyHooksInit`/`ShvPolicyHooksUninit`
+(`nt/hpv_policy_hooks.c`), junto dos outros hooks de política — cada um dos 4 hooks é
+independente e não-fatal (falha de um não impede os outros nem o resto do driver).
+
+**Gatilho do log**: só gera evento quando o processo **chamador** (`PsGetCurrentProcessId()`,
+não um "processo alvo" — registro não tem esse conceito) está na lista de **MONITORADOS**
+(`ShvHookMonitoredPids`/nome, mesma lista usada por `NtOpenProcess`/`MmCopyVirtualMemory` em
+`hpv_policy_hooks.c`). Não bloqueia nada, só observa — igual o comportamento de monitoramento
+(não-proteção) já existente. Log duplo: `ShvLog` (arquivo) + `DbgPrintEx` (WinDbg), mesmo padrão
+dos outros hooks de política.
+
+**Resolução do caminho da chave**: `ZwOpenKey`/`ZwOpenKeyEx`/`ZwCreateKey` recebem
+`OBJECT_ATTRIBUTES` (`RootDirectory` opcional + `ObjectName` relativo/absoluto) —
+`ResolvePathFromObjectAttributes` resolve o nome do `RootDirectory` via
+`ObReferenceObjectByHandle` + `ObQueryNameString` (ambas resolvidas **dinamicamente** via
+`MmGetSystemRoutineAddress`, mesmo motivo de todas as outras APIs "não garantidas" deste
+projeto — import estático não resolvido impede o driver de carregar) e concatena com
+`ObjectName`. `ZwQueryKey` não recebe `OBJECT_ATTRIBUTES` (só o handle já aberto) —
+`ResolvePathFromHandle` usa `ZwQueryObject(ObjectNameInformation)` (também resolvida
+dinamicamente) direto no handle. Caminho (`UNICODE_STRING`, wide) convertido pra ANSI por
+truncamento simples (`ConvertUnicodeToAnsiTruncated` — suficiente pra exibição, nomes de chave
+de registro são essencialmente sempre ASCII).
+
+**Transporte pra GUI**: ring buffer próprio no kernel (`g_RegEvents[512]`, `KSPIN_LOCK`,
+`SHV_REGISTRY_EVENT{SeqNum,Pid,ProcessName,Operation,DesiredAccess,Status,KeyPath}`) — **não**
+usa o mecanismo de evento por CPUID (`ShvHvPushEvent`/`SHV_QUERY_EVENT_*`) que serve EPT/LSTAR:
+aquele é necessário só porque EPT violations disparam em VMX root mode (onde CPUID é o único
+canal disponível) e tem payload de tamanho fixo sem espaço pra string; os hooks de registro
+rodam em contexto kernel normal (fora de VMX root), então um IOCTL simples (`SHV_CMD_
+LIST_REGISTRY_EVENTS`=33 / `SHV_CMD_CLEAR_REGISTRY_EVENTS`=34) basta e permite campo de caminho
+de tamanho variável (`SHV_REG_PATH_LEN`=260). `SeqNum` monotônico permite a GUI (`ShvBackend::
+PollOnce`, a cada 1s) acumular só eventos novos num histórico local (`ShvState::registryEvents`,
+cap `kEventHistoryMax`=20000) sem duplicar entre polls, mesmo com o ring do kernel sendo menor
+(512) que o histórico mantido na GUI.
+
+**GUI**: aba Eventos→Syscalls (`tab_events.cpp`, `RenderRegistryEventsTable`) — antes placeholder
+"futura implementação", agora tabela (Seq/PID/Processo/Operação/Status/Caminho) com filtro de
+texto no caminho, auto-scroll e botão "Limpar" (`ShvBackend::ClearRegistryEvents`, zera ring do
+kernel + histórico local).

@@ -1064,8 +1064,15 @@ ShvDispatchIoctl (
             UINT32 count = 0;
             UINT32 maxEntries = SHV_MAX_READ_SIZE / sizeof(SHV_MODULE_ENTRY);
             UINT32 i;
+            // Paginacao (igual SHV_CMD_LIST_PROCESS_MEMORY): o buffer do IOCTL
+            // so cabe maxEntries modulos de uma vez -- em VMs com muitos drivers
+            // carregados (>maxEntries) a lista cortava sem aviso, deixando o
+            // resto sem "Tamanho" na GUI (enriquecimento em tab_drivers.cpp so
+            // acha os primeiros maxEntries na lista do hypervisor). StartIndex
+            // deixa o cliente (ShvBackend::ListModules) continuar de onde parou.
+            UINT32 startIndex = (UINT32)req.ListModules.StartIndex;
 
-            for (i = 0; i < mods->NumberOfModules && count < maxEntries; i++)
+            for (i = startIndex; i < mods->NumberOfModules && count < maxEntries; i++)
             {
                 PRTL_PROCESS_MODULE_INFORMATION mi = &mods->Modules[i];
                 PSHV_MODULE_ENTRY               me = &resp->Modules[count];
@@ -1740,6 +1747,19 @@ ShvDispatchIoctl (
 
     case SHV_CMD_SET_STACK_FILTER:
         ShvSetStackFilterEnabled((UINT8)req.ProcFilter.Pid);
+        resp->Status = SHVD_STATUS_OK;
+        break;
+
+    case SHV_CMD_LIST_REGISTRY_EVENTS:
+    {
+        UINT32 maxEntries = SHV_MAX_READ_SIZE / sizeof(SHV_REGISTRY_EVENT);
+        resp->Count  = ShvRegistryListEvents(resp->RegEvents, maxEntries);
+        resp->Status = SHVD_STATUS_OK;
+        break;
+    }
+
+    case SHV_CMD_CLEAR_REGISTRY_EVENTS:
+        ShvRegistryClearEvents();
         resp->Status = SHVD_STATUS_OK;
         break;
 

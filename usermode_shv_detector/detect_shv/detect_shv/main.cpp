@@ -17,6 +17,8 @@
 
 #include "../../../shv_comm.h"
 
+#pragma comment(lib, "advapi32.lib")
+
 // ============================================================
 // Console colors
 // ============================================================
@@ -113,6 +115,74 @@ static bool CheckHvVendorLeaf(char outVendor[13])
     memcpy(outVendor + 8, &r.edx, 4);
     outVendor[12] = '\0';
     return (r.eax >= 0x40000001u && r.eax <= 0x4000ffffu);
+}
+
+// ============================================================
+// Teste do monitoramento de registro (nt/hpv_registry_hooks.c)
+// ============================================================
+// RegOpenKeyExA/RegCreateKeyExA/RegQueryInfoKeyA (advapi32) descem pro
+// kernel via syscall de usermode (ntdll!NtOpenKeyEx/NtCreateKey/NtQueryKey).
+// No kernel, essas rotinas Nt* e as Zw* hookeadas por
+// nt/hpv_registry_hooks.c sao o MESMO codigo (Zw* e so a forma chamavel
+// diretamente por um driver, com PreviousMode=KernelMode fixo em vez de
+// herdado da thread) -- entao o shadow hook em "ZwOpenKeyEx" etc. dispara
+// tambem pra este processo usermode, sem precisar de nada especial aqui.
+//
+// Pre-requisito pra ver o log: este processo (detect_shv.exe) precisa
+// estar na lista de MONITORADOS do driver (aba Filtros->Monitorar, ou
+// MonitorName("detect_shv.exe") pela GUI) -- senao os hooks executam mas
+// nao geram evento (ver CallerIsMonitored em hpv_registry_hooks.c).
+static void TestRegistryAccess()
+{
+    SetColor(C_LABEL);
+    printf("  [REG] Disparando ZwOpenKey/ZwCreateKey/ZwQueryKey...\n");
+    SetColor(C_NORMAL);
+
+    HKEY hKey = NULL;
+    LSTATUS st;
+
+    // ZwOpenKey (via RegOpenKeyExA, sem opcoes extras)
+    st = RegOpenKeyExA(HKEY_CURRENT_USER, "Software", 0, KEY_READ, &hKey);
+    printf("      RegOpenKeyExA(HKCU\\Software)                  -> %ld %s\n",
+           st, st == ERROR_SUCCESS ? "OK" : "falhou");
+    if (hKey) { RegCloseKey(hKey); hKey = NULL; }
+
+    // ZwQueryKey (via RegQueryInfoKeyA, precisa de um handle aberto)
+    st = RegOpenKeyExA(HKEY_CURRENT_USER, "Software", 0, KEY_READ, &hKey);
+    if (st == ERROR_SUCCESS)
+    {
+        CHAR  className[256] = {};
+        DWORD classLen = sizeof(className);
+        DWORD subKeys = 0, maxSubKeyLen = 0, values = 0;
+        st = RegQueryInfoKeyA(hKey, className, &classLen, NULL,
+                               &subKeys, &maxSubKeyLen, NULL,
+                               &values, NULL, NULL, NULL, NULL);
+        printf("      RegQueryInfoKeyA(HKCU\\Software)               -> %ld %s\n",
+               st, st == ERROR_SUCCESS ? "OK" : "falhou");
+        RegCloseKey(hKey);
+        hKey = NULL;
+    }
+
+    // ZwCreateKey (via RegCreateKeyExA -- cria uma subchave de teste e a
+    // remove na mesma passada, nao deixa lixo no registro)
+    DWORD disposition = 0;
+    st = RegCreateKeyExA(HKEY_CURRENT_USER,
+                          "Software\\SimpleVisor_RegMonTest",
+                          0, NULL, REG_OPTION_NON_VOLATILE,
+                          KEY_ALL_ACCESS, NULL, &hKey, &disposition);
+    printf("      RegCreateKeyExA(HKCU\\...\\SimpleVisor_RegMonTest) -> %ld %s (disp=%lu)\n",
+           st, st == ERROR_SUCCESS ? "OK" : "falhou", disposition);
+    if (hKey)
+    {
+        RegCloseKey(hKey);
+        RegDeleteKeyA(HKEY_CURRENT_USER, "Software\\SimpleVisor_RegMonTest");
+    }
+
+    SetColor(C_DIM);
+    printf("      Verifique a aba Eventos->Syscalls da GUI (ou "
+           "C:\\SimpleVisor.txt / WinDbg) -- so aparece se este processo\n"
+           "      estiver na lista de MONITORADOS.\n\n");
+    SetColor(C_NORMAL);
 }
 
 // ============================================================
@@ -309,6 +379,7 @@ int main()
         SetColor(C_DIM);
         printf("   F9  -- leitura DIRETA via ponteiro\n");
         printf("   F8  -- leitura via ReadProcessMemory\n");
+        printf("   F7  -- disparar acesso de registro (teste do REGMON)\n");
         printf("   ESC -- sair\n\n");
         SetColor(C_NORMAL);
 
@@ -356,6 +427,10 @@ int main()
                     else
                         printf("FALHOU (err=%lu, nRead=%zu)\n",
                                GetLastError(), nRead);
+                }
+                else if (fn == 0x41) // F7
+                {
+                    TestRegistryAccess();
                 }
             }
             else if (c == 0x1B) // ESC

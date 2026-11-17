@@ -121,6 +121,8 @@ Abstract:
 #define SHV_CMD_THREAD_RESUME        30
 #define SHV_CMD_THREAD_GET_CONTEXT   31
 #define SHV_CMD_THREAD_GET_STACK     32
+#define SHV_CMD_LIST_REGISTRY_EVENTS 33
+#define SHV_CMD_CLEAR_REGISTRY_EVENTS 34
 
 // Status de resposta
 #define SHVD_STATUS_OK             0
@@ -146,6 +148,13 @@ Abstract:
 #define SHV_MAX_READ_SIZE          16384
 #define SHV_PROC_NAME_LEN          64
 #define SHV_MOD_NAME_LEN           128
+#define SHV_REG_PATH_LEN           260
+
+// Tipo de operacao de registro monitorada (SHV_REGISTRY_EVENT)
+#define SHV_REGOP_OPENKEY    1
+#define SHV_REGOP_OPENKEYEX  2
+#define SHV_REGOP_CREATEKEY  3
+#define SHV_REGOP_QUERYKEY   4
 
 // ============================================================
 // Estruturas de protocolo (packed, espelhando o kernel)
@@ -209,6 +218,10 @@ typedef struct {
 } SHV_LISTPROCMEMORY_ARGS;
 
 typedef struct {
+    unsigned long long StartIndex;
+} SHV_LISTMODULES_ARGS;
+
+typedef struct {
     unsigned int Command;
     union {
         SHV_HOOK_ARGS            Hook;
@@ -222,6 +235,7 @@ typedef struct {
         SHV_LISTPROCMODULES_ARGS ListProcModules;
         SHV_THREADCTL_ARGS       ThreadCtl;
         SHV_LISTPROCMEMORY_ARGS  ListProcMemory;
+        SHV_LISTMODULES_ARGS     ListModules;
     };
 } SHV_REQUEST;
 
@@ -298,6 +312,16 @@ typedef struct {
 } SHV_EPT_HOOK_INFO;
 
 typedef struct {
+    unsigned long long SeqNum;
+    unsigned long long Pid;
+    char               ProcessName[SHV_PROC_NAME_LEN];
+    unsigned char      Operation;
+    unsigned int       DesiredAccess;
+    long               Status;
+    char               KeyPath[SHV_REG_PATH_LEN];
+} SHV_REGISTRY_EVENT;
+
+typedef struct {
     unsigned long long Pid;
     char               Name[SHV_PROC_NAME_LEN];
     unsigned char      Type;
@@ -321,6 +345,7 @@ typedef struct {
         SHV_PROC_FILTER_ENTRY Filters[SHV_MAX_READ_SIZE / sizeof(SHV_PROC_FILTER_ENTRY)];
         SHV_SHADOW_HOOK_INFO  ShadowHookInfos[SHV_MAX_READ_SIZE / sizeof(SHV_SHADOW_HOOK_INFO)];
         SHV_EPT_HOOK_INFO     EptHookInfos[SHV_MAX_READ_SIZE / sizeof(SHV_EPT_HOOK_INFO)];
+        SHV_REGISTRY_EVENT    RegEvents[SHV_MAX_READ_SIZE / sizeof(SHV_REGISTRY_EVENT)];
     };
 } SHV_RESPONSE;
 
@@ -416,7 +441,11 @@ public:
     bool ListProcs(SHV_PROC_ENTRY* out, uint32_t maxCount, uint32_t* outCount);
 
     // Lista modulos do KERNEL (ntoskrnl.exe + drivers carregados), nao de um processo.
-    bool ListModules(SHV_MODULE_ENTRY* out, uint32_t maxCount, uint32_t* outCount);
+    // startIndex: continuacao de uma chamada anterior (0 = do inicio) -- o
+    // buffer do IOCTL so cabe SHV_MAX_READ_SIZE/sizeof(SHV_MODULE_ENTRY) de
+    // uma vez; ShvBackend::ListModules pagina automaticamente por cima disto.
+    bool ListModules(SHV_MODULE_ENTRY* out, uint32_t maxCount, uint32_t* outCount,
+                      uint64_t startIndex = 0);
 
     // Lista modulos (EXE+DLLs) do processo pid, via PEB lido pelo kernel
     // (KeStackAttachProcess + PsGetProcessPeb) -- diferente de ListModules
@@ -467,6 +496,15 @@ public:
 
     // Lista EPT hooks instalados via IOCTL.
     bool ListEptHooks(SHV_EPT_HOOK_INFO* out, uint32_t maxCount, uint32_t* outCount);
+
+    // Lista eventos de acesso a registro (ZwOpenKey/ZwOpenKeyEx/ZwCreateKey/
+    // ZwQueryKey) de processos MONITORADOS, capturados via shadow hook
+    // (nt/hpv_registry_hooks.c). Ring buffer no kernel -- chamadas sucessivas
+    // continuam vendo eventos novos ate ClearRegistryEvents() ser chamado.
+    bool ListRegistryEvents(SHV_REGISTRY_EVENT* out, uint32_t maxCount, uint32_t* outCount);
+
+    // Zera o ring buffer de eventos de registro no kernel.
+    bool ClearRegistryEvents();
 
     // Lista filtros de processo (protect/monitor) ativos.
     bool ListFilters(SHV_PROC_FILTER_ENTRY* out, uint32_t maxCount, uint32_t* outCount);

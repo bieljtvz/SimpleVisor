@@ -86,6 +86,8 @@ struct ShvState {
     std::vector<ShvEptHookEntry>       eptHooks;
     std::vector<ShvShadowEntry>        shadowPatches;   // patches instalados pela GUI (IOCTL cru)
     std::vector<ShvShadowEntry>        kernelShadows;   // hooks instalados no startup do driver
+    std::deque<SHV_REGISTRY_EVENT>     registryEvents;  // SHV_CMD_LIST_REGISTRY_EVENTS (acumulado localmente por SeqNum)
+    uint64_t                           lastRegistrySeqSeen = 0;
 };
 
 // ============================================================
@@ -157,6 +159,8 @@ public:
     CmdResult ClearEvents();
     CmdResult SetStackFilter(bool enabled);
     CmdResult ListEptHooks();
+    // Zera o ring buffer de eventos de registro no kernel E o acumulado local.
+    CmdResult ClearRegistryEvents();
 
     // Linha de status (ultima operacao)
     const std::string& StatusMsg()     const { return m_statusMsg;     }

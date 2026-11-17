@@ -4,6 +4,50 @@ Histórico de bugs resolvidos: o que quebrava, a causa raiz e a correção aplic
 
 ---
 
+## 2026-11-17 — Lista de drivers (SHV_CMD_LIST_MODULES) parava de trazer "Tamanho" a partir de certo ponto
+
+**Contexto:** usuário notou que a aba Drivers (`tab_drivers.cpp`) mostrava "Tamanho: ---" pra
+drivers a partir de um certo ponto da lista.
+
+**Causa raiz:** não era falta de memória — era o mesmo limite estrutural já visto e corrigido em
+`SHV_CMD_LIST_PROCESS_MEMORY` (ver entrada "585 regiões" abaixo). `SHV_CMD_LIST_MODULES`
+preenchia `resp->Modules[]` até `SHV_MAX_READ_SIZE / sizeof(SHV_MODULE_ENTRY)` (~113 entradas) e
+devolvia, **sem paginação**, mesmo quando `ZwQuerySystemInformation(SystemModuleInformation)`
+tinha retornado mais que isso (uma VM com muitos drivers carregados facilmente passa de 113).
+`tab_drivers.cpp` usa `EnumDeviceDrivers` (psapi) como lista completa (fonte 1) e só *enriquece*
+com o tamanho vindo de `backend.State().kernelModules` (fonte 2, via hypervisor) — qualquer
+driver cujo índice no array do kernel caísse depois do corte de 113 simplesmente não tinha
+correspondência em `kernelModules`, e `d.size` ficava 0 → coluna mostra "---".
+
+**Fix:** paginação igual a `SHV_CMD_LIST_PROCESS_MEMORY` (que já usa `StartAddr`): novo campo
+`req.ListModules.StartIndex` (`shv_dbg.h`/`shv_client.h`) — o handler em `nt/shvos.c` começa a
+preencher `resp->Modules[]` a partir desse índice no array `mods->Modules[]` em vez de sempre do
+0. `ShvClient::ListModules` ganhou um parâmetro `startIndex` opcional (default 0, compatível com
+chamadas antigas). `ShvBackend::PollOnce` agora pagina automaticamente (mesmo padrão de
+`ShvBackend::ListProcessMemory`): chama em loop com `startIndex += n` até a página voltar menor
+que o buffer (fim da lista) ou vazia, com um teto de 50 páginas (~5650 módulos) contra loop
+infinito. Transparente pros consumidores (`tab_drivers.cpp` não mudou).
+
+---
+
+## 2026-11-17 — Comentário de bloco C fechado prematuramente em hpv_registry_hooks.c
+
+**Contexto:** build inicial do novo monitoramento de registro (ver project_architecture.md)
+falhou com uma cascata de erros de sintaxe (`C2143`, `C2061`, `C2059`) a partir da linha 17 do
+arquivo novo, e warning `C4138: '*/' encontrado fora de comentário` na linha 39.
+
+**Causa raiz:** o comentário de cabeçalho do módulo (estilo `/*++ ... --*/` usado no projeto)
+continha o texto `Nt*/Zw*` — o `*/` dentro dessa sequência fecha o comentário de bloco ali
+mesmo, no meio da explicação, fazendo o compilador tratar o resto do texto do comentário como
+código C de verdade.
+
+**Fix:** reescrito `Nt*/Zw*` como `Nt* e Zw*` (sem a sequência `*/` literal). Lição geral:
+qualquer comentário de bloco neste projeto que precise mencionar dois identificadores separados
+por `/` (ex. `Nt*/Zw*`, `read/write`) corre esse risco se o segundo terminar logo antes de outro
+caractere que complete `*/` — evitar `X*/Y` dentro de `/* ... */`.
+
+---
+
 ## 2026-11-16 — HOST_CR3 capturado via __readcr3() podia apontar pra processo errado (triple fault silencioso)
 
 **Contexto:** continuação da pesquisa sobre `DriverEntry` fora do caminho padrão do loader —

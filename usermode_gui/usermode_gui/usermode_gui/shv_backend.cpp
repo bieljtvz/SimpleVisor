@@ -154,6 +154,28 @@ void ShvBackend::PollOnce()
         }
     }
 
+    // --- Eventos de registro (processos monitorados, ZwOpenKey/ZwOpenKeyEx/
+    // ZwCreateKey/ZwQueryKey) -- acumula localmente por SeqNum, igual o ring
+    // buffer de eventos EPT/LSTAR acima, pois o ring do kernel (512 entradas)
+    // e menor que o historico que a GUI quer manter.
+    {
+        static SHV_REGISTRY_EVENT buf[SHV_MAX_READ_SIZE / sizeof(SHV_REGISTRY_EVENT)];
+        uint32_t n = 0;
+        if (m_client.ListRegistryEvents(buf, _countof(buf), &n))
+        {
+            for (uint32_t i = 0; i < n; i++)
+            {
+                if (buf[i].SeqNum > m_state.lastRegistrySeqSeen)
+                {
+                    m_state.registryEvents.push_back(buf[i]);
+                    m_state.lastRegistrySeqSeen = buf[i].SeqNum;
+                }
+            }
+            while ((int)m_state.registryEvents.size() > kEventHistoryMax)
+                m_state.registryEvents.pop_front();
+        }
+    }
+
     // --- Syscall hooks ---
     {
         static SHV_HOOK_INFO buf[SHV_MAX_READ_SIZE / sizeof(SHV_HOOK_INFO)];
@@ -179,11 +201,33 @@ void ShvBackend::PollOnce()
     }
 
     // --- Modulos do kernel ---
+    // Pagina automaticamente (igual ListProcessMemory): o buffer do IOCTL so
+    // cabe SHV_MAX_READ_SIZE/sizeof(SHV_MODULE_ENTRY) (~113) modulos de uma
+    // vez -- VMs com mais drivers carregados que isso cortavam a lista sem
+    // aviso, deixando o resto sem "Tamanho" na GUI (tab_drivers.cpp so
+    // enriquece com o que estiver em kernelModules). Ver [[fixes]].
     {
         static SHV_MODULE_ENTRY buf[SHV_MAX_READ_SIZE / sizeof(SHV_MODULE_ENTRY)];
-        uint32_t n = 0;
-        if (m_client.ListModules(buf, _countof(buf), &n))
-            m_state.kernelModules.assign(buf, buf + n);
+        const uint32_t kPageCap  = _countof(buf);
+        const uint32_t kMaxPages = 50; // seguranca contra loop infinito (~5650 modulos)
+        uint64_t startIndex = 0;
+
+        m_state.kernelModules.clear();
+        for (uint32_t page = 0; page < kMaxPages; page++)
+        {
+            uint32_t n = 0;
+            if (!m_client.ListModules(buf, kPageCap, &n, startIndex))
+            {
+                m_state.kernelModules.clear();
+                break;
+            }
+            if (n == 0) break;
+
+            m_state.kernelModules.insert(m_state.kernelModules.end(), buf, buf + n);
+
+            if (n < kPageCap) break; // buffer nao encheu -- chegou ao fim
+            startIndex += n;
+        }
     }
 
     // --- Shadow hooks do kernel (startup) ---
@@ -661,6 +705,22 @@ ShvBackend::CmdResult ShvBackend::ListEptHooks()
         }
     }
     else PostStatus(true, "ListEptHooks falhou: %s", ShvClient::StatusString(_st));
+    Unlock();
+    return { _ok, _st };
+}
+
+ShvBackend::CmdResult ShvBackend::ClearRegistryEvents()
+{
+    Lock();
+    bool _ok = m_client.ClearRegistryEvents();
+    uint32_t _st = m_client.LastStatus();
+    if (_ok)
+    {
+        m_state.registryEvents.clear();
+        m_state.lastRegistrySeqSeen = 0;
+        PostStatus(false, "Eventos de registro limpos");
+    }
+    else PostStatus(true, "ClearRegistryEvents falhou: %s", ShvClient::StatusString(_st));
     Unlock();
     return { _ok, _st };
 }

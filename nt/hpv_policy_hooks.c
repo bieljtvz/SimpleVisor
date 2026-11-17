@@ -357,11 +357,18 @@ NTSTATUS ShvPolicyHooksInit(VOID)
         }
     }
 
+    // Monitoramento de registro (ZwOpenKey/ZwOpenKeyEx/ZwCreateKey/ZwQueryKey)
+    // dos processos monitorados -- nt/hpv_registry_hooks.c. Nao-fatal (cada
+    // hook individual ja e nao-fatal la dentro).
+    ShvRegistryHooksInit();
+
     return STATUS_SUCCESS;
 }
 
 VOID ShvPolicyHooksUninit(VOID)
 {
+    ShvRegistryHooksUninit();
+
     if (g_OrigNtOpenProcess != NULL)
     {
         UNICODE_STRING ustr;

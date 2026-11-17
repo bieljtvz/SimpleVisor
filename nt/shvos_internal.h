@@ -120,6 +120,13 @@ extern volatile UINT64 ShvReadVirtualMemoryHookHitCount;
 NTSTATUS ShvPolicyHooksInit(VOID);
 VOID     ShvPolicyHooksUninit(VOID);
 
+// nt/hpv_registry_hooks.c -- monitoramento de acesso a registro (ZwOpenKey/
+// ZwOpenKeyEx/ZwCreateKey/ZwQueryKey) de processos monitorados.
+NTSTATUS ShvRegistryHooksInit(VOID);
+VOID     ShvRegistryHooksUninit(VOID);
+UINT32   ShvRegistryListEvents(_Out_writes_(MaxCount) SHV_REGISTRY_EVENT* Out, _In_ UINT32 MaxCount);
+VOID     ShvRegistryClearEvents(VOID);
+
 // nt/shvos_log.c
 VOID ShvLog(_In_z_ _Printf_format_string_ const char* Fmt, ...);
 
