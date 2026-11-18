@@ -46,7 +46,7 @@ Abstract:
 #define SHV_CMD_UNHOOK_ALL         7   // remove todos os EPT hooks
 #define SHV_CMD_HOOK_SHADOW        8   // instala shadow hook (nao implementado)
 #define SHV_CMD_UNHOOK_SHADOW      9   // remove shadow hook (nao implementado)
-#define SHV_CMD_BEEP_SHADOW_SETUP  10  // upgrade beep hijack para EPT shadow (nao implementado)
+#define SHV_CMD_BEEP_SHADOW_SETUP  10  // upgrade beep hijack (tabela) para EPT shadow na funcao original
 #define SHV_CMD_LIST_SYSCALL_HOOKS 11  // lista syscall hooks (nao implementado)
 #define SHV_CMD_NTOP_PROTECT       12  // adiciona PID a lista de protegidos
 #define SHV_CMD_NTOP_UNPROTECT     13  // remove PID da lista de protegidos
@@ -71,6 +71,7 @@ Abstract:
 #define SHV_CMD_THREAD_GET_STACK     32 // captura Rip/Rsp/Rbp + stack de kernel via APC especial (funciona com PPL, igual Process Hacker)
 #define SHV_CMD_LIST_REGISTRY_EVENTS 33 // lista eventos de acesso a registro (ZwOpenKey/ZwOpenKeyEx/ZwCreateKey/ZwQueryKey) de processos monitorados
 #define SHV_CMD_CLEAR_REGISTRY_EVENTS 34 // limpa o ring buffer de eventos de registro
+#define SHV_CMD_BEEP_SHADOW_REMOVE 35 // downgrade do Beep shadow (Etapa 2) de volta pro hijack de tabela (Etapa 1) -- mantem a comunicacao
 
 //
 // Tipos de hook EPT (bitmask)
@@ -328,16 +329,42 @@ typedef struct _SHV_HOOK_INFO
 } SHV_HOOK_INFO, *PSHV_HOOK_INFO;
 
 //
-// Informacao de um shadow patch instalado via EPT split page
-// (retornada por SHV_CMD_LIST_SHADOW_PATCHES).
+// Informacao de UMA FUNCAO hookeada dentro de uma shadow page (parte de
+// SHV_SHADOW_HOOK_INFO, retornada por SHV_CMD_LIST_SHADOW_PATCHES).
 //
+// Offset/PatchLen/PatchBytes sao POR FUNCAO, nao da pagina -- cada funcao
+// tem seu proprio patch de 12 bytes (JMP) no seu proprio offset dentro da
+// pagina de 4KB compartilhada. Antes, SHV_SHADOW_PAGE_RECORD (kernel) so
+// guardava o do ULTIMO patch aplicado na pagina, entao duas funcoes na
+// mesma pagina apareciam com os MESMOS bytes/offset na GUI -- ver
+// memory/fixes.md.
+//
+typedef struct _SHV_SHADOW_FUNC_INFO
+{
+    unsigned long long FuncVa;
+    unsigned int        Offset;
+    unsigned int        PatchLen;
+    unsigned char        PatchBytes[SHV_SHADOW_PATCH_MAX];
+} SHV_SHADOW_FUNC_INFO, *PSHV_SHADOW_FUNC_INFO;
+
+//
+// Informacao de um shadow patch instalado via EPT split page
+// (retornada por SHV_CMD_LIST_SHADOW_PATCHES) -- uma entrada por PAGINA
+// fisica (GpaPage), com uma ou mais funcoes (Funcs[]) hookeadas nela.
+//
+// Uma UNICA pagina de 4KB pode ter MULTIPLAS funcoes hookeadas (ex.
+// ZwOpenKey/ZwOpenKeyEx vizinhas no binario) -- HpvHookFuncByVa reutiliza a
+// mesma shadow page via RefCount nesse caso (ver nt/hpv_hooks.c). Funcs[]
+// lista TODAS, cada uma com seu proprio offset/bytes (nao so a primeira,
+// nao so os bytes de uma delas repetidos pras outras).
+//
+#define SHV_SHADOW_MAX_FUNCS_PER_PAGE 8
+
 typedef struct _SHV_SHADOW_HOOK_INFO
 {
-    unsigned long long GpaPage;
-    unsigned int       Offset;
-    unsigned int       PatchLen;
-    unsigned char      PatchBytes[SHV_SHADOW_PATCH_MAX];
-    unsigned long long FuncVa;
+    unsigned long long   GpaPage;
+    unsigned int          FuncCount;
+    SHV_SHADOW_FUNC_INFO Funcs[SHV_SHADOW_MAX_FUNCS_PER_PAGE];
 } SHV_SHADOW_HOOK_INFO, *PSHV_SHADOW_HOOK_INFO;
 
 //
@@ -404,4 +431,14 @@ typedef struct _SHV_SYSCALL_HOOK_ENTRY
     void*         FuncVa;
     unsigned char InUse;
     unsigned char IsInlinePatch;
+    // Offset/patch DESTA funcao dentro da pagina de shadow (FuncGpa & 0xFFF) --
+    // por funcao, nao por pagina: quando duas funcoes compartilham a mesma
+    // shadow page (RefCount > 1 em SHV_SHADOW_PAGE_RECORD, ver nt/hpv_hooks.c),
+    // cada uma tem seu proprio offset/bytes de patch (12 bytes de JMP cada),
+    // diferente do record da pagina em si (que so guarda o do ULTIMO patch
+    // aplicado nela -- era por isso que a GUI mostrava os mesmos bytes/offset
+    // pra funcoes diferentes na mesma pagina, ver memory/fixes.md).
+    unsigned int  PatchOffset;
+    unsigned int  PatchLen;
+    unsigned char PatchBytes[SHV_SHADOW_PATCH_MAX];
 } SHV_SYSCALL_HOOK_ENTRY, *PSHV_SYSCALL_HOOK_ENTRY;

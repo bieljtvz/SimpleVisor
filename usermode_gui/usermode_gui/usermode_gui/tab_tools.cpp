@@ -140,6 +140,7 @@ void RenderTabTools(ShvBackend& backend)
     {
         static char s_gpaResult[64] = "";
         static bool s_beepOk = false;
+        static bool s_beepShadowOn = false;
 
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.10f, 0.10f, 1.0f));
         if (ImGui::Button("Remover Todos os Hooks"))
@@ -152,14 +153,34 @@ void RenderTabTools(ShvBackend& backend)
 
         ImGui::SameLine(0, 16);
 
-        if (ImGui::Button("Beep Shadow Setup"))
+        // Checkbox, nao botao: marcar instala o shadow EPT (Etapa 2,
+        // restaura a tabela de dispatch -- stealth); desmarcar faz o
+        // DOWNGRADE de volta pro hijack de tabela (Etapa 1), que mantem a
+        // comunicacao funcionando. NUNCA remover isto pelo botao generico
+        // "Remover Shadow" da aba Filtros->Hook Shadow -- aquele so tira o
+        // redirecionamento EPT sem recolocar o hijack de tabela no lugar,
+        // e o canal Beep perde a comunicacao com o hypervisor.
+        if (ImGui::Checkbox("Beep Shadow", &s_beepShadowOn))
         {
-            uint64_t gpa = 0;
-            auto r = backend.BeepShadowSetup(&gpa);
-            s_beepOk = r.ok;
-            if (r.ok) snprintf(s_gpaResult, sizeof(s_gpaResult), "GPA=0x%llX", gpa);
-            else      snprintf(s_gpaResult, sizeof(s_gpaResult), "Falhou");
+            if (s_beepShadowOn)
+            {
+                uint64_t gpa = 0;
+                auto r = backend.BeepShadowSetup(&gpa);
+                s_beepOk = r.ok;
+                s_beepShadowOn = r.ok; // nao marca se falhou
+                if (r.ok) snprintf(s_gpaResult, sizeof(s_gpaResult), "GPA=0x%llX", gpa);
+                else      snprintf(s_gpaResult, sizeof(s_gpaResult), "Falhou");
+            }
+            else
+            {
+                auto r = backend.BeepShadowRemove();
+                s_beepOk = r.ok;
+                s_beepShadowOn = !r.ok; // continua marcado se a remocao falhou
+                snprintf(s_gpaResult, sizeof(s_gpaResult), r.ok ? "Removido" : "Falhou");
+            }
         }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Upgrade/downgrade do canal Beep entre hijack de tabela e shadow EPT");
         if (s_gpaResult[0])
         {
             ImGui::SameLine();

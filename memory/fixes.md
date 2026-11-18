@@ -4,6 +4,135 @@ Histórico de bugs resolvidos: o que quebrava, a causa raiz e a correção aplic
 
 ---
 
+## 2026-11-18 — Remover Beep Shadow pela aba generica Hook Shadow perdia a comunicacao com o hypervisor
+
+**Contexto:** continuação direta da implementação do Beep Shadow (entrada abaixo). Usuário
+notou que removendo o hook pela aba Filtros→Hook Shadow (botão genérico "Remover Shadow (página
+inteira)") o canal de comunicação Beep parava de responder.
+
+**Causa raiz:** `SHV_CMD_UNHOOK_SHADOW` (usado pelo botão genérico) só remove o redirecionamento
+EPT — não sabe nem precisa saber que, no caso específico do Beep, é a ÚNICA coisa que leva
+chamadas a `ShvDispatchIoctl`. A Etapa 2 do Beep Shadow (`ShvBeepShadowSetup`) já tinha restaurado
+`MajorFunction[IRP_MJ_DEVICE_CONTROL]` pro handler ORIGINAL do Beep (esse é o próprio "stealth"
+da Etapa 2) — então remover só o shadow EPT por ali deixa a tabela de dispatch apontando pro
+Beep original, SEM NENHUM caminho de volta pra `ShvDispatchIoctl`: o canal Beep para de
+responder a `SHV_IOCTL_SUBMIT` de qualquer cliente.
+
+**Fix:** "Beep Shadow" virou um **checkbox** na GUI (`tab_tools.cpp` e `tab_memory.cpp`) em vez
+de um botão de setup só-ida. Desmarcar chama o novo `SHV_CMD_BEEP_SHADOW_REMOVE` →
+`ShvBeepShadowRemove` (`nt/shvos_beep.c`), que remove o shadow EPT **e reinstala o hijack de
+tabela** (`ShvBeepHijackSetup` de novo) no mesmo IOCTL — a comunicação nunca fica sem um caminho
+válido pra `ShvDispatchIoctl`. Documentado nos comentários de `ShvBeepShadowRemove` e no
+checkbox: **nunca** usar o "Remover Shadow" genérico nesta GPA especificamente.
+
+---
+
+## 2026-11-18 — Beep Shadow (SHV_CMD_BEEP_SHADOW_SETUP) nunca foi implementado, so retornava OK/GPA=0
+
+**Contexto:** usuário clicou no botão "Beep Shadow" na GUI e recebeu `Beep shadow OK, GPA=0x0`
+— sem nenhum hook de verdade sendo instalado.
+
+**Causa raiz:** não era bug — o handler em `nt/shvos.c` era um **stub** desde que a Etapa 2 (ver
+comentário em `nt/shvos_beep.c`) foi planejada: `case SHV_CMD_BEEP_SHADOW_SETUP: resp->Status =
+SHVD_STATUS_OK; break;` — não fazia nada além de devolver sucesso, com `resp->PhysAddr`
+(GPA) zerado por padrão (`RtlZeroMemory(resp, ...)` no topo do dispatcher). `shv_dbg.h` já
+marcava isso: `// upgrade beep hijack para EPT shadow (nao implementado)`.
+
+**Fix — implementação completa da Etapa 2** (`nt/shvos_beep.c`):
+- `ShvBeepShadowSetup(&gpa)`: pega o handler ORIGINAL do Beep (`ShvBeepGetOriginalControl()`,
+  salvo pela Etapa 1 em `ShvBeepHijackSetup`, chamada no `DriverEntry`) e instala um shadow hook
+  via EPT nele (`HpvHookFuncByVa`) redirecionando pra `ShvDispatchIoctl` — depois restaura
+  `MajorFunction[IRP_MJ_DEVICE_CONTROL]` pro valor original (`ShvBeepHijackTeardown`), removendo
+  o ponteiro visivelmente alterado na tabela de dispatch (o "stealth" da Etapa 2: um
+  `!drvobj \Driver\Beep` no WinDbg volta a mostrar o handler original do Beep.sys, mas qualquer
+  chamada que entre nele é redirecionada pelo EPT). Idempotente — chamar de novo só devolve a GPA
+  já instalada (`g_BeepShadowVa` cacheada), não reinstala nem falha.
+- `ShvBeepShadowTeardown()`: remove o shadow hook (`HpvUnhookFuncByVa`) — chamada no
+  `DriverUnload` **antes** do VMXOFF (mesma exigência de `ShvPolicyHooksUninit`/qualquer outro
+  shadow hook deste projeto: remover depois do EPT desligado não sincroniza as outras CPUs
+  corretamente). Sem isso, a função original do Beep.sys ficaria redirecionando pra um endereço
+  dentro do nosso driver já descarregado — qualquer chamada real ao Beep.sys depois bugchecaria.
+- `nt/shvos.c` (`SHV_CMD_BEEP_SHADOW_SETUP`): agora chama `ShvBeepShadowSetup` de verdade e
+  preenche `resp->PhysAddr` com a GPA retornada.
+
+---
+
+## 2026-11-18 — Hook Shadow: linhas por função ainda mostravam os MESMOS bytes/offset (vinham da página, não da função)
+
+**Contexto:** continuação direta da entrada abaixo ("Hook Shadow escondia funções"). Depois do
+fix de tooltip→linhas por função, o usuário apontou que faltava distinguir por **VA** (já feito)
+mas os bytes/offset de cada linha ainda vinham de **um lugar só** — a correção anterior só
+resolvia o `FuncVa`; `Offset`/`PatchLen`/`PatchBytes` continuavam vindo de `g_ShadowPages[i]`
+(a página), que só guarda o patch do **ÚLTIMO** hook instalado nela. Então 2+ funções na mesma
+página apareciam com os mesmos bytes/offset — errado pra todas, exceto a última instalada.
+
+**Causa raiz real:** `HpvHookFuncByVa` (`nt/hpv_hooks.c`) escrevia `Offset`/`PatchLen`/
+`PatchBytes` só em `g_ShadowPages[slot]` (um record por **página física**), nunca por função.
+Quando uma segunda função reusa a página (via `RefCount`), seu patch sobrescreve o registro da
+página — a primeira função perde seu offset/bytes registrados, mesmo com o patch dela ainda
+ativo e funcionando na EPT (o bug era só de **relato/exibição**, não de execução).
+
+**Fix:** `SHV_SYSCALL_HOOK_ENTRY` (um registro por FUNÇÃO hookeada, já existia pra guardar
+`FuncVa`/`Trampoline`/etc.) ganhou `PatchOffset`/`PatchLen`/`PatchBytes` PRÓPRIOS, preenchidos em
+`HpvHookFuncByVa` junto com o resto do registro (cada função grava seu próprio patch de 12 bytes
+no seu próprio offset). `SHV_SHADOW_HOOK_INFO` (protocolo IOCTL) virou um array de
+`SHV_SHADOW_FUNC_INFO{FuncVa,Offset,PatchLen,PatchBytes}` por página (`Funcs[8]`), em vez de um
+único offset/bytes pra página inteira — o handler em `nt/shvos.c` agora copia o patch de **cada**
+`g_SyscallHooks[]` que casa com a GPA, não só a VA. Preserva o caso de shadow patch manual (aba
+Memória→Shadow Patch, sem `g_SyscallHooks` associado) como uma linha "sintética" com `FuncVa=0`
+usando o record da página. GUI (`ShvShadowEntry`/`ShvShadowFuncEntry`, `tab_filters.cpp`) segue
+o mesmo padrão: cada linha pega offset/len/bytes do SEU `ShvShadowFuncEntry`, não mais de campos
+compartilhados da página.
+
+---
+
+## 2026-11-18 — Filtros->Hook Shadow escondia funcoes quando varias compartilhavam a mesma pagina
+
+**Contexto:** usuário notou que a aba Filtros→Hook Shadow listava 7 shadow patches, enquanto a
+aba Status (que lista por FUNÇÃO, não por página) mostrava 10 — todos os 10 hooks estavam
+corretamente instalados.
+
+**Causa raiz:** não é bug de contagem — `HpvHookFuncByVa` reutiliza a mesma shadow page via
+`RefCount` quando duas funções hookeadas caem na mesma página física de 4KB (comum com `Zw*`
+vizinhas no binário, ex. `ZwOpenKey`/`ZwOpenKeyEx`). A aba Hook Shadow é **por página**
+(`g_ShadowPages[]`), não por função — 10 funções em 7 páginas únicas é esperado. O problema real
+era de **exibição**: o handler `SHV_CMD_LIST_SHADOW_PATCHES` (`nt/shvos.c`) fazia `break` no
+primeiro `g_SyscallHooks[]` que casasse com a GPA da página, então quando uma página tinha 2+
+funções, só UMA aparecia na coluna "VA" — as demais ficavam completamente invisíveis na GUI.
+
+**Fix:** `SHV_SHADOW_HOOK_INFO.FuncVa` (singular) → `FuncVaCount`/`FuncVas[SHV_SHADOW_MAX_FUNCS_PER_PAGE]`
+(`shv_dbg.h`/`shv_client.h`, cap de 8 por página). O handler agora lista TODAS as correspondências
+em vez de parar na primeira. `ShvShadowEntry` (GUI) ganhou um `std::vector<uint64_t> vas` (mantém
+`va` = `vas[0]` por compatibilidade com o lookup de módulo/CR3 existente, que só fazia sentido
+pra uma VA). A coluna "VA" em `tab_filters.cpp` mostra a primeira + "+..." quando há mais, com
+tooltip listando todas (endereço + nome do módulo de cada uma).
+
+---
+
+## 2026-11-17 — NtGdiBitBlt: MmGetSystemRoutineAddress nao resolve exports de win32k mesmo com attach
+
+**Contexto:** hook de `NtGdiBitBlt` (win32kfull.sys, ver project_architecture.md) logava
+`[WIN32K] NtGdiBitBlt: falhou (0xC000007A) -- va=0000000000000000 (nao fatal)` mesmo com o
+`KeStackAttachProcess(winlogon)` já implementado. `0xC000007A` = `STATUS_PROCEDURE_NOT_FOUND`.
+
+**Causa raiz:** `MmGetSystemRoutineAddress` consulta a lista **global** de módulos do kernel
+(a mesma que `PsLoadedModuleList` cobre) — `win32k.sys`/`win32kfull.sys` fica numa lista **por
+sessão**, separada, que essa API não percorre, independente de estar attached ou não num
+processo Win32. O attach resolve o problema de *mapeamento de memória* (ler/traduzir VA de
+win32k), não o de *resolução por nome* — são dois problemas diferentes que pareciam o mesmo.
+
+**Fix:** dois passos, ambos dentro do mesmo `KeStackAttachProcess(winlogon)`:
+1. `ShvOsFindKernelModuleBase("win32kfull.sys", &base)` (novo helper em `nt/shvos.c`) — acha a
+   base do módulo via `ZwQuerySystemInformation(SystemModuleInformation)` (que SIM lista módulos
+   de sessão, mesmo walk de `SHV_CMD_LIST_MODULES`).
+2. `RtlFindExportedRoutineByName(base, "NtGdiBitBlt")` — rotina **interna do ntoskrnl** (não de
+   win32k), resolvida dinamicamente via `MmGetSystemRoutineAddress` (essa sim funciona, pois é
+   exportada pelo próprio ntoskrnl.exe), que percorre o Export Directory do PE em memória
+   recebido como parâmetro. É o caminho que de fato resolve exports de módulos fora da lista
+   global — usado por técnicas conhecidas de resolução de API em kernel.
+
+---
+
 ## 2026-11-17 — Lista de drivers (SHV_CMD_LIST_MODULES) parava de trazer "Tamanho" a partir de certo ponto
 
 **Contexto:** usuário notou que a aba Drivers (`tab_drivers.cpp`) mostrava "Tamanho: ---" pra

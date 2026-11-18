@@ -240,25 +240,44 @@ void ShvBackend::PollOnce()
             for (uint32_t i = 0; i < n; i++)
             {
                 ShvShadowEntry e = {};
-                e.gpa    = buf[i].GpaPage;
-                e.offset = buf[i].Offset;
-                e.len    = (buf[i].PatchLen < SHV_SHADOW_PATCH_MAX)
-                               ? buf[i].PatchLen : SHV_SHADOW_PATCH_MAX;
-                memcpy(e.bytes, buf[i].PatchBytes, e.len);
+                e.gpa = buf[i].GpaPage;
 
-                // FuncVa agora vem de verdade do kernel pra hooks instalados
-                // via HpvHookFuncByVa (ex. NtOpenProcess) -- o kernel acha por
-                // correspondencia de GPA em g_SyscallHooks[] (ver shvos.c).
+                // Funcs[] vem de verdade do kernel, UMA entrada por FUNCAO
+                // hookeada nesta pagina (ex. ZwOpenKey/ZwOpenKeyEx vizinhas no
+                // binario compartilhando a mesma shadow page) -- cada uma com
+                // seu PROPRIO offset/bytes (nao mais um unico offset/bytes da
+                // pagina repetido pra todas, ver memory/fixes.md). e.va fica
+                // como a PRIMEIRA (compatibilidade com o lookup de modulo/CR3
+                // abaixo, que so faz sentido pra uma VA).
+                for (uint32_t k = 0; k < buf[i].FuncCount; k++)
+                {
+                    ShvShadowFuncEntry f = {};
+                    f.va  = buf[i].Funcs[k].FuncVa;
+                    f.offset = buf[i].Funcs[k].Offset;
+                    f.len    = (buf[i].Funcs[k].PatchLen < SHV_SHADOW_PATCH_MAX)
+                                   ? buf[i].Funcs[k].PatchLen : SHV_SHADOW_PATCH_MAX;
+                    memcpy(f.bytes, buf[i].Funcs[k].PatchBytes, f.len);
+                    e.funcs.push_back(f);
+                }
+                e.va = e.funcs.empty() ? 0 : e.funcs[0].va;
+
                 // Pra shadows criados manualmente pela propria GUI (aba
                 // Memoria->Shadow Patch, modo "Por VA+PID"), o kernel nao tem
-                // de onde tirar isso, entao complementa com o cache local
-                // (shadowPatches) nesse caso.
-                e.va  = buf[i].FuncVa;
+                // de onde tirar a VA (ja veio como a linha "sintetica"
+                // FuncVa=0 montada em shvos.c) -- complementa com o cache
+                // local (shadowPatches), que sabe a VA que a propria GUI usou.
                 if (e.va == 0)
                 {
                     for (const auto& s : m_state.shadowPatches)
                     {
-                        if (s.gpa == e.gpa) { e.va = s.va; e.cr3 = s.cr3; break; }
+                        if (s.gpa == e.gpa)
+                        {
+                            e.va  = s.va;
+                            e.cr3 = s.cr3;
+                            if (e.va != 0 && !e.funcs.empty())
+                                e.funcs[0].va = e.va;
+                            break;
+                        }
                     }
                 }
                 else
@@ -610,22 +629,23 @@ ShvBackend::CmdResult ShvBackend::ShadowPatch(uint64_t gpa, uint32_t offset,
         // sempre guarda/retorna a GPA alinhada), e vira uma linha duplicada na lista.
         uint64_t gpaAligned = gpa & ~0xFFFULL;
         PostStatus(false, "Shadow patch GPA 0x%llX+0x%X (%u bytes)", gpaAligned, offset, len);
+        // Cache local usado SO pra lookup de VA/CR3 por GPA (ver enriquecimento
+        // em PollOnce abaixo) -- offset/bytes de verdade vem sempre do kernel
+        // (SHV_CMD_LIST_SHADOW_PATCHES, por funcao, ver ShvShadowFuncEntry),
+        // nao precisam ser duplicados aqui.
         bool found = false;
         for (auto& s : m_state.shadowPatches)
         {
             if (s.gpa == gpaAligned)
             {
-                s.offset = offset; s.len = len; s.va = va; s.cr3 = cr3;
-                memcpy(s.bytes, bytes, min(len, (uint32_t)SHV_SHADOW_PATCH_MAX));
+                s.va = va; s.cr3 = cr3;
                 found = true; break;
             }
         }
         if (!found)
         {
             ShvShadowEntry e = {};
-            e.gpa = gpaAligned; e.offset = offset; e.va = va; e.cr3 = cr3;
-            e.len = min(len, (uint32_t)SHV_SHADOW_PATCH_MAX);
-            memcpy(e.bytes, bytes, e.len);
+            e.gpa = gpaAligned; e.va = va; e.cr3 = cr3;
             m_state.shadowPatches.push_back(e);
         }
     }
@@ -732,6 +752,17 @@ ShvBackend::CmdResult ShvBackend::BeepShadowSetup(uint64_t* outGpa)
     uint32_t _st = m_client.LastStatus();
     if (_ok) PostStatus(false, "Beep shadow OK, GPA=0x%llX", outGpa ? *outGpa : 0);
     else     PostStatus(true,  "BeepShadowSetup falhou: %s", ShvClient::StatusString(_st));
+    Unlock();
+    return { _ok, _st };
+}
+
+ShvBackend::CmdResult ShvBackend::BeepShadowRemove()
+{
+    Lock();
+    bool _ok = m_client.BeepShadowRemove();
+    uint32_t _st = m_client.LastStatus();
+    if (_ok) PostStatus(false, "Beep shadow removido (voltou pro hijack de tabela)");
+    else     PostStatus(true,  "BeepShadowRemove falhou: %s", ShvClient::StatusString(_st));
     Unlock();
     return { _ok, _st };
 }

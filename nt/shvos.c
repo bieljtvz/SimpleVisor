@@ -481,6 +481,185 @@ typedef struct _RTL_PROCESS_MODULES
     RTL_PROCESS_MODULE_INFORMATION Modules[1];
 } RTL_PROCESS_MODULES, *PRTL_PROCESS_MODULES;
 
+// Comparacao ASCII case-insensitive sem depender da CRT (igual ShvStrEqiA,
+// static em nt/shvhooks.c -- redeclarada aqui pois e local aquele arquivo).
+static BOOLEAN
+ShvOsStrEqiA (
+    _In_z_ const char* a,
+    _In_z_ const char* b
+    )
+{
+    while (*a && *b)
+    {
+        char ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca += 'a' - 'A';
+        if (cb >= 'A' && cb <= 'Z') cb += 'a' - 'A';
+        if (ca != cb) return FALSE;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+// ============================================================
+// ShvOsFindProcessByName -- acha o primeiro processo cujo nome de imagem
+// (ImageName, via ZwQuerySystemInformation(SystemProcessInformation),
+// mesmo walk usado por SHV_CMD_LIST_PROCS acima) bate com Name
+// (case-insensitive, ASCII). Usado por nt/hpv_win32k_hooks.c pra achar o
+// winlogon.exe (processo Win32 de sessao interativa) antes de dar
+// KeStackAttachProcess -- win32k.sys/win32kfull.sys e carregado por SESSAO,
+// nao globalmente, entao MmGetSystemRoutineAddress so resolve exports dele
+// se o processo atual (attach) pertencer a uma sessao com win32k carregado;
+// o processo System (sessao 0) nunca tem win32k mapeado.
+//
+// *OutProcess vem com uma referencia adicional (ObReferenceObjectByPointer
+// via PsLookupProcessByProcessId) -- quem chama precisa ObDereferenceObject
+// depois de usar.
+// ============================================================
+NTSTATUS
+ShvOsFindProcessByName (
+    _In_z_ PCSTR     Name,
+    _Out_  PEPROCESS* OutProcess
+    )
+{
+    ULONG    bufSize = 0x80000;
+    PVOID    sysInfo = NULL;
+    NTSTATUS qStatus = STATUS_UNSUCCESSFUL;
+    UINT32   tries;
+    NTSTATUS result = STATUS_NOT_FOUND;
+
+    *OutProcess = NULL;
+
+    if (g_pZwQuerySystemInformation == NULL)
+        return STATUS_NOT_SUPPORTED;
+
+    for (tries = 0; tries < 4; tries++)
+    {
+        if (sysInfo) ExFreePoolWithTag(sysInfo, 'kWvS');
+        sysInfo = ExAllocatePoolWithTag(PagedPool, bufSize, 'kWvS');
+        if (sysInfo == NULL)
+            return STATUS_INSUFFICIENT_RESOURCES;
+
+        qStatus = g_pZwQuerySystemInformation(SystemProcessInformation,
+                                              sysInfo, bufSize, NULL);
+        if (qStatus != STATUS_INFO_LENGTH_MISMATCH)
+            break;
+        bufSize *= 2;
+    }
+
+    if (!NT_SUCCESS(qStatus))
+    {
+        if (sysInfo) ExFreePoolWithTag(sysInfo, 'kWvS');
+        return qStatus;
+    }
+
+    {
+        PSYSTEM_PROCESS_INFORMATION_SHV entry =
+            (PSYSTEM_PROCESS_INFORMATION_SHV)sysInfo;
+
+        for (;;)
+        {
+            if (entry->ImageName.Buffer != NULL && entry->ImageName.Length > 0)
+            {
+                CHAR  nameBuf[SHV_PROC_NAME_LEN] = { 0 };
+                ULONG nameChars = entry->ImageName.Length / sizeof(WCHAR);
+                ULONG i;
+
+                if (nameChars >= sizeof(nameBuf))
+                    nameChars = sizeof(nameBuf) - 1;
+                for (i = 0; i < nameChars; i++)
+                    nameBuf[i] = (CHAR)entry->ImageName.Buffer[i];
+
+                if (ShvOsStrEqiA(nameBuf, Name))
+                {
+                    PEPROCESS proc = NULL;
+                    if (NT_SUCCESS(PsLookupProcessByProcessId(entry->UniqueProcessId, &proc)))
+                    {
+                        *OutProcess = proc; // referencia ja adquirida por PsLookupProcessByProcessId
+                        result = STATUS_SUCCESS;
+                    }
+                    break;
+                }
+            }
+
+            if (entry->NextEntryOffset == 0)
+                break;
+            entry = (PSYSTEM_PROCESS_INFORMATION_SHV)
+                    ((ULONG_PTR)entry + entry->NextEntryOffset);
+        }
+    }
+
+    ExFreePoolWithTag(sysInfo, 'kWvS');
+    return result;
+}
+
+// ============================================================
+// ShvOsFindKernelModuleBase -- acha a base de um modulo de KERNEL pelo nome
+// de arquivo (ex. "win32kfull.sys") via ZwQuerySystemInformation(
+// SystemModuleInformation) -- mesmo walk usado por SHV_CMD_LIST_MODULES.
+//
+// Usado por nt/hpv_win32k_hooks.c: MmGetSystemRoutineAddress NAO resolve
+// exports de win32k.sys/win32kfull.sys (carregado por sessao, fora da lista
+// global de modulos que essa API consulta -- confirmado na pratica:
+// retorna NULL mesmo com KeStackAttachProcess num processo Win32). O
+// caminho que funciona e achar a BASE do modulo aqui e depois usar
+// RtlFindExportedRoutineByName (rotina interna do ntoskrnl, resolvida
+// dinamicamente via MmGetSystemRoutineAddress -- essa sim funciona porque
+// e exportada pelo proprio ntoskrnl.exe, nao pelo win32k) pra procurar o
+// export dentro do PE em memoria a partir dessa base.
+//
+// DEVE ser chamado com o processo atual ja attached (KeStackAttachProcess)
+// num processo da sessao desejada -- a lista retornada reflete os modulos
+// de sessao visiveis dali (igual qualquer leitura de memoria de sessao).
+// ============================================================
+NTSTATUS
+ShvOsFindKernelModuleBase (
+    _In_z_ PCSTR Name,
+    _Out_  PVOID* OutBase
+    )
+{
+    ULONG    bufSize = 0x40000;
+    PVOID    sysInfo = NULL;
+    NTSTATUS qStatus = STATUS_UNSUCCESSFUL;
+    NTSTATUS result  = STATUS_NOT_FOUND;
+
+    *OutBase = NULL;
+
+    if (g_pZwQuerySystemInformation == NULL)
+        return STATUS_NOT_SUPPORTED;
+
+    sysInfo = ExAllocatePoolWithTag(PagedPool, bufSize, 'mWvS');
+    if (sysInfo == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    qStatus = g_pZwQuerySystemInformation(SystemModuleInformation, sysInfo, bufSize, NULL);
+    if (!NT_SUCCESS(qStatus))
+    {
+        ExFreePoolWithTag(sysInfo, 'mWvS');
+        return qStatus;
+    }
+
+    {
+        PRTL_PROCESS_MODULES mods = (PRTL_PROCESS_MODULES)sysInfo;
+        UINT32 i;
+
+        for (i = 0; i < mods->NumberOfModules; i++)
+        {
+            PRTL_PROCESS_MODULE_INFORMATION mi = &mods->Modules[i];
+            const CHAR* fname = (const CHAR*)(mi->FullPathName + mi->OffsetToFileName);
+
+            if (ShvOsStrEqiA(fname, Name))
+            {
+                *OutBase = mi->ImageBase;
+                result   = STATUS_SUCCESS;
+                break;
+            }
+        }
+    }
+
+    ExFreePoolWithTag(sysInfo, 'mWvS');
+    return result;
+}
+
 // ============================================================
 // Tabela de MDLs: guarda os MDLs que travam paginas user-mode durante hooks EPT.
 // Indexado pela PA do primeiro byte da regiao (page-aligned).
@@ -2053,10 +2232,36 @@ ShvDispatchIoctl (
     }
 
     case SHV_CMD_BEEP_SHADOW_SETUP:
-        // Beep hijack is already set up via dispatch table replacement in DriverEntry.
-        // EPT shadow upgrade is a future enhancement.
-        resp->Status = SHVD_STATUS_OK;
+    {
+        // Beep hijack (Etapa 1, hijack direto da tabela de dispatch) ja foi
+        // instalado em DriverEntry -- aqui fazemos a Etapa 2: upgrade pra
+        // shadow hook via EPT na funcao ORIGINAL do Beep (ver nt/shvos_beep.c),
+        // restaurando a tabela de dispatch pro valor original (stealth).
+        UINT64 gpa = 0;
+        NTSTATUS beepStatus = ShvBeepShadowSetup(&gpa);
+
+        resp->PhysAddr = gpa;
+        resp->Status   = NT_SUCCESS(beepStatus) ? SHVD_STATUS_OK : SHVD_STATUS_ERR_ACCESS;
+        ShvLog("[SHV-IOCTL] BEEP_SHADOW_SETUP -> status=0x%08X gpa=%016llX\n",
+               beepStatus, gpa);
         break;
+    }
+
+    case SHV_CMD_BEEP_SHADOW_REMOVE:
+    {
+        // Downgrade de volta pro hijack direto de tabela (Etapa 1) --
+        // DIFERENTE de SHV_CMD_UNHOOK_SHADOW generico (aba Filtros->Hook
+        // Shadow): aquele so remove o redirecionamento EPT sem recolocar
+        // nada no lugar, deixando o canal Beep sem NENHUM caminho pra
+        // ShvDispatchIoctl (perde a comunicacao). Este reinstala o hijack
+        // de tabela depois de remover o shadow, entao a comunicacao
+        // continua funcionando com o outro mecanismo.
+        NTSTATUS beepStatus = ShvBeepShadowRemove();
+
+        resp->Status = NT_SUCCESS(beepStatus) ? SHVD_STATUS_OK : SHVD_STATUS_ERR_ACCESS;
+        ShvLog("[SHV-IOCTL] BEEP_SHADOW_REMOVE -> status=0x%08X\n", beepStatus);
+        break;
+    }
 
     case SHV_CMD_LIST_SYSCALL_HOOKS:
     {
@@ -2098,30 +2303,51 @@ ShvDispatchIoctl (
                 PSHV_SHADOW_HOOK_INFO shi = &resp->ShadowHookInfos[count];
                 UINT32 j;
                 RtlZeroMemory(shi, sizeof(*shi));
-                shi->GpaPage  = g_ShadowPages[i].Gpa;
-                shi->Offset   = g_ShadowPages[i].Offset;
-                shi->PatchLen = g_ShadowPages[i].PatchLen;
-                shi->FuncVa   = 0;
+                shi->GpaPage   = g_ShadowPages[i].Gpa;
+                shi->FuncCount = 0;
 
-                // g_ShadowPages nao guarda a VA original -- so a GPA (pagina).
-                // Quem sabe a VA de verdade e g_SyscallHooks[] (hooks de
-                // funcao via HpvHookFuncByVa, ex. NtOpenProcess), entao acha
-                // por correspondencia de GPA (pagina) pra nao devolver sempre
-                // FuncVa=0 pra esses casos -- era por isso que a coluna "VA"
-                // em Filtros->Hook Shadow nunca aparecia preenchida na GUI.
-                for (j = 0; j < SHV_SYSCALL_HOOK_MAX; j++)
+                // g_ShadowPages nao guarda offset/bytes POR FUNCAO (so o do
+                // ULTIMO patch aplicado na pagina) -- quem tem isso e
+                // g_SyscallHooks[] (um registro por funcao hookeada via
+                // HpvHookFuncByVa, com seu PROPRIO PatchOffset/PatchBytes,
+                // ver shv_dbg.h). UMA pagina pode ter MULTIPLAS funcoes
+                // hookeadas nela (RefCount > 1, ex. ZwOpenKey/ZwOpenKeyEx
+                // vizinhas no binario) -- lista TODAS, cada uma com seus
+                // proprios bytes (nao so a primeira, nao bytes repetidos de
+                // uma so pra todas -- ver memory/fixes.md).
+                for (j = 0; j < SHV_SYSCALL_HOOK_MAX &&
+                            shi->FuncCount < SHV_SHADOW_MAX_FUNCS_PER_PAGE; j++)
                 {
                     if (g_SyscallHooks[j].InUse &&
                         (g_SyscallHooks[j].FuncGpa & ~0xFFFULL) == g_ShadowPages[i].Gpa)
                     {
-                        shi->FuncVa = (UINT64)(ULONG_PTR)g_SyscallHooks[j].FuncVa;
-                        break;
+                        PSHV_SHADOW_FUNC_INFO fi = &shi->Funcs[shi->FuncCount++];
+                        fi->FuncVa   = (UINT64)(ULONG_PTR)g_SyscallHooks[j].FuncVa;
+                        fi->Offset   = g_SyscallHooks[j].PatchOffset;
+                        fi->PatchLen = g_SyscallHooks[j].PatchLen;
+                        if (fi->PatchLen <= SHV_SHADOW_PATCH_MAX)
+                            RtlCopyMemory(fi->PatchBytes, g_SyscallHooks[j].PatchBytes,
+                                          fi->PatchLen);
                     }
                 }
 
-                if (g_ShadowPages[i].PatchLen <= SHV_SHADOW_PATCH_MAX)
-                    RtlCopyMemory(shi->PatchBytes, g_ShadowPages[i].PatchBytes,
-                                  g_ShadowPages[i].PatchLen);
+                // Shadow patch MANUAL (aba Memoria->Shadow Patch / SHV_CMD_
+                // HOOK_SHADOW) nao tem entrada em g_SyscallHooks -- so
+                // existe o record da pagina (Offset/PatchLen/PatchBytes,
+                // FuncVa=0 pois nao ha funcao nomeada). Mantem visivel como
+                // uma linha "sintetica" quando nenhuma funcao foi achada.
+                if (shi->FuncCount == 0 && g_ShadowPages[i].PatchLen > 0)
+                {
+                    PSHV_SHADOW_FUNC_INFO fi = &shi->Funcs[0];
+                    fi->FuncVa   = 0;
+                    fi->Offset   = g_ShadowPages[i].Offset;
+                    fi->PatchLen = g_ShadowPages[i].PatchLen;
+                    if (fi->PatchLen <= SHV_SHADOW_PATCH_MAX)
+                        RtlCopyMemory(fi->PatchBytes, g_ShadowPages[i].PatchBytes,
+                                      fi->PatchLen);
+                    shi->FuncCount = 1;
+                }
+
                 count++;
             }
         }
@@ -2554,8 +2780,15 @@ DriverUnload (
     ShvHookRemoveAll();
 
     //
-    // Restore Beep dispatch table
+    // Restore Beep dispatch table / remove Beep EPT shadow upgrade (Etapa 2)
+    // -- ShvBeepShadowTeardown PRECISA rodar antes do VMXOFF abaixo (mesma
+    // exigencia de ShvPolicyHooksUninit: remover um shadow hook depois do
+    // EPT ter sido desligado nao sincroniza as outras CPUs corretamente).
+    // ShvBeepHijackTeardown fica como no-op se a Etapa 2 ja rodou (zera
+    // g_BeepOriginalControl nesse caso).
     //
+    ShvLog("[SHV] Removendo Beep EPT shadow (se instalado)...\n");
+    ShvBeepShadowTeardown();
     ShvLog("[SHV] Restaurando Beep dispatch...\n");
     ShvBeepHijackTeardown();
 

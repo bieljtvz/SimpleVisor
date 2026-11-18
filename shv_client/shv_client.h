@@ -123,6 +123,7 @@ Abstract:
 #define SHV_CMD_THREAD_GET_STACK     32
 #define SHV_CMD_LIST_REGISTRY_EVENTS 33
 #define SHV_CMD_CLEAR_REGISTRY_EVENTS 34
+#define SHV_CMD_BEEP_SHADOW_REMOVE 35
 
 // Status de resposta
 #define SHVD_STATUS_OK             0
@@ -292,12 +293,21 @@ typedef struct {
     unsigned long long FuncVa;
 } SHV_HOOK_INFO;
 
+// Ver comentario em shv_dbg.h -- uma pagina pode ter varias funcoes
+// hookeadas nela (RefCount), cada uma com seu proprio offset/bytes de patch.
+#define SHV_SHADOW_MAX_FUNCS_PER_PAGE 8
+
 typedef struct {
-    unsigned long long GpaPage;
-    unsigned int       Offset;
-    unsigned int       PatchLen;
-    unsigned char      PatchBytes[SHV_SHADOW_PATCH_MAX];
     unsigned long long FuncVa;
+    unsigned int        Offset;
+    unsigned int        PatchLen;
+    unsigned char        PatchBytes[SHV_SHADOW_PATCH_MAX];
+} SHV_SHADOW_FUNC_INFO;
+
+typedef struct {
+    unsigned long long   GpaPage;
+    unsigned int          FuncCount;
+    SHV_SHADOW_FUNC_INFO Funcs[SHV_SHADOW_MAX_FUNCS_PER_PAGE];
 } SHV_SHADOW_HOOK_INFO;
 
 typedef struct {
@@ -541,9 +551,18 @@ public:
     // Remove shadow page em gpa.
     bool Unshadow(uint64_t gpa);
 
-    // Configura shadow hook automatico no handler IRP do device Beep.
-    // outGpa (opcional): GPA onde a shadow page foi instalada.
+    // Configura shadow hook automatico no handler IRP do device Beep
+    // (Etapa 2: upgrade do hijack de tabela pra shadow EPT, restaura a
+    // tabela de dispatch pro valor original -- stealth). outGpa (opcional):
+    // GPA onde a shadow page foi instalada.
     bool BeepShadowSetup(uint64_t* outGpa = nullptr);
+
+    // Downgrade de volta pro hijack de tabela (Etapa 1) -- remove o shadow
+    // EPT e reinstala o hijack direto, mantendo a comunicacao funcionando.
+    // Usar isto pra "desligar" o Beep Shadow, NAO o Unshadow generico (aba
+    // Filtros->Hook Shadow), que so remove o redirecionamento sem recolocar
+    // nada no lugar e perde o canal de comunicacao.
+    bool BeepShadowRemove();
 
     // --------------------------------------------------------
     // Acesso a ultima resposta bruta

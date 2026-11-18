@@ -106,6 +106,17 @@ BOOLEAN HpvFindNtoskrnlModule(_Out_ UINT64* Base, _Out_ SIZE_T* Size);
 // hook em hpv_policy_hooks.c).
 VOID ShvCleanupExitedProcess(_In_ UINT64 Pid);
 
+// nt/shvos.c -- acha o primeiro processo cujo ImageName bate com Name
+// (case-insensitive). *OutProcess sai referenciado (ObDereferenceObject
+// depois de usar). Usado por nt/hpv_win32k_hooks.c pra achar o winlogon.exe
+// antes de dar KeStackAttachProcess (win32k.sys e por sessao, nao global).
+NTSTATUS ShvOsFindProcessByName(_In_z_ PCSTR Name, _Out_ PEPROCESS* OutProcess);
+
+// nt/shvos.c -- acha a base de um modulo de kernel (incl. win32k.sys/
+// win32kfull.sys, carregado por sessao) pelo nome de arquivo. Chamar com o
+// processo atual ja attached na sessao desejada (ver nt/hpv_win32k_hooks.c).
+NTSTATUS ShvOsFindKernelModuleBase(_In_z_ PCSTR Name, _Out_ PVOID* OutBase);
+
 // nt/hpv_hooks_legacy.c -- SSDT + LSTAR, NAO usados atualmente em nenhum
 // caminho ativo (ver comentario no topo do arquivo). Mantidos pra estudo.
 NTSTATUS ShvSsdtGetFuncVa(_In_ ULONG SyscallIndex, _Out_ PVOID* FuncVa);
@@ -127,6 +138,19 @@ VOID     ShvRegistryHooksUninit(VOID);
 UINT32   ShvRegistryListEvents(_Out_writes_(MaxCount) SHV_REGISTRY_EVENT* Out, _In_ UINT32 MaxCount);
 VOID     ShvRegistryClearEvents(VOID);
 
+// nt/hpv_win32k_hooks.c -- shadow hook em NtGdiBitBlt (win32kfull.sys,
+// carregado por sessao -- precisa de attach num processo Win32 interativo
+// pra resolver/instalar, ver comentario no topo do arquivo).
+NTSTATUS ShvWin32kHooksInit(VOID);
+VOID     ShvWin32kHooksUninit(VOID);
+
+// nt/hpv_memprotect_hooks.c -- shadow hook em ZwAllocateVirtualMemory/
+// ZwProtectVirtualMemory, monitora paginas executaveis surgindo na memoria
+// de processos monitorados (alocacao RWX/RX ou mudanca de protecao
+// adicionando execucao -- padrao de shellcode/injecao).
+NTSTATUS ShvMemProtectHooksInit(VOID);
+VOID     ShvMemProtectHooksUninit(VOID);
+
 // nt/shvos_log.c
 VOID ShvLog(_In_z_ _Printf_format_string_ const char* Fmt, ...);
 
@@ -135,3 +159,15 @@ NTSTATUS ShvBeepHijackSetup(VOID);
 VOID     ShvBeepHijackTeardown(VOID);
 PDRIVER_DISPATCH ShvBeepGetOriginalControl(VOID);
 NTSTATUS ShvBeepGetDriverObject(_Out_ PDRIVER_OBJECT* OutObject);
+
+// nt/shvos_beep.c -- Etapa 2 (SHV_CMD_BEEP_SHADOW_SETUP): upgrade do hijack
+// de tabela pra shadow hook via EPT na funcao original do Beep. Chamar
+// ShvBeepShadowTeardown no DriverUnload ANTES do VMXOFF.
+NTSTATUS ShvBeepShadowSetup(_Out_ UINT64* OutGpa);
+VOID     ShvBeepShadowTeardown(VOID);
+
+// nt/shvos_beep.c -- downgrade de volta pra Etapa 1 (hijack de tabela),
+// usado pelo checkbox "Beep Shadow" da GUI ao desmarcar: mantem a
+// comunicacao funcionando (diferente de ShvBeepShadowTeardown, so usada no
+// DriverUnload, onde a comunicacao nao precisa mais continuar).
+NTSTATUS ShvBeepShadowRemove(VOID);

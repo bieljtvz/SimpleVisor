@@ -362,11 +362,23 @@ NTSTATUS ShvPolicyHooksInit(VOID)
     // hook individual ja e nao-fatal la dentro).
     ShvRegistryHooksInit();
 
+    // NtGdiBitBlt (win32kfull.sys) -- nt/hpv_win32k_hooks.c. Nao-fatal: se
+    // nenhuma sessao interativa (winlogon.exe) estiver ativa ainda no
+    // momento do DriverEntry, o hook so nao e instalado (driver continua
+    // normal); nao ha retry automatico depois disso nesta versao.
+    ShvWin32kHooksInit();
+
+    // Paginas executaveis surgindo via ZwAllocateVirtualMemory/
+    // ZwProtectVirtualMemory (shellcode/injecao) -- nt/hpv_memprotect_hooks.c.
+    ShvMemProtectHooksInit();
+
     return STATUS_SUCCESS;
 }
 
 VOID ShvPolicyHooksUninit(VOID)
 {
+    ShvMemProtectHooksUninit();
+    ShvWin32kHooksUninit();
     ShvRegistryHooksUninit();
 
     if (g_OrigNtOpenProcess != NULL)

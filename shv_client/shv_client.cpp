@@ -645,6 +645,13 @@ bool ShvClient::BeepShadowSetup(uint64_t* outGpa)
     return true;
 }
 
+bool ShvClient::BeepShadowRemove()
+{
+    SHV_REQUEST req = {};
+    req.Command = SHV_CMD_BEEP_SHADOW_REMOVE;
+    return Submit(req) && m_resp.Status == SHVD_STATUS_OK;
+}
+
 // ============================================================
 // Utilitario
 // ============================================================

@@ -333,7 +333,27 @@ void RenderTabFilters(ShvBackend& backend)
         kernMods = backend.State().kernelModules;
         backend.Unlock();
 
-        ImGui::TextDisabled("%zu shadow patch(es) ativos", shadows.size());
+        // Uma linha por FUNCAO hookeada, nao por pagina -- uma pagina com
+        // varias funcoes compartilhando ela (RefCount > 1 no kernel, ex.
+        // ZwOpenKey/ZwOpenKeyEx vizinhas no binario) gera uma linha pra cada
+        // uma, CADA UMA com seu proprio Offset/Len/Bytes (vem de
+        // ShvShadowFuncEntry, nao mais os mesmos bytes da pagina repetidos
+        // pra todas -- ver memory/fixes.md). GPA e CR3 sao da pagina (iguais
+        // pra todas as linhas que compartilham ela).
+        struct ShadowRow { int pageIdx; int funcIdx; };
+        std::vector<ShadowRow> rows;
+        for (int i = 0; i < (int)shadows.size(); i++)
+        {
+            const ShvShadowEntry& p = shadows[i];
+            if (p.funcs.empty())
+                rows.push_back({ i, -1 });
+            else
+                for (int f = 0; f < (int)p.funcs.size(); f++)
+                    rows.push_back({ i, f });
+        }
+
+        ImGui::TextDisabled("%zu funcao(oes) hookeada(s) em %zu pagina(s) de shadow",
+                            rows.size(), shadows.size());
         ImGui::Spacing();
 
         static uint64_t s_selGpa    = 0;
@@ -368,9 +388,23 @@ void RenderTabFilters(ShvBackend& backend)
             ImGui::TableSetupColumn("Bytes",   ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableHeadersRow();
 
-            for (int i = 0; i < (int)shadows.size(); i++)
+            auto ModNameForVa = [&](uint64_t va) -> const char* {
+                for (const auto& m : kernMods)
+                    if (va >= m.Base && va < m.Base + m.Size)
+                    {
+                        const char* base = strrchr(m.Name, '\\');
+                        return base ? base + 1 : m.Name;
+                    }
+                return nullptr;
+            };
+
+            static const ShvShadowFuncEntry kEmptyFunc = {};
+
+            for (int i = 0; i < (int)rows.size(); i++)
             {
-                const ShvShadowEntry& p = shadows[i];
+                const ShadowRow&          r  = rows[i];
+                const ShvShadowEntry&     p  = shadows[r.pageIdx];
+                const ShvShadowFuncEntry& fn = (r.funcIdx >= 0) ? p.funcs[r.funcIdx] : kEmptyFunc;
                 bool isSelected = s_hasSel && (s_selGpa == p.gpa);
                 ImGui::TableNextRow();
                 ImGui::PushID(i);
@@ -385,7 +419,11 @@ void RenderTabFilters(ShvBackend& backend)
                 }
                 if (ImGui::BeginPopupContextItem("shd_ctx"))
                 {
-                    if (ImGui::MenuItem("Remover Shadow"))
+                    // Remove a pagina inteira -- se outras funcoes ainda
+                    // compartilham ela, HpvUnhookFuncByVa decrementa o
+                    // RefCount em vez de liberar (ver nt/hpv_hooks.c);
+                    // so some da lista quando a ultima for removida.
+                    if (ImGui::MenuItem("Remover Shadow (pagina inteira)"))
                         backend.Unshadow(p.gpa);
                     ImGui::EndPopup();
                 }
@@ -393,24 +431,12 @@ void RenderTabFilters(ShvBackend& backend)
                 ImGui::Text("0x%016llX", (unsigned long long)p.gpa);
 
                 ImGui::TableNextColumn();
-                if (p.va != 0) ImGui::Text("0x%016llX", (unsigned long long)p.va);
-                else            ImGui::TextDisabled("---");
+                if (fn.va != 0) ImGui::Text("0x%016llX", (unsigned long long)fn.va);
+                else             ImGui::TextDisabled("---");
 
                 ImGui::TableNextColumn();
                 {
-                    const char* modName = nullptr;
-                    if (p.va != 0)
-                    {
-                        for (const auto& m : kernMods)
-                        {
-                            if (p.va >= m.Base && p.va < m.Base + m.Size)
-                            {
-                                const char* base = strrchr(m.Name, '\\');
-                                modName = base ? base + 1 : m.Name;
-                                break;
-                            }
-                        }
-                    }
+                    const char* modName = fn.va != 0 ? ModNameForVa(fn.va) : nullptr;
                     if (modName) ImGui::TextUnformatted(modName);
                     else          ImGui::TextDisabled("---");
                 }
@@ -420,17 +446,17 @@ void RenderTabFilters(ShvBackend& backend)
                 else             ImGui::TextDisabled("kernel");
 
                 ImGui::TableNextColumn();
-                ImGui::Text("0x%X", p.offset);
+                ImGui::Text("0x%X", fn.offset);
 
                 ImGui::TableNextColumn();
-                ImGui::Text("%u", p.len);
+                ImGui::Text("%u", fn.len);
 
                 ImGui::TableNextColumn();
                 {
                     char hexBuf[SHV_SHADOW_PATCH_MAX * 3 + 1];
                     char* q = hexBuf;
-                    for (uint32_t b = 0; b < p.len && b < SHV_SHADOW_PATCH_MAX; b++)
-                        q += snprintf(q, 4, "%02X ", p.bytes[b]);
+                    for (uint32_t b = 0; b < fn.len && b < SHV_SHADOW_PATCH_MAX; b++)
+                        q += snprintf(q, 4, "%02X ", fn.bytes[b]);
                     if (q > hexBuf) *(q - 1) = '\0';
                     ImGui::PushStyleColor(ImGuiCol_Text, kColorWarn);
                     ImGui::TextUnformatted(hexBuf);
@@ -440,7 +466,7 @@ void RenderTabFilters(ShvBackend& backend)
                 ImGui::PopID();
             }
 
-            if (shadows.empty())
+            if (rows.empty())
             {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();

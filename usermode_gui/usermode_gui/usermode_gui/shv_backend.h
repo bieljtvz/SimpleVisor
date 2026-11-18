@@ -64,15 +64,28 @@ struct ShvEptHookEntry {
     uint64_t pid;
 };
 
-struct ShvShadowEntry {
-    uint64_t gpa;
+// Uma FUNCAO hookeada dentro de uma shadow page -- offset/len/bytes sao
+// POR FUNCAO (cada uma tem seu proprio patch de 12 bytes no seu proprio
+// offset dentro da pagina de 4KB compartilhada), nao da pagina como um todo.
+struct ShvShadowFuncEntry {
+    uint64_t va;   // 0 = shadow patch manual sem funcao nomeada associada
+                   // (aba Memoria->Shadow Patch, modo cru por GPA).
     uint32_t offset;
     uint32_t len;
     uint8_t  bytes[SHV_SHADOW_PATCH_MAX];
-    uint64_t va;   // VA original usada pra achar essa GPA (0 = desconhecida --
-                   // so e conhecida quando a GUI mesma instalou o shadow via
-                   // VA+PID; shadows pre-existentes vistos so pelo poll nao tem VA).
-    uint64_t cr3;  // DirBase do processo dono da VA acima (0 = desconhecido/kernel).
+};
+
+struct ShvShadowEntry {
+    uint64_t gpa;
+    uint64_t va;   // PRIMEIRA funcao (funcs[0].va, ou 0 se nenhuma) -- mantido
+                   // por compatibilidade com o lookup de modulo/CR3 existente.
+    uint64_t cr3;  // DirBase do processo dono de "va" (0 = desconhecido/kernel).
+    std::vector<ShvShadowFuncEntry> funcs; // TODAS as funcoes hookeadas que
+                                // compartilham esta pagina (RefCount > 1 no
+                                // kernel, ex. ZwOpenKey/ZwOpenKeyEx vizinhas no
+                                // binario), cada uma com seu PROPRIO offset/
+                                // bytes -- nao os mesmos bytes repetidos pra
+                                // todas (ver memory/fixes.md).
 };
 
 struct ShvState {
@@ -156,6 +169,11 @@ public:
                           uint64_t va = 0, uint64_t cr3 = 0);
     CmdResult Unshadow(uint64_t gpa);
     CmdResult BeepShadowSetup(uint64_t* outGpa);
+    // Downgrade de volta pro hijack de tabela -- usar isto pra "desligar" o
+    // Beep Shadow (ex. checkbox na GUI), NAO backend.Unshadow() com a GPA
+    // do beep: aquele so remove o redirecionamento sem recolocar nada no
+    // lugar, perdendo a comunicacao com o hypervisor pelo canal Beep.
+    CmdResult BeepShadowRemove();
     CmdResult ClearEvents();
     CmdResult SetStackFilter(bool enabled);
     CmdResult ListEptHooks();

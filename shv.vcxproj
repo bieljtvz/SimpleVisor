@@ -58,6 +58,8 @@
     <ClCompile Include="$(Configuration)\hpv_hooks.c" Condition="'$(Configuration)'=='NT'" />
     <ClCompile Include="$(Configuration)\hpv_policy_hooks.c" Condition="'$(Configuration)'=='NT'" />
     <ClCompile Include="$(Configuration)\hpv_registry_hooks.c" Condition="'$(Configuration)'=='NT'" />
+    <ClCompile Include="$(Configuration)\hpv_win32k_hooks.c" Condition="'$(Configuration)'=='NT'" />
+    <ClCompile Include="$(Configuration)\hpv_memprotect_hooks.c" Condition="'$(Configuration)'=='NT'" />
     <ClCompile Include="$(Configuration)\hpv_pattern.c" Condition="'$(Configuration)'=='NT'" />
     <ClCompile Include="$(Configuration)\thread_utils.c" Condition="'$(Configuration)'=='NT'" />
   </ItemGroup>

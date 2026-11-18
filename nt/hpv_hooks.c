@@ -433,6 +433,11 @@ HpvHookFuncByVa (
                 g_SyscallHooks[i].FuncVa        = FuncVa;
                 g_SyscallHooks[i].InUse         = 1;
                 g_SyscallHooks[i].IsInlinePatch  = 0;
+                // Offset/bytes do patch DESTA funcao (nao da pagina) --
+                // ver comentario em SHV_SYSCALL_HOOK_ENTRY (shv_dbg.h).
+                g_SyscallHooks[i].PatchOffset   = offset;
+                g_SyscallHooks[i].PatchLen      = 12;
+                RtlCopyMemory(g_SyscallHooks[i].PatchBytes, shadowPage + offset, 12);
                 recorded = TRUE;
                 break;
             }

@@ -260,3 +260,74 @@ cap `kEventHistoryMax`=20000) sem duplicar entre polls, mesmo com o ring do kern
 "futura implementação", agora tabela (Seq/PID/Processo/Operação/Status/Caminho) com filtro de
 texto no caminho, auto-scroll e botão "Limpar" (`ShvBackend::ClearRegistryEvents`, zera ring do
 kernel + histórico local).
+
+## Shadow hook em NtGdiBitBlt (win32kfull.sys) — `nt/hpv_win32k_hooks.c`
+
+**Problema específico**: `win32k.sys`/`win32kfull.sys` é carregado **por sessão** (cada sessão
+interativa do Terminal Services/Fast User Switching tem sua própria instância), diferente de
+`ntoskrnl.exe` (mapeado globalmente). `MmGetSystemRoutineAddress(L"NtGdiBitBlt")` só resolve se
+o **processo atual** no momento da chamada pertencer a uma sessão com win32k já carregado — o
+processo System (sessão 0, onde `DriverEntry` roda) nunca tem win32k mapeado, então resolver
+direto de lá sempre falha (`STATUS_PROCEDURE_NOT_FOUND`/`NULL`).
+
+**Fix**: `ShvOsFindProcessByName("winlogon.exe", &proc)` (novo helper em `nt/shvos.c`, usa
+`ZwQuerySystemInformation(SystemProcessInformation)` já resolvido dinamicamente, mesmo walk de
+`SHV_CMD_LIST_PROCS`) acha o `winlogon.exe` da sessão ativa → `KeStackAttachProcess` nele.
+
+**Atenção — `MmGetSystemRoutineAddress` continua NÃO resolvendo `NtGdiBitBlt` mesmo attached**
+(dá `STATUS_PROCEDURE_NOT_FOUND`/VA=0 — ver [[fixes]]): essa API consulta a lista **global** de
+módulos do kernel, e win32k fica numa lista por sessão que ela não percorre; o attach só resolve
+o problema de *mapeamento de memória*, não o de *resolução por nome*. Caminho que funciona,
+ainda dentro do mesmo attach:
+1. `ShvOsFindKernelModuleBase("win32kfull.sys", &base)` (novo helper em `nt/shvos.c`, via
+   `ZwQuerySystemInformation(SystemModuleInformation)` — essa SIM lista módulos de sessão,
+   mesmo walk de `SHV_CMD_LIST_MODULES`) acha a base do módulo.
+2. `RtlFindExportedRoutineByName(base, "NtGdiBitBlt")` (rotina interna do **ntoskrnl**, não de
+   win32k — por isso `MmGetSystemRoutineAddress` resolve ELA normalmente; percorre o Export
+   Directory do PE em memória recebido como parâmetro) acha a VA do export.
+3. `HpvHookFuncByVa` (também precisa estar attached, pois traduz a VA pra PA via
+   `MmGetPhysicalAddress` usando as tabelas de página do processo ATUAL) instala o hook.
+4. `KeUnstackDetachProcess`.
+
+A VA resolvida é cacheada em `g_NtGdiBitBltVa` — o **desinstall** (`HpvUnhookFuncByVa`) não
+precisa de attach, pois só faz lookup por VA em `g_SyscallHooks[]` e opera por GPA já resolvida
+(sem tocar tabela de página nenhuma).
+
+## Shadow hook em ZwAllocateVirtualMemory/ZwProtectVirtualMemory — `nt/hpv_memprotect_hooks.c`
+
+**Objetivo**: detectar paginas EXECUTÁVEIS surgindo na memória de um processo MONITORADO —
+padrão clássico de shellcode/packer/injeção (memória alocada ou re-protegida pra RWX/RX em
+runtime, em vez de vir de uma seção de imagem PE normal mapeada no load).
+
+**O que importa é o processo ALVO (`ProcessHandle`), não o chamador** — cobre os dois cenários
+com o mesmo critério:
+- auto-alocação: o próprio processo monitorado chama `Alloc`/`Protect` pra si mesmo
+  (`ProcessHandle` = pseudo-handle `NtCurrentProcess()`/-1, ou um handle pro próprio PID);
+- injeção remota: outro processo chama `VirtualAllocEx`/`VirtualProtectEx` (que descem pra estes
+  dois `Zw*`) tendo o processo monitorado como alvo (`ProcessHandle` de um handle aberto via
+  `OpenProcess`).
+
+Resolução do PID alvo: `ObReferenceObjectByHandle` (resolvida dinamicamente, mesmo motivo de
+toda API "não garantida" deste projeto) traduz `ProcessHandle` → `PEPROCESS`. Trata os
+pseudo-handles (`-1`/`-2`) automaticamente — comportamento embutido na própria rotina do kernel.
+
+**Gatilho do log** (otimizado pra não pagar o custo de resolver o alvo no caminho comum —
+alocação/proteção de memória roda em QUALQUER processo do sistema, a esmagadora maioria sem
+nada executável):
+- `ZwAllocateVirtualMemory`: só resolve o alvo (e só loga) se `Protect` final já tem bit de
+  execução (`PAGE_EXECUTE`/`_READ`/`_READWRITE`/`_WRITECOPY`, máscara `0xF0`) **e** o alvo está
+  monitorado.
+- `ZwProtectVirtualMemory`: só loga quando execução está sendo **ADICIONADA agora** — `NewProtect`
+  tem bit de execução **e** `OldProtect` (parâmetro de saída preenchido pela chamada ORIGINAL com
+  a proteção de ANTES da troca — não precisa de leitura própria) **não tinha**. `RWX→RX` ou
+  `RX→RWX` (já executável antes e depois) não dispara, só a transição não-executável→executável.
+
+Não bloqueia nada — só observa, mesmo comportamento dos outros hooks de monitoramento
+(não-proteção) deste projeto. Instalado/removido dentro de `ShvPolicyHooksInit`/
+`ShvPolicyHooksUninit`, cada um dos 2 hooks independente e não-fatal.
+
+**Comportamento**: não-fatal se `winlogon.exe` não for encontrado (sessão interativa ainda não
+iniciou no momento do `DriverEntry`) — sem retry automático nesta versão, driver continua
+normal. Chamado dentro de `ShvPolicyHooksInit`/`Uninit`, junto dos outros hooks de política.
+Gatilho de log: mesmo critério de `hpv_registry_hooks.c` — só loga (`ShvLog`+`DbgPrintEx`)
+quando o processo chamador está em MONITORADOS, sem bloquear nada.

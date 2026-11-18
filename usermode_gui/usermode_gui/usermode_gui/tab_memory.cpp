@@ -311,10 +311,25 @@ void RenderTabMemory(ShvBackend& backend)
                 if (gpa != 0) backend.Unshadow(gpa);
             }
             ImGui::SameLine();
-            if (ImGui::Button("Beep Shadow Setup"))
+            // Checkbox, nao botao -- desmarcar faz o downgrade de volta pro
+            // hijack de tabela (mantem a comunicacao), diferente do botao
+            // "Remover##sh" acima (generico, por GPA, NAO usar nesta GPA
+            // especifica: so tira o redirecionamento sem recolocar nada no
+            // lugar, perde o canal de comunicacao Beep -- ver tab_tools.cpp).
+            static bool s_beepShadowOnMem = false;
+            if (ImGui::Checkbox("Beep Shadow##mem", &s_beepShadowOnMem))
             {
-                uint64_t gpa = 0;
-                backend.BeepShadowSetup(&gpa);
+                if (s_beepShadowOnMem)
+                {
+                    uint64_t gpa = 0;
+                    auto r = backend.BeepShadowSetup(&gpa);
+                    s_beepShadowOnMem = r.ok;
+                }
+                else
+                {
+                    auto r = backend.BeepShadowRemove();
+                    s_beepShadowOnMem = !r.ok;
+                }
             }
 
             if (s_lastMsg[0])
